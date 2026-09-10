@@ -1,13 +1,21 @@
 import { WorkflowEntrypoint, WorkflowStep } from "cloudflare:workers";
 import type { WorkflowEvent } from "cloudflare:workers";
-import { chQuery, chInsert, toB64Url } from "./ch";
+import { chQuery, chInsert, fromB64Url } from "./ch";
 
 /**
- * Cron C — ClickHouse check (partial: steps ① and ② only)
+ * Cron C — ClickHouse check (partial: matching only)
  *
- *   ① read candidate keys from ca_drop_combined_search_result
- *   ② check each against the DROP hash set in KV
- *   ③ write every match into ca_drop_match_run
+ *   ⓿ optionally refresh ca_drop_combined_search_result
+ *   ① copy the DROP hash set from KV into default.ca_drop_work_items
+ *   ② match, once per list: INSERT ... SELECT entirely inside ClickHouse
+ *   ③ prune ca_drop_work_items down to the hashes that matched
+ *   ④ summary
+ *
+ * The candidate keys never leave the database. The earlier version streamed
+ * them out and did one kv.get() per key, which is ~2.5M subrequests for the
+ * current key volume — far past the Worker per-invocation limit. ClickHouse
+ * cannot JOIN against KV, so the DROP set is mirrored into a table instead;
+ * KV remains the source of truth and still serves the real-time Lookup gate.
  *
  * Not implemented yet: the R2 log, the expire in entity_search_results,
  * the D1 status write and the BetterStack alert.
@@ -17,49 +25,41 @@ import { chQuery, chInsert, toB64Url } from "./ch";
  *   ALTER TABLE default.ca_drop_match_run DROP PARTITION '<run_id>'
  */
 
+const LISTS = ["email", "phone", "ndz", "namevin"] as const;
+type ListType = (typeof LISTS)[number];
+
+const KEY_COLUMN: Record<ListType, string> = {
+	email: "email_keys",
+	phone: "phone_keys",
+	ndz: "ndz_keys",
+	namevin: "namevin_keys",
+};
+
 type Params = {
-	/** identifiers per ClickHouse page */
-	batchSize?: number;
-	/** run SYSTEM REFRESH VIEW first — needs SYSTEM VIEWS privilege */
+	/** KV keys read per sync step. Keep the whole step under the ~1000
+	 *  subrequest cap: worst case it is one list + one get per key. */
+	kvPageSize?: number;
+	/** run SYSTEM REFRESH VIEW first — needs the SYSTEM VIEWS privilege */
 	refreshView?: boolean;
-	/** stop after N pages; safety rail while this is partial */
-	maxPages?: number;
+	/** skip the KV -> ClickHouse copy and match against whatever is already there */
+	skipKvSync?: boolean;
+	/** safety rail on the sync loop */
+	maxKvPages?: number;
+	/** keep the full KV mirror in ca_drop_work_items instead of pruning it
+	 *  down to the matched hashes at the end of the run */
+	keepFullDropSet?: boolean;
 };
 
-type KeyRow = {
-	type: string;
-	normalized_value: string;
-	list_type: string;
-	key: string; // Base64, as stored in ClickHouse
-};
-
-/** One page of candidate keys. Cursor pagination on the view's sort key. */
-const KEYS_SQL = `
-SELECT type, normalized_value, list_type, key
-FROM (
-    SELECT type, normalized_value, 'email'   AS list_type, arrayJoin(email_keys)   AS key
-    FROM default.ca_drop_combined_search_result WHERE notEmpty(email_keys)
-    UNION ALL
-    SELECT type, normalized_value, 'phone'   AS list_type, arrayJoin(phone_keys)   AS key
-    FROM default.ca_drop_combined_search_result WHERE notEmpty(phone_keys)
-    UNION ALL
-    SELECT type, normalized_value, 'ndz'     AS list_type, arrayJoin(ndz_keys)     AS key
-    FROM default.ca_drop_combined_search_result WHERE notEmpty(ndz_keys)
-    UNION ALL
-    SELECT type, normalized_value, 'namevin' AS list_type, arrayJoin(namevin_keys) AS key
-    FROM default.ca_drop_combined_search_result WHERE notEmpty(namevin_keys)
-)
-WHERE (type, normalized_value) > ({cur_type:String}, {cur_nv:String})
-ORDER BY type, normalized_value
-LIMIT {batch:UInt32}
-`;
+type KvMeta = { work_item_id?: string; request_date?: string };
 
 export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
 		const runId = event.instanceId;
-		const batchSize = event.payload?.batchSize ?? 20000;
-		const maxPages = event.payload?.maxPages ?? 200;
+		const kvPageSize = event.payload?.kvPageSize ?? 400;
 		const refreshView = event.payload?.refreshView ?? false;
+		const skipKvSync = event.payload?.skipKvSync ?? false;
+		const maxKvPages = event.payload?.maxKvPages ?? 500;
+		const keepFullDropSet = event.payload?.keepFullDropSet ?? false;
 
 		// Progress for the UI. Outside step.do, so it may repeat — updateStep is
 		// idempotent, which is why that is safe.
@@ -82,12 +82,15 @@ export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
 		if (refreshView) {
 			await notifyStep("refresh view", "running");
 			await step.do("refresh combined view", async () => {
-				await chQuery(this.env, "SYSTEM REFRESH VIEW default.ca_drop_combined_search_result");
+				await chQuery(
+					this.env,
+					"SYSTEM REFRESH VIEW default.ca_drop_combined_search_result",
+				);
 			});
 			// SYSTEM REFRESH VIEW returns immediately; wait for it to settle.
 			await step.do(
 				"await refresh",
-				{ retries: { limit: 30, delay: "10 seconds", backoff: "constant" } },
+				{ retries: { limit: 60, delay: "10 seconds", backoff: "constant" } },
 				async () => {
 					const [r] = await chQuery<{ status: string; exception: string }>(
 						this.env,
@@ -104,93 +107,166 @@ export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
 		}
 
 		// ---------------------------------------------------------------
-		// ① + ② page through the keys, check KV, write matches
+		// ① KV -> ClickHouse. One page per step, so each step stays well
+		//    inside the subrequest cap. Cron A is untouched by this.
 		// ---------------------------------------------------------------
-		await notifyStep("match keys", "running");
+		const synced: Record<string, number> = {};
 
-		// The cursor lives in a local variable, not in a step return. Step returns
-		// are persisted and size-capped, so they carry counters only — never keys.
-		let curType = "";
-		let curNv = "";
-		let page = 0;
-		let keysScanned = 0;
-		let matchesFound = 0;
+		if (!skipKvSync) {
+			await notifyStep("sync DROP set", "running");
 
-		for (;;) {
-			page += 1;
-			if (page > maxPages) throw new Error(`stopped after ${maxPages} pages — raise maxPages deliberately`);
+			for (const listType of LISTS) {
+				const prefix = `drop:${listType}:`;
+				let cursor: string | undefined;
+				let page = 0;
+				let count = 0;
 
-			const rows = await step.do(`read keys · page ${page}`, async () =>
-				chQuery<KeyRow>(this.env, KEYS_SQL, {
-					cur_type: curType,
-					cur_nv: curNv,
-					batch: batchSize,
-				}),
-			);
-
-			if (rows.length === 0) break;
-
-			const matches = await step.do(`check KV · page ${page}`, async () => {
-				const found: object[] = [];
-				const CONCURRENCY = 50;
-
-				for (let i = 0; i < rows.length; i += CONCURRENCY) {
-					const slice = rows.slice(i, i + CONCURRENCY);
-					const hits = await Promise.all(
-						slice.map(async (r) => {
-							const workItemId = await this.env.kv.get(`drop:${r.list_type}:${toB64Url(r.key)}`);
-							return workItemId ? { r, workItemId } : null;
-						}),
-					);
-					for (const hit of hits) {
-						if (!hit) continue;
-						found.push({
-							run_id: runId,
-							list_type: hit.r.list_type,
-							work_item_id: hit.workItemId,
-							hash: hit.r.key,
-							type: hit.r.type,
-							normalized_value: hit.r.normalized_value,
-						});
+				for (;;) {
+					page += 1;
+					if (page > maxKvPages) {
+						throw new Error(
+							`sync ${listType}: stopped after ${maxKvPages} pages — raise maxKvPages deliberately`,
+						);
 					}
-				}
-				return found;
-			});
 
-			if (matches.length > 0) {
-				await step.do(`write matches · page ${page}`, async () =>
-					chInsert(this.env, "default.ca_drop_match_run", matches),
-				);
+					// The cursor is returned by the step, so a retry resumes here.
+					const result: { cursor?: string; inserted: number } = await step.do(
+						`sync ${listType} · page ${page}`,
+						async () => {
+							const listed = await this.env.kv.list<KvMeta>({
+								prefix,
+								limit: kvPageSize,
+								cursor,
+							});
+
+							const rows: object[] = [];
+							for (const k of listed.keys) {
+								// The hash is the key name (base64url); the work item id is
+								// the value, or the metadata when Cron A wrote it there.
+								const hash = fromB64Url(k.name.slice(prefix.length));
+								const meta = k.metadata;
+								const workItemId =
+									meta?.work_item_id ?? (await this.env.kv.get(k.name)) ?? "";
+
+								const row: Record<string, string | number> = {
+									list_type: listType,
+									hash,
+									work_item_id: workItemId,
+								};
+								if (meta?.request_date) row.request_date = meta.request_date;
+								rows.push(row);
+							}
+
+							if (rows.length > 0) {
+								await chInsert(this.env, "default.ca_drop_work_items", rows);
+							}
+
+							return {
+								cursor: listed.list_complete ? undefined : listed.cursor,
+								inserted: rows.length,
+							};
+						},
+					);
+
+					count += result.inserted;
+					cursor = result.cursor;
+					if (!cursor) break;
+				}
+
+				synced[listType] = count;
 			}
 
-			keysScanned += rows.length;
-			matchesFound += matches.length;
-
-			const last = rows[rows.length - 1];
-			curType = last.type;
-			curNv = last.normalized_value;
+			await notifyStep("sync DROP set", "completed");
 		}
 
-		await notifyStep("match keys", "completed");
+		// ---------------------------------------------------------------
+		// ② the match — one INSERT ... SELECT per list, inside ClickHouse.
+		//    Nothing is read into the Worker.
+		// ---------------------------------------------------------------
+		await notifyStep("match", "running");
+
+		const matched: Record<string, number> = {};
+
+		for (const listType of LISTS) {
+			matched[listType] = await step.do(
+				`match ${listType}`,
+				{ timeout: "15 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "linear" } },
+				async () => {
+					await chQuery(this.env, matchSql(KEY_COLUMN[listType]), {
+						run_id: runId,
+						list_type: listType,
+					});
+					// uniqExact, not count(): the table is a ReplacingMergeTree and a
+					// retried step re-inserts the same rows before they merge.
+					const [row] = await chQuery<{ n: number }>(
+						this.env,
+						`SELECT uniqExact((work_item_id, hash, type, normalized_value)) AS n
+						 FROM default.ca_drop_match_run
+						 WHERE run_id = {run_id:String} AND list_type = {list_type:String}`,
+						{ run_id: runId, list_type: listType },
+					);
+					return Number(row?.n ?? 0);
+				},
+			);
+		}
+
+		await notifyStep("match", "completed");
 
 		// ---------------------------------------------------------------
-		// summary
+		// ③ prune the mirror down to the hashes that actually matched.
+		//    ca_drop_work_items is a working copy, not a store: KV (and R2)
+		//    remain the durable DROP set, so dropping the non-matching rows
+		//    loses nothing and keeps unmatched consumer hashes out of
+		//    ClickHouse. The next run re-syncs from KV before matching.
+		// ---------------------------------------------------------------
+		let prunedTo = -1;
+		if (!keepFullDropSet) {
+			await notifyStep("prune DROP set", "running");
+			prunedTo = await step.do(
+				"prune DROP set · keep matched only",
+				{ timeout: "15 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "linear" } },
+				async () => {
+					// Lightweight DELETE — needs ALTER DELETE on the table.
+					await chQuery(
+						this.env,
+						`DELETE FROM default.ca_drop_work_items
+						 WHERE (list_type, hash) NOT IN (
+						     SELECT list_type, hash FROM default.ca_drop_match_run
+						     WHERE run_id = {run_id:String}
+						 )`,
+						{ run_id: runId },
+					);
+					const [row] = await chQuery<{ n: number }>(
+						this.env,
+						"SELECT count() AS n FROM default.ca_drop_work_items",
+					);
+					return Number(row?.n ?? 0);
+				},
+			);
+			await notifyStep("prune DROP set", "completed");
+		}
+
+		// ---------------------------------------------------------------
+		// ④ summary
 		// ---------------------------------------------------------------
 		await notifyStep("summary", "running");
 		const summary = await step.do("summary · count run rows", async () => {
-			const [row] = await chQuery<{ rows: number; work_items: number }>(
+			const [row] = await chQuery<{ rows: number; work_items: number; identifiers: number }>(
 				this.env,
-				`SELECT count() AS rows, uniqExact(work_item_id) AS work_items
+				`SELECT uniqExact((list_type, work_item_id, hash, type, normalized_value)) AS rows,
+				        uniqExact(work_item_id) AS work_items,
+				        uniqExact((type, normalized_value)) AS identifiers
 				 FROM default.ca_drop_match_run WHERE run_id = {run_id:String}`,
 				{ run_id: runId },
 			);
 			return {
 				runId,
-				pages: page - 1,
-				keysScanned,
-				matchesFound,
-				rowsInRunTable: row?.rows ?? 0,
-				distinctWorkItems: row?.work_items ?? 0,
+				syncedFromKv: synced,
+				matchesByList: matched,
+				dropSetRowsKept: prunedTo,
+				rowsInRunTable: Number(row?.rows ?? 0),
+				distinctWorkItems: Number(row?.work_items ?? 0),
+				distinctIdentifiers: Number(row?.identifiers ?? 0),
 			};
 		});
 		await notifyStep("summary", "completed");
@@ -199,3 +275,39 @@ export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
 		return summary;
 	}
 }
+
+/**
+ * The match. Candidate keys are expanded with arrayJoin and streamed past the
+ * DROP set, which ClickHouse hashes into memory as the build side — the cheap
+ * direction, because the DROP set is small and the candidate side is millions
+ * of rows. Both {run_id} and {list_type} are server-side parameters, so no
+ * Base64 ever reaches the SQL text.
+ */
+function matchSql(keyColumn: string): string {
+	return `
+INSERT INTO default.ca_drop_match_run
+    (run_id, list_type, work_item_id, hash, type, normalized_value)
+SELECT
+    {run_id:String}    AS run_id,
+    {list_type:String} AS list_type,
+    d.work_item_id,
+    c.hash,
+    c.type,
+    c.normalized_value
+FROM
+(
+    SELECT type, normalized_value, arrayJoin(${keyColumn}) AS hash
+    FROM default.ca_drop_combined_search_result
+    WHERE notEmpty(${keyColumn})
+) AS c
+INNER JOIN
+(
+    SELECT hash, argMax(work_item_id, loaded_at) AS work_item_id
+    FROM default.ca_drop_work_items
+    WHERE list_type = {list_type:String} AND revoked = 0
+    GROUP BY hash
+) AS d
+USING (hash)
+`;
+}
+

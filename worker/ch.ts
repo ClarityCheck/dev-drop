@@ -69,6 +69,12 @@ export async function chInsert(env: Env, table: string, rows: object[]): Promise
  * but it appears in the KV key name as base64url, because + and / are awkward
  * in key names, logs and URLs.
  */
+/** base64url (the KV key name) -> standard Base64 (what ClickHouse stores). */
+export function fromB64Url(b64url: string): string {
+	const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+	return b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+}
+
 export function toB64Url(b64: string): string {
 	return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }

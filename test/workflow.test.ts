@@ -22,10 +22,10 @@ describe("DropCheckWorkflow", () => {
 
 		await env.DEV_DROP.create({
 			id: instanceId,
-			params: { batchSize: 10, maxPages: 1, refreshView: false },
+			params: { kvPageSize: 10, maxKvPages: 1, refreshView: false },
 		});
 
-		// "read keys · page 1" is the first step that talks to ClickHouse.
+		// "sync email · page 1" is the first step that talks to KV + ClickHouse.
 		const status = await instance.waitForStatus("errored").catch(() => null);
 		expect(status === null || typeof status === "object").toBe(true);
 	});
