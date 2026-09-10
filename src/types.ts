@@ -36,27 +36,21 @@ export interface WorkflowUpdateMessage {
 // Step definitions for the workflow
 export const WORKFLOW_STEPS: StepDefinition[] = [
 	{
-		id: "process-data",
-		name: "process data",
-		description: "Break code into durable steps",
-		lineRange: [3, 7],
+		id: "refresh-view",
+		name: "refresh view",
+		description: "Recompute ca_drop_combined_search_result",
+		lineRange: [1, 1],
 	},
 	{
-		id: "wait-2-seconds",
-		name: "wait 2 seconds",
-		description: "Add time-based delays",
-		lineRange: [9, 10],
+		id: "match-keys",
+		name: "match keys",
+		description: "Page keys from ClickHouse, check each against KV",
+		lineRange: [2, 2],
 	},
 	{
-		id: "wait-for-approval",
-		name: "wait for approval",
-		description: "Pause for external events",
-		lineRange: [12, 16],
-	},
-	{
-		id: "final",
-		name: "final",
-		description: "Use data from previous steps",
-		lineRange: [18, 22],
+		id: "summary",
+		name: "summary",
+		description: "Count what landed in ca_drop_match_run",
+		lineRange: [3, 3],
 	},
 ];

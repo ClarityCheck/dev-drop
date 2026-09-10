@@ -1,5 +1,6 @@
 // Export the Workflow and Durable Object classes
 export { MyWorkflow } from "./workflow";
+import { chSmokeTest } from "./ch";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
@@ -118,6 +119,12 @@ export default {
 					status: 500,
 				});
 			}
+		}
+
+		// Diagnostics: verify the ClickHouse + KV wiring before running anything.
+		// GET /api/ch-test
+		if (url.pathname === "/api/ch-test") {
+			return chSmokeTest(env);
 		}
 
 		return Response.json({ error: "Not Found" }, { status: 404 });

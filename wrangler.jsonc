@@ -1,6 +1,15 @@
 /**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
+ * Wrangler config for dev-drop-check-ch.
+ *
+ * IMPORTANT: `wrangler deploy` replaces the Worker's bindings with whatever is
+ * in THIS file. Bindings you added in the dashboard (kv, r2) must be listed
+ * here as well, or the next deploy removes them.
+ *
+ * CH_PASSWORD is NOT here — it is a secret:
+ *     npx wrangler secret put CH_PASSWORD
+ *
+ * The KV namespace `id` below is the namespace UUID, not its name. Get it with:
+ *     npx wrangler kv namespace list
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
@@ -14,11 +23,6 @@
 	"observability": {
 		"enabled": true
 	},
-	/**
-	 * Workflows
-	 * Define Workflows to orchestrate multi-step processes
-	 * https://developers.cloudflare.com/workflows/
-	 */
 	"workflows": [
 		{
 			"name": "my-workflow",
@@ -26,11 +30,6 @@
 			"class_name": "MyWorkflow"
 		}
 	],
-	/**
-	 * Durable Objects
-	 * Used for WebSocket state management and real-time updates
-	 * https://developers.cloudflare.com/durable-objects/
-	 */
 	"durable_objects": {
 		"bindings": [
 			{
@@ -39,15 +38,32 @@
 			}
 		]
 	},
-	/**
-	 * Migrations
-	 * Required for Durable Objects
-	 */
 	"migrations": [
 		{
 			"tag": "v1",
-			"new_sqlite_classes": ["WorkflowStatusDO"]
+			"new_sqlite_classes": [
+				"WorkflowStatusDO"
+			]
 		}
 	],
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"kv_namespaces": [
+		{
+			"binding": "kv",
+			"id": "0f2019fd0c714603b5c60e6ae8c0f464"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "r2",
+			"bucket_name": "dev-drop"
+		}
+	],
+	"vars": {
+		"CH_URL": "https://cu7iy7dd3r.eu-central-1.aws.clickhouse.cloud:8443",
+		"CH_USER": "drop_workflow"
+	},
+	"triggers": {
+		"crons": []
+	}
 }
