@@ -226,14 +226,21 @@ export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
 				"prune DROP set · keep matched only",
 				{ timeout: "15 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "linear" } },
 				async () => {
-					// Lightweight DELETE — needs ALTER DELETE on the table.
+					// ALTER TABLE ... DELETE, not the lightweight DELETE FROM: the
+					// lightweight form is implemented as a mutation of the virtual
+					// _row_exists column and therefore demands ALTER UPDATE on top
+					// of ALTER DELETE. This form needs only ALTER DELETE.
+					// mutations_sync = 2 makes it synchronous, so the count below is
+					// taken after the rows are actually gone.
 					await chQuery(
 						this.env,
-						`DELETE FROM default.ca_drop_work_items
-						 WHERE (list_type, hash) NOT IN (
-						     SELECT list_type, hash FROM default.ca_drop_match_run
+						`ALTER TABLE default.ca_drop_work_items
+						 DELETE WHERE concat(list_type, ':', hash) NOT IN (
+						     SELECT concat(list_type, ':', hash)
+						     FROM default.ca_drop_match_run
 						     WHERE run_id = {run_id:String}
-						 )`,
+						 )
+						 SETTINGS mutations_sync = 2`,
 						{ run_id: runId },
 					);
 					const [row] = await chQuery<{ n: number }>(
