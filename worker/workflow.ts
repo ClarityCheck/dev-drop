@@ -54,7 +54,7 @@ ORDER BY type, normalized_value
 LIMIT {batch:UInt32}
 `;
 
-export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
+export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
 		const runId = event.instanceId;
 		const batchSize = event.payload?.batchSize ?? 20000;
@@ -81,12 +81,12 @@ export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
 		// ---------------------------------------------------------------
 		if (refreshView) {
 			await notifyStep("refresh view", "running");
-			await step.do("refresh-view", async () => {
+			await step.do("refresh combined view", async () => {
 				await chQuery(this.env, "SYSTEM REFRESH VIEW default.ca_drop_combined_search_result");
 			});
 			// SYSTEM REFRESH VIEW returns immediately; wait for it to settle.
 			await step.do(
-				"await-refresh",
+				"await refresh",
 				{ retries: { limit: 30, delay: "10 seconds", backoff: "constant" } },
 				async () => {
 					const [r] = await chQuery<{ status: string; exception: string }>(
@@ -120,7 +120,7 @@ export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
 			page += 1;
 			if (page > maxPages) throw new Error(`stopped after ${maxPages} pages — raise maxPages deliberately`);
 
-			const rows = await step.do(`fetch-keys-${page}`, async () =>
+			const rows = await step.do(`read keys · page ${page}`, async () =>
 				chQuery<KeyRow>(this.env, KEYS_SQL, {
 					cur_type: curType,
 					cur_nv: curNv,
@@ -130,7 +130,7 @@ export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
 
 			if (rows.length === 0) break;
 
-			const matches = await step.do(`match-kv-${page}`, async () => {
+			const matches = await step.do(`check KV · page ${page}`, async () => {
 				const found: object[] = [];
 				const CONCURRENCY = 50;
 
@@ -158,7 +158,7 @@ export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
 			});
 
 			if (matches.length > 0) {
-				await step.do(`insert-matches-${page}`, async () =>
+				await step.do(`write matches · page ${page}`, async () =>
 					chInsert(this.env, "default.ca_drop_match_run", matches),
 				);
 			}
@@ -177,7 +177,7 @@ export class MyWorkflow extends WorkflowEntrypoint<Env, Params> {
 		// summary
 		// ---------------------------------------------------------------
 		await notifyStep("summary", "running");
-		const summary = await step.do("summary", async () => {
+		const summary = await step.do("summary · count run rows", async () => {
 			const [row] = await chQuery<{ rows: number; work_items: number }>(
 				this.env,
 				`SELECT count() AS rows, uniqExact(work_item_id) AS work_items

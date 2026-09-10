@@ -25,9 +25,9 @@
 	},
 	"workflows": [
 		{
-			"name": "my-workflow",
-			"binding": "MY_WORKFLOW",
-			"class_name": "MyWorkflow"
+			"name": "dev-drop",
+			"binding": "DEV_DROP",
+			"class_name": "DropCheckWorkflow"
 		}
 	],
 	"durable_objects": {

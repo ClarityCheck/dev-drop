@@ -1,5 +1,5 @@
 // Export the Workflow and Durable Object classes
-export { MyWorkflow } from "./workflow";
+export { DropCheckWorkflow } from "./workflow";
 import { chSmokeTest } from "./ch";
 export { WorkflowStatusDO } from "./durable-object";
 
@@ -19,7 +19,7 @@ export default {
 		// API: Start a new workflow instance
 		if (url.pathname === "/api/workflow/start" && request.method === "POST") {
 			try {
-				const instance = await env.MY_WORKFLOW.create({
+				const instance = await env.DEV_DROP.create({
 					params: {
 						timestamp: Date.now(),
 					},
@@ -48,7 +48,7 @@ export default {
 			}
 
 			try {
-				const instance = await env.MY_WORKFLOW.get(instanceId);
+				const instance = await env.DEV_DROP.get(instanceId);
 				const status = await instance.status();
 				return Response.json(status);
 			} catch {
@@ -77,7 +77,7 @@ export default {
 					approved: boolean;
 					comment?: string;
 				};
-				const instance = await env.MY_WORKFLOW.get(instanceId);
+				const instance = await env.DEV_DROP.get(instanceId);
 
 				await instance.sendEvent({
 					type: "user-approval",
