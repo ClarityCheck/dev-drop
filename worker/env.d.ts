@@ -1,7 +1,10 @@
-// Secrets are not declared in wrangler.jsonc, so `wrangler types` cannot see
-// them. Declare them here so the Worker and Workflow type-check.
-declare namespace Cloudflare {
-	interface Env {
-		CH_PASSWORD: string;
-	}
+/**
+ * Secrets are not declared in wrangler.jsonc, so `wrangler types` cannot
+ * generate them. Declaration merging adds them to the global Env interface,
+ * which means running `npm run cf-typegen` will not drop them again.
+ *
+ *   npx wrangler secret put CH_PASSWORD
+ */
+interface Env {
+	CH_PASSWORD: string;
 }

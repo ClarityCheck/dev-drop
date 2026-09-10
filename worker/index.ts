@@ -19,11 +19,15 @@ export default {
 		// API: Start a new workflow instance
 		if (url.pathname === "/api/workflow/start" && request.method === "POST") {
 			try {
-				const instance = await env.DEV_DROP.create({
-					params: {
-						timestamp: Date.now(),
-					},
-				});
+				// Optional body: { refreshView?: boolean, batchSize?: number, maxPages?: number }
+				let params: Record<string, unknown> = {};
+				try {
+					params = (await request.json()) as Record<string, unknown>;
+				} catch {
+					// no body — run with defaults
+				}
+
+				const instance = await env.DEV_DROP.create({ params });
 
 				return Response.json({
 					instanceId: instance.id,
