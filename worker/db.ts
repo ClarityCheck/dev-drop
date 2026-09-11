@@ -41,6 +41,25 @@ export type WorkItemRow = {
 	request_date: string | null;
 };
 
+/**
+ * sql.end() waits for the connection to close, and on a half-open TLS socket
+ * that wait does not finish — which is why db-test was answering a bare 500:
+ * the handler had its result and was stuck in `finally`. Closing is
+ * best-effort, and nothing downstream depends on it: Hyperdrive (or the
+ * pooler) owns the real connection.
+ */
+async function closeQuietly(sql: { end: (o?: { timeout?: number }) => Promise<void> } | undefined) {
+	if (!sql) return;
+	try {
+		await Promise.race([
+			sql.end({ timeout: 1 }),
+			new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+		]);
+	} catch {
+		// a connection that never opened has nothing worth reporting on close
+	}
+}
+
 /** Nothing in workerd enforces postgres.js's own connect_timeout, so a socket
  *  that never establishes would hang the whole step until the Workflow's
  *  timeout. This turns that into a real error with a usable message. */
@@ -185,7 +204,7 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 		console.log(`db: upserted ${rows.length} rows`);
 		return rows.length;
 	} finally {
-		await sql.end({ timeout: 5 });
+		await closeQuietly(sql);
 	}
 }
 
@@ -252,11 +271,7 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 		out.ok = false;
 		out.error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
 	} finally {
-		try {
-			await sql?.end({ timeout: 5 });
-		} catch {
-			// closing a connection that never opened is not worth reporting
-		}
+		await closeQuietly(sql);
 	}
 	timings.total_ms = Date.now() - t0;
 	out.timings = timings;

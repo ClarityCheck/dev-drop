@@ -159,25 +159,33 @@ export default {
 			"/api/logs-test": logsSmokeTest,
 		};
 		// Everything at once: GET /api/diag
+		// In parallel — in series the socket probe's stages plus the database
+		// timeout add up past most clients' patience, and a caller that gives
+		// up learns nothing.
 		if (url.pathname === "/api/diag") {
-			const report: Record<string, unknown> = {};
-			for (const [name, run] of [
+			const checks: [string, () => Promise<Response>][] = [
 				["socket", () => socketProbe(env, url)],
 				["db", () => dbSmokeTest(env)],
 				["clickhouse", () => chSmokeTest(env)],
 				["logs", () => logsSmokeTest(env)],
-			] as [string, () => Promise<Response>][]) {
-				try {
-					report[name] = await (await run()).json();
-				} catch (e) {
-					report[name] = {
-						ok: false,
-						error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-					};
-				}
-			}
-			const parts = Object.values(report) as { ok?: boolean }[];
-			return Response.json({ ok: parts.every((p) => p.ok === true), ...report });
+			];
+			const settled = await Promise.all(
+				checks.map(async ([name, run]) => {
+					try {
+						return [name, await (await run()).json()] as const;
+					} catch (e) {
+						return [
+							name,
+							{ ok: false, error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) },
+						] as const;
+					}
+				}),
+			);
+			const report = Object.fromEntries(settled);
+			return Response.json({
+				ok: settled.every(([, r]) => (r as { ok?: boolean }).ok === true),
+				...report,
+			});
 		}
 
 		if (url.pathname === "/api/socket-test") {
