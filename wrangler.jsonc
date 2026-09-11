@@ -21,7 +21,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "dev-drop-check-ch",
+	"name": "dev-drop",
 	"main": "worker/index.ts",
 	"compatibility_date": "2025-10-08",
 	"assets": {
