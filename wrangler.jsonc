@@ -26,7 +26,16 @@
 	"compatibility_date": "2025-10-08",
 	"assets": {
 		"directory": "./dist",
-		"not_found_handling": "single-page-application"
+		"not_found_handling": "single-page-application",
+		// Without this, opening /api/... in a browser returns the SPA shell
+		// instead of calling the Worker: a top-level navigation carries
+		// Sec-Fetch-Mode: navigate, and for those Cloudflare applies
+		// not_found_handling rather than invoking the script. Plain fetch()
+		// reached the Worker all along, which is why a browser and a script
+		// saw different things for the same URL.
+		"run_worker_first": [
+			"/api/*"
+		]
 	},
 	"observability": {
 		"enabled": true
