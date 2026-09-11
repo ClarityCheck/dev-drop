@@ -93,11 +93,15 @@ export async function socketProbe(env: Env, url: URL): Promise<Response> {
 			return Response.json(out);
 		}
 
-		// 3. TLS upgrade. servername matters: without SNI the handshake fails
-		//    outright, which is what this probe did on its first attempt. The
-		//    driver passes it too (postgres/cf/src/connection.js: servername).
+		// 3. TLS upgrade. The hostname matters: without it the handshake fails
+		//    outright, which is what this probe did on its first attempt.
+		//    workerd calls the option expectedServerHostname — NOT servername,
+		//    which is what postgres.js's cf build passes
+		//    (postgres/cf/src/connection.js:279, polyfills.js:116). workerd
+		//    ignores unknown keys, so the driver upgrades without ever naming
+		//    the host. That is a strong candidate for the driver's hang.
 		t = Date.now();
-		const secure = socket.startTls({ servername: host });
+		const secure = socket.startTls({ expectedServerHostname: host });
 		await timeout(secure.opened, 8000, "TLS handshake");
 		stages.push({ stage: "starttls", ms: Date.now() - t, ok: true });
 		socket = secure;
