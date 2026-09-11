@@ -111,13 +111,8 @@ function describe(env: Env): string {
 }
 
 /**
- * One client per step. `prepare: false` because the connection is not
- * exclusively ours between statements; `fetch_types: false` saves a round trip
- * on connect. Hyperdrive keeps the real pool, so this is cheap.
- */
-/**
- * Everything that can be wrong with the connection string, said plainly.
- * Without this, a placeholder left in the secret surfaces as
+ * Everything that can be wrong with the fallback connection string, said
+ * plainly. Without this, a placeholder left in the secret surfaces as
  * "TypeError: Invalid URL string." from inside the driver, four retries deep.
  */
 function checkUrl(url: string): void {
@@ -145,8 +140,8 @@ function checkUrl(url: string): void {
 		throw new Error(
 			`${u.hostname} is the direct host, which Supabase serves over IPv6 only ` +
 				"unless the project has the IPv4 add-on — a Worker socket hangs on it. " +
-				"Use the shared pooler in session mode instead (aws-N-<region>.pooler.supabase.com:5432). " +
-				"The direct host is what the Hyperdrive config wants, not the Worker.",
+				"Use the shared pooler in session mode instead. The direct host is what " +
+				"the Hyperdrive config wants, not the Worker.",
 		);
 	}
 	if (u.hostname.endsWith(".pooler.supabase.com") && !u.username.includes(".")) {
@@ -156,8 +151,32 @@ function checkUrl(url: string): void {
 	}
 }
 
+/**
+ * One client per step, with options that depend on which path we are on —
+ * they are not interchangeable.
+ *
+ * Through Hyperdrive: exactly Cloudflare's documented sample, and no ssl.
+ * The hop from the Worker to hyperdrive.local is internal; Hyperdrive does
+ * the real TLS to Supabase itself with verify-full. Forcing ssl here makes
+ * the driver send an SSLRequest into that internal hop and wait forever for
+ * an answer that never comes — which is what made db-test hang at 8s.
+ *
+ * Direct to the pooler (the SUPABASE_DB_URL fallback): the opposite. TLS is
+ * ours to ask for, and `prepare` must be off because Supavisor in
+ * transaction mode does not keep prepared statements.
+ */
 function connect(env: Env) {
-	const url = connectionString(env);
+	const hyperdrive = (env as unknown as { DROP_DB?: { connectionString?: string } }).DROP_DB;
+
+	if (hyperdrive?.connectionString) {
+		return postgres(hyperdrive.connectionString, {
+			max: 5,
+			fetch_types: false,
+			prepare: true,
+		});
+	}
+
+	const url = env.SUPABASE_DB_URL;
 	if (!url) throw new Error("no database: add the DROP_DB Hyperdrive binding or set SUPABASE_DB_URL");
 	checkUrl(url);
 	return postgres(url, {
@@ -166,15 +185,6 @@ function connect(env: Env) {
 		connect_timeout: 15,
 		prepare: false,
 		fetch_types: false,
-		// Supabase refuses a plaintext connection ("ESSLREQUIRED: SSL connection
-		// is required"), and postgres.js defaults to no SSL. Forced here rather
-		// than left to ?sslmode= in the connection string, so a string pasted
-		// without it still works.
-		//
-		// "require" encrypts but does not verify the server's certificate: a
-		// Worker socket cannot be given a CA bundle. That is the gap Hyperdrive
-		// closes with --sslmode verify-full, and the reason this driver path is
-		// the fallback rather than the destination.
 		ssl: "require",
 	});
 }
