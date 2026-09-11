@@ -5,8 +5,11 @@
  * in THIS file. Bindings you added in the dashboard (kv, r2) must be listed
  * here as well, or the next deploy removes them.
  *
- * CH_PASSWORD is NOT here — it is a secret:
+ * Secrets are NOT here:
  *     npx wrangler secret put CH_PASSWORD
+ *     npx wrangler secret put SUPABASE_URL
+ *     npx wrangler secret put SUPABASE_ANON_KEY
+ *     npx wrangler secret put SUPABASE_JWT_SECRET
  *
  * The KV namespace `id` below is the namespace UUID, not its name. Get it with:
  *     npx wrangler kv namespace list
@@ -25,9 +28,14 @@
 	},
 	"workflows": [
 		{
-			"name": "dev-drop",
-			"binding": "DEV_DROP",
-			"class_name": "DropCheckWorkflow"
+			"name": "drop-reports",
+			"binding": "DROP_REPORTS",
+			"class_name": "DropReportsWorkflow"
+		},
+		{
+			"name": "drop-sync",
+			"binding": "DROP_SYNC",
+			"class_name": "DropSyncWorkflow"
 		}
 	],
 	"durable_objects": {

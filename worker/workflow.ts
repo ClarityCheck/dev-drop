@@ -1,9 +1,9 @@
-import { WorkflowEntrypoint, WorkflowStep } from "cloudflare:workers";
-import type { WorkflowEvent } from "cloudflare:workers";
+import { WorkflowEntrypoint } from "cloudflare:workers";
+import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chQuery, chInsert, fromB64Url } from "./ch";
 
 /**
- * Cron C — ClickHouse check (partial: matching only)
+ * Cron C — ClickHouse check  (workflow: drop-reports)
  *
  *   ⓿ optionally refresh ca_drop_combined_search_result
  *   ① copy the DROP hash set from KV into default.ca_drop_work_items
@@ -18,7 +18,7 @@ import { chQuery, chInsert, fromB64Url } from "./ch";
  * KV remains the source of truth and still serves the real-time Lookup gate.
  *
  * Not implemented yet: the R2 log, the expire in entity_search_results,
- * the D1 status write and the BetterStack alert.
+ * the Supabase status write and the BetterStack alert.
  *
  * run_id is the workflow instanceId, so a retry reuses it. ca_drop_match_run
  * is PARTITION BY run_id, so a bad run can be discarded as one partition:
@@ -52,7 +52,7 @@ type Params = {
 
 type KvMeta = { work_item_id?: string; request_date?: string };
 
-export class DropCheckWorkflow extends WorkflowEntrypoint<Env, Params> {
+export class DropReportsWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
 		const runId = event.instanceId;
 		const kvPageSize = event.payload?.kvPageSize ?? 400;

@@ -7,12 +7,12 @@ import { describe, it, expect } from "vitest";
  * CH_USER and CH_PASSWORD in the test env. Without them the first step
  * fails, which is what the second test asserts.
  */
-describe("DropCheckWorkflow", () => {
+describe("DropReportsWorkflow", () => {
 	it("starts and reaches the first ClickHouse step", async () => {
 		const instanceId = `test-${Date.now()}`;
 
 		await using instance = await introspectWorkflowInstance(
-			env.DEV_DROP,
+			env.DROP_REPORTS,
 			instanceId,
 		);
 
@@ -20,7 +20,7 @@ describe("DropCheckWorkflow", () => {
 			await m.disableSleeps();
 		});
 
-		await env.DEV_DROP.create({
+		await env.DROP_REPORTS.create({
 			id: instanceId,
 			params: { kvPageSize: 10, maxKvPages: 1, refreshView: false },
 		});
@@ -35,7 +35,7 @@ describe("DropCheckWorkflow", () => {
 		// Cron C must never block on a person: every step is autonomous, so a
 		// forced event timeout has nothing to time out on.
 		const src = await import("../worker/workflow");
-		expect(src.DropCheckWorkflow).toBeDefined();
-		expect(String(src.DropCheckWorkflow)).not.toContain("waitForEvent");
+		expect(src.DropReportsWorkflow).toBeDefined();
+		expect(String(src.DropReportsWorkflow)).not.toContain("waitForEvent");
 	});
 });
