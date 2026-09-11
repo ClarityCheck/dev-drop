@@ -169,7 +169,7 @@ export async function logsSmokeTest(env: Env): Promise<Response> {
 		out.hint =
 			"set LOGS_HOST in wrangler.jsonc to the source's ingesting host " +
 			"(s<id>.<region>.betterstackdata.com) and LOGS_TOKEN as a secret, then redeploy";
-		return Response.json(out, { status: 500 });
+		return Response.json(out);
 	}
 	try {
 		const res = await fetch(`https://${env.LOGS_HOST}/`, {
@@ -194,5 +194,5 @@ export async function logsSmokeTest(env: Env): Promise<Response> {
 		out.ok = false;
 		out.error = String(e);
 	}
-	return Response.json(out, { status: out.ok ? 200 : 500 });
+	return Response.json(out);
 }

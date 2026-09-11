@@ -140,5 +140,5 @@ export async function chSmokeTest(env: Env): Promise<Response> {
 		out.ok = false;
 		out.error = String(e);
 	}
-	return Response.json(out, { status: out.ok ? 200 : 500 });
+	return Response.json(out);
 }

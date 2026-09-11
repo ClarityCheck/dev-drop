@@ -191,7 +191,7 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 	};
 	if (!hasDb(env)) {
 		out.hint = "create the Hyperdrive config, or set SUPABASE_DB_URL as a secret";
-		return Response.json(out, { status: 500 });
+		return Response.json(out);
 	}
 
 	const url = connectionString(env);
@@ -200,7 +200,7 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 	} catch (e) {
 		out.ok = false;
 		out.error = String(e);
-		return Response.json(out, { status: 500 });
+		return Response.json(out);
 	}
 
 	const sql = connect(env);
@@ -231,5 +231,5 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 	} finally {
 		await sql.end({ timeout: 5 });
 	}
-	return Response.json(out, { status: out.ok ? 200 : 500 });
+	return Response.json(out);
 }
