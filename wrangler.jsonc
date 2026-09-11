@@ -46,19 +46,6 @@
 			"class_name": "DropDownloaderWorkflow"
 		}
 	],
-	// Postgres for the Workflows. Create it once, then paste the id here:
-	//   npx wrangler cert upload certificate-authority \
-	//       --ca-cert supabase-ca.pem --name supabase-ca
-	//   npx wrangler hyperdrive create drop-db \
-	//       --connection-string="postgresql://drop_workflow:<PASSWORD>@db.vsqxnmrvvjsgcrudpruy.supabase.co:5432/postgres" \
-	//       --sslmode verify-full --ca-certificate-id <UUID>
-	// Until then the code falls back to the SUPABASE_DB_URL secret.
-	// "hyperdrive": [
-	// 	{
-	// 		"binding": "DROP_DB",
-	// 		"id": "<HYPERDRIVE_CONFIG_ID>"
-	// 	}
-	// ],
 	"durable_objects": {
 		"bindings": [
 			{
@@ -102,5 +89,16 @@
 	},
 	"triggers": {
 		"crons": []
-	}
+	},
+	// Postgres, through Hyperdrive: Cloudflare holds the pool and does the TLS
+	// handshake with sslmode=verify-full against the uploaded Supabase root CA.
+	// The config was validated at creation — Hyperdrive runs a test query then,
+	// so credentials, CA and the (IPv6) direct host are all proven.
+	//   config: drop-db · origin db.vsqxnmrvvjsgcrudpruy.supabase.co:5432
+	"hyperdrive": [
+		{
+			"binding": "DROP_DB",
+			"id": "df29c50286574600a5f37d7c2490589c"
+		}
+	]
 }
