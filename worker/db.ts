@@ -195,16 +195,14 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 	}
 
 	const url = connectionString(env);
+	// Everything from here is inside one try: connect() and postgres() can both
+	// throw synchronously, and a throw that escapes turns this into a bare 500
+	// with no body — which is the one thing a diagnostic must never do.
+	let sql: ReturnType<typeof connect> | undefined;
 	try {
 		if (url) checkUrl(url);
-	} catch (e) {
-		out.ok = false;
-		out.error = String(e);
-		return Response.json(out);
-	}
+		sql = connect(env);
 
-	const sql = connect(env);
-	try {
 		const [who] = await withTimeout(
 			sql`SELECT current_user AS role, current_database() AS db`,
 			20000,
@@ -212,24 +210,36 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 		);
 		out.identity = who;
 
-		const [rows] = await sql`SELECT count(*)::int AS n FROM public.ca_drop_work_item`;
+		const [rows] = await withTimeout(
+			sql`SELECT count(*)::int AS n FROM public.ca_drop_work_item`,
+			20000,
+			"count ca_drop_work_item",
+		);
 		out.work_item_rows = rows.n;
 
 		// The grant should reach exactly one table. Anything higher means the
 		// role can see tables it has no business seeing.
-		const [reach] = await sql`
-			SELECT count(DISTINCT table_name)::int AS n
-			FROM information_schema.table_privileges
-			WHERE grantee = current_user AND privilege_type = 'SELECT'
-		`;
+		const [reach] = await withTimeout(
+			sql`
+				SELECT count(DISTINCT table_name)::int AS n
+				FROM information_schema.table_privileges
+				WHERE grantee = current_user AND privilege_type = 'SELECT'
+			`,
+			20000,
+			"privilege check",
+		);
 		out.selectable_tables = reach.n;
 
 		out.ok = true;
 	} catch (e) {
 		out.ok = false;
-		out.error = String(e);
+		out.error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
 	} finally {
-		await sql.end({ timeout: 5 });
+		try {
+			await sql?.end({ timeout: 5 });
+		} catch {
+			// closing a connection that never opened is not worth reporting
+		}
 	}
 	return Response.json(out);
 }

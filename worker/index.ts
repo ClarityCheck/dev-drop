@@ -151,14 +151,23 @@ export default {
 
 		// Diagnostics: verify the wiring before running anything.
 		// GET /api/ch-test   GET /api/db-test   GET /api/logs-test
-		if (url.pathname === "/api/ch-test") {
-			return chSmokeTest(env);
-		}
-		if (url.pathname === "/api/db-test") {
-			return dbSmokeTest(env);
-		}
-		if (url.pathname === "/api/logs-test") {
-			return logsSmokeTest(env);
+		const diagnostics: Record<string, (e: Env) => Promise<Response>> = {
+			"/api/ch-test": chSmokeTest,
+			"/api/db-test": dbSmokeTest,
+			"/api/logs-test": logsSmokeTest,
+		};
+		const diagnostic = diagnostics[url.pathname];
+		if (diagnostic) {
+			try {
+				return await diagnostic(env);
+			} catch (e) {
+				// A diagnostic that 500s tells you nothing. Report the throw instead.
+				return Response.json({
+					ok: false,
+					error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+					where: url.pathname,
+				});
+			}
 		}
 
 		return Response.json({ error: "Not Found" }, { status: 404 });
