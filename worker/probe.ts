@@ -93,9 +93,11 @@ export async function socketProbe(env: Env, url: URL): Promise<Response> {
 			return Response.json(out);
 		}
 
-		// 3. TLS upgrade
+		// 3. TLS upgrade. servername matters: without SNI the handshake fails
+		//    outright, which is what this probe did on its first attempt. The
+		//    driver passes it too (postgres/cf/src/connection.js: servername).
 		t = Date.now();
-		const secure = socket.startTls();
+		const secure = socket.startTls({ servername: host });
 		await timeout(secure.opened, 8000, "TLS handshake");
 		stages.push({ stage: "starttls", ms: Date.now() - t, ok: true });
 		socket = secure;
