@@ -146,6 +146,16 @@ function connect(env: Env) {
 		connect_timeout: 15,
 		prepare: false,
 		fetch_types: false,
+		// Supabase refuses a plaintext connection ("ESSLREQUIRED: SSL connection
+		// is required"), and postgres.js defaults to no SSL. Forced here rather
+		// than left to ?sslmode= in the connection string, so a string pasted
+		// without it still works.
+		//
+		// "require" encrypts but does not verify the server's certificate: a
+		// Worker socket cannot be given a CA bundle. That is the gap Hyperdrive
+		// closes with --sslmode verify-full, and the reason this driver path is
+		// the fallback rather than the destination.
+		ssl: "require",
 	});
 }
 
