@@ -4,6 +4,7 @@ export { DropDownloaderWorkflow } from "./workflow-downloader";
 import { chSmokeTest } from "./ch";
 import { dbSmokeTest } from "./db";
 import { logsSmokeTest } from "./logs";
+import { socketProbe } from "./probe";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
@@ -150,12 +151,24 @@ export default {
 		}
 
 		// Diagnostics: verify the wiring before running anything.
-		// GET /api/ch-test   GET /api/db-test   GET /api/logs-test
+		// GET /api/ch-test   GET /api/db-test   GET /api/logs-test   GET /api/socket-test
 		const diagnostics: Record<string, (e: Env) => Promise<Response>> = {
 			"/api/ch-test": chSmokeTest,
 			"/api/db-test": dbSmokeTest,
 			"/api/logs-test": logsSmokeTest,
 		};
+		if (url.pathname === "/api/socket-test") {
+			try {
+				return await socketProbe(env, url);
+			} catch (e) {
+				return Response.json({
+					ok: false,
+					error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+					where: url.pathname,
+				});
+			}
+		}
+
 		const diagnostic = diagnostics[url.pathname];
 		if (diagnostic) {
 			try {
