@@ -32,7 +32,7 @@
  */
 
 import postgres from "postgres";
-import { logEvent } from "./logs";
+import { logEvent, version } from "./logs";
 
 export type WorkItemRow = {
 	list_type: string;
@@ -211,6 +211,7 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 /** Connectivity + privilege check. GET /api/db-test */
 export async function dbSmokeTest(env: Env): Promise<Response> {
 	const out: Record<string, unknown> = {
+		version: version(env),
 		configured: hasDb(env),
 		via: (env as unknown as { DROP_DB?: unknown }).DROP_DB ? "hyperdrive" : "SUPABASE_DB_URL",
 		target: describe(env),

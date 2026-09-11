@@ -16,7 +16,7 @@
  * needed — this probe cannot leak anything.
  */
 
-import { logEvent } from "./logs";
+import { logEvent, version } from "./logs";
 
 type Stage = { stage: string; ms: number; ok: boolean; detail?: string };
 
@@ -50,7 +50,7 @@ export async function socketProbe(env: Env, url: URL): Promise<Response> {
 	}
 
 	const stages: Stage[] = [];
-	const out: Record<string, unknown> = { host, port, stages };
+	const out: Record<string, unknown> = { version: version(env), host, port, stages };
 	let socket: Socket | undefined;
 
 	try {

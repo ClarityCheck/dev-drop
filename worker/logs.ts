@@ -82,6 +82,12 @@ function numericOnly(value: unknown): Record<string, number> | undefined {
  * Wraps step.do. Same call shapes as the original — (name, fn) and
  * (name, config, fn) — so it is a drop-in replacement.
  */
+/** The deployed version that is answering, from the version_metadata binding. */
+export function version(env: Env): string {
+	const v = (env as unknown as { CF_VERSION?: { id?: string; tag?: string } }).CF_VERSION;
+	return v?.tag || v?.id?.slice(0, 8) || "unknown";
+}
+
 export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 	return async function tracedStep<T extends Rpc.Serializable<T>>(
 		name: string,
@@ -186,6 +192,7 @@ export async function logRun(
  */
 export async function logsSmokeTest(env: Env): Promise<Response> {
 	const out: Record<string, unknown> = {
+		version: version(env),
 		host: env.LOGS_HOST ?? null,
 		token: env.LOGS_TOKEN ? "set" : "missing",
 		configured: configured(env),

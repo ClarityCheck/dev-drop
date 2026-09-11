@@ -5,6 +5,7 @@ import { chSmokeTest } from "./ch";
 import { dbSmokeTest } from "./db";
 import { logsSmokeTest } from "./logs";
 import { socketProbe } from "./probe";
+import { version } from "./logs";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
@@ -172,7 +173,7 @@ export default {
 			const settled = await Promise.all(
 				checks.map(async ([name, run]) => {
 					try {
-						return [name, await (await run()).json()] as const;
+						return [name, await (await capped(run(), name, version(env))).json()] as const;
 					} catch (e) {
 						return [
 							name,
@@ -190,7 +191,7 @@ export default {
 
 		if (url.pathname === "/api/socket-test") {
 			try {
-				return await socketProbe(env, url);
+				return await capped(socketProbe(env, url), url.pathname, version(env));
 			} catch (e) {
 				return Response.json({
 					ok: false,
@@ -203,7 +204,7 @@ export default {
 		const diagnostic = diagnostics[url.pathname];
 		if (diagnostic) {
 			try {
-				return await diagnostic(env);
+				return await capped(diagnostic(env), url.pathname, version(env));
 			} catch (e) {
 				// A diagnostic that 500s tells you nothing. Report the throw instead.
 				return Response.json({
@@ -217,3 +218,32 @@ export default {
 		return Response.json({ error: "Not Found" }, { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
+
+/**
+ * A diagnostic that does not answer tells you nothing — and the two failures
+ * we hit (a hung socket, then a hung sql.end) both showed up as an empty 500
+ * or a client-side read timeout. Whatever happens inside, something JSON
+ * comes back.
+ */
+async function capped(work: Promise<Response>, where: string, v: string): Promise<Response> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const bail = new Promise<Response>((resolve) => {
+		timer = setTimeout(
+			() =>
+				resolve(
+					Response.json({
+						ok: false,
+						version: v,
+						where,
+						error: "the check did not answer within 25s — it is hanging, not failing",
+					}),
+				),
+			25000,
+		);
+	});
+	try {
+		return await Promise.race([work, bail]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
