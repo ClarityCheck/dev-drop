@@ -10,11 +10,12 @@
  * The service_role key is deliberately not used: it bypasses RLS and every
  * grant, which would make the role pointless.
  *
- * Requires, in Supabase: schema ca_drop added to Project settings → API →
- * Exposed schemas, and GRANT drop_workflow TO authenticator.
+ * The table lives in public, which PostgREST exposes by default, so the only
+ * requirement in Supabase is GRANT drop_workflow TO authenticator. The role is
+ * granted on ca_drop_work_item alone, so it cannot touch the OTP tables that
+ * share the schema.
  */
 
-const SCHEMA = "ca_drop";
 const ROLE = "drop_workflow";
 
 export function hasSupabase(env: Env): boolean {
@@ -50,8 +51,6 @@ async function headers(env: Env, extra: Record<string, string> = {}): Promise<He
 		apikey: env.SUPABASE_ANON_KEY,
 		Authorization: `Bearer ${await roleToken(env)}`,
 		"Content-Type": "application/json",
-		"Content-Profile": SCHEMA,
-		"Accept-Profile": SCHEMA,
 		...extra,
 	};
 }
@@ -105,7 +104,7 @@ export async function sbSmokeTest(env: Env): Promise<Response> {
 	}
 	try {
 		const res = await fetch(
-			`${env.SUPABASE_URL}/rest/v1/work_item?select=id&limit=1`,
+			`${env.SUPABASE_URL}/rest/v1/ca_drop_work_item?select=id&limit=1`,
 			{ headers: await headers(env) },
 		);
 		out.status = res.status;

@@ -13,7 +13,7 @@ import type { ListType } from "./zip";
  *   ① locate the ZIP in R2
  *   ② unzip, parse the list CSVs, write them back to R2 as small pages
  *   ③ clear the DROP prefixes in KV
- *   ④ load each page: KV, and upsert into ca_drop.work_item
+ *   ④ load each page: KV, and upsert into ca_drop_work_item
  *   ⑤ apply the Removed identifiers file
  *   ⑥ drop the parsed pages, summary
  *
@@ -190,7 +190,7 @@ export class DropSyncWorkflow extends WorkflowEntrypoint<Env, Params> {
 
 		// -------------------------------------------------------------
 		// ⑤ Removed identifiers → delete from KV.
-		//    ca_drop.work_item has no column for a revocation, so this is
+		//    ca_drop_work_item has no column for a revocation, so this is
 		//    recorded in the run summary only.
 		// -------------------------------------------------------------
 		let removed = 0;
@@ -261,7 +261,7 @@ export class DropSyncWorkflow extends WorkflowEntrypoint<Env, Params> {
 		if (useSupabase) {
 			await sbUpsert(
 				this.env,
-				"work_item",
+				"ca_drop_work_item",
 				rows.map((r) => ({
 					list_type: listType,
 					work_item_id: r.id,
