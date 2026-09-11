@@ -32,6 +32,7 @@
  */
 
 import postgres from "postgres";
+import { logEvent } from "./logs";
 
 export type WorkItemRow = {
 	list_type: string;
@@ -205,6 +206,8 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 	}
 
 	const url = connectionString(env);
+	const timings: Record<string, number> = {};
+	const t0 = Date.now();
 	// Everything from here is inside one try: connect() and postgres() can both
 	// throw synchronously, and a throw that escapes turns this into a bare 500
 	// with no body — which is the one thing a diagnostic must never do.
@@ -213,18 +216,22 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 		if (url) checkUrl(url);
 		sql = connect(env);
 
+		let t = Date.now();
 		const [who] = await withTimeout(
 			sql`SELECT current_user AS role, current_database() AS db`,
 			20000,
 			"connect",
 		);
+		timings.connect_and_first_query_ms = Date.now() - t;
 		out.identity = who;
 
+		t = Date.now();
 		const [rows] = await withTimeout(
 			sql`SELECT count(*)::int AS n FROM public.ca_drop_work_item`,
 			20000,
 			"count ca_drop_work_item",
 		);
+		timings.count_ms = Date.now() - t;
 		out.work_item_rows = rows.n;
 
 		// The grant should reach exactly one table. Anything higher means the
@@ -251,5 +258,13 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 			// closing a connection that never opened is not worth reporting
 		}
 	}
+	timings.total_ms = Date.now() - t0;
+	out.timings = timings;
+	// So a failed check is in the log stream too, not only in whoever's browser.
+	await logEvent(env, "db-test", out.ok === true, {
+		error: out.error as string | undefined,
+		result: { ...timings, work_item_rows: Number(out.work_item_rows ?? -1) },
+		duration_ms: timings.total_ms,
+	});
 	return Response.json(out);
 }

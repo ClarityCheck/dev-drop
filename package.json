@@ -1,6 +1,6 @@
 {
-	"name": "dev-drop-check-ch",
-	"description": "Interactive starter template demonstrating Cloudflare Workflows with real-time status updates",
+	"name": "dev-drop",
+	"description": "CA DROP pipeline: drop-downloader (Cron A) and drop-reports-cleanup (Cron C) as Cloudflare Workflows",
 	"cloudflare": {
 		"label": "Workflows Starter",
 		"products": [

@@ -151,12 +151,35 @@ export default {
 		}
 
 		// Diagnostics: verify the wiring before running anything.
+		// GET /api/diag runs all of them; individually:
 		// GET /api/ch-test   GET /api/db-test   GET /api/logs-test   GET /api/socket-test
 		const diagnostics: Record<string, (e: Env) => Promise<Response>> = {
 			"/api/ch-test": chSmokeTest,
 			"/api/db-test": dbSmokeTest,
 			"/api/logs-test": logsSmokeTest,
 		};
+		// Everything at once: GET /api/diag
+		if (url.pathname === "/api/diag") {
+			const report: Record<string, unknown> = {};
+			for (const [name, run] of [
+				["socket", () => socketProbe(env, url)],
+				["db", () => dbSmokeTest(env)],
+				["clickhouse", () => chSmokeTest(env)],
+				["logs", () => logsSmokeTest(env)],
+			] as [string, () => Promise<Response>][]) {
+				try {
+					report[name] = await (await run()).json();
+				} catch (e) {
+					report[name] = {
+						ok: false,
+						error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+					};
+				}
+			}
+			const parts = Object.values(report) as { ok?: boolean }[];
+			return Response.json({ ok: parts.every((p) => p.ok === true), ...report });
+		}
+
 		if (url.pathname === "/api/socket-test") {
 			try {
 				return await socketProbe(env, url);

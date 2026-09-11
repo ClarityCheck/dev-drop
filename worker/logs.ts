@@ -134,6 +134,31 @@ export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 	};
 }
 
+/**
+ * One-off event, for things that are not workflow steps — the diagnostic
+ * endpoints. Same guarantees: never throws, and only numeric fields of
+ * `result` are shipped.
+ */
+export async function logEvent(
+	env: Env,
+	what: string,
+	ok: boolean,
+	extra?: { error?: string; result?: unknown; duration_ms?: number },
+): Promise<void> {
+	await ship(env, {
+		workflow: "(diagnostics)",
+		run_id: "-",
+		dt: new Date().toISOString(),
+		level: ok ? "info" : "error",
+		message: `${what}: ${ok ? "ok" : "failed"}`,
+		step: what,
+		phase: ok ? "completed" : "failed",
+		attempt_duration_ms: extra?.duration_ms,
+		result: numericOnly(extra?.result),
+		error: extra?.error,
+	});
+}
+
 /** Run-level bookend, so a run that dies between steps is still visible. */
 export async function logRun(
 	env: Env,

@@ -16,6 +16,8 @@
  * needed — this probe cannot leak anything.
  */
 
+import { logEvent } from "./logs";
+
 type Stage = { stage: string; ms: number; ok: boolean; detail?: string };
 
 function timeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -120,5 +122,9 @@ export async function socketProbe(env: Env, url: URL): Promise<Response> {
 		}
 	}
 
+	await logEvent(env, "socket-test", out.ok === true, {
+		error: stages.find((x) => !x.ok)?.detail,
+		result: Object.fromEntries(stages.map((x) => [`${x.stage}_ms`, x.ms])),
+	});
 	return Response.json(out);
 }

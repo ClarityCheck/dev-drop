@@ -1,5 +1,5 @@
 /**
- * Wrangler config for dev-drop-check-ch.
+ * Wrangler config for the dev-drop Worker.
  *
  * IMPORTANT: `wrangler deploy` replaces the Worker's bindings with whatever is
  * in THIS file. Bindings you added in the dashboard (kv, r2) must be listed
