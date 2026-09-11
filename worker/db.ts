@@ -239,7 +239,7 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 		let t = Date.now();
 		const [who] = await withTimeout(
 			sql`SELECT current_user AS role, current_database() AS db`,
-			20000,
+			8000,
 			"connect",
 		);
 		timings.connect_and_first_query_ms = Date.now() - t;
@@ -248,7 +248,7 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 		t = Date.now();
 		const [rows] = await withTimeout(
 			sql`SELECT count(*)::int AS n FROM public.ca_drop_work_item`,
-			20000,
+			8000,
 			"count ca_drop_work_item",
 		);
 		timings.count_ms = Date.now() - t;
@@ -262,7 +262,7 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 				FROM information_schema.table_privileges
 				WHERE grantee = current_user AND privilege_type = 'SELECT'
 			`,
-			20000,
+			8000,
 			"privilege check",
 		);
 		out.selectable_tables = reach.n;

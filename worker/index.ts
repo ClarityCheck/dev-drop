@@ -235,10 +235,10 @@ async function capped(work: Promise<Response>, where: string, v: string): Promis
 						ok: false,
 						version: v,
 						where,
-						error: "the check did not answer within 25s — it is hanging, not failing",
+						error: "the check did not answer within 12s — it is hanging, not failing",
 					}),
 				),
-			25000,
+			12000,
 		);
 	});
 	try {

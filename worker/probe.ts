@@ -100,8 +100,43 @@ export async function socketProbe(env: Env, url: URL): Promise<Response> {
 		stages.push({ stage: "starttls", ms: Date.now() - t, ok: true });
 		socket = secure;
 
-		out.ok = true;
-		out.conclusion = "network and TLS are fine — anything failing above this is the driver or the credentials";
+		// 4. Postgres startup, over TLS. A StartupMessage carries the user and
+		//    database but no password, so this stays credential-free: we only
+		//    read what the server asks for. 'R' = authentication request (the
+		//    server is speaking Postgres), 'E' = error (e.g. Supavisor saying
+		//    the tenant or user is unknown, which is a useful answer too).
+		t = Date.now();
+		const user = url.searchParams.get("user") ?? "drop_workflow.vsqxnmrvvjsgcrudpruy";
+		const params = new TextEncoder().encode(`user\0${user}\0database\0postgres\0\0`);
+		const startup = new Uint8Array(8 + params.length);
+		const dv = new DataView(startup.buffer);
+		dv.setInt32(0, startup.length);
+		dv.setInt32(4, 196608); // protocol 3.0
+		startup.set(params, 8);
+
+		const w2 = secure.writable.getWriter();
+		await timeout(w2.write(startup), 5000, "write StartupMessage");
+		w2.releaseLock();
+
+		const r2 = secure.readable.getReader();
+		const reply = await timeout(r2.read(), 8000, "read startup reply");
+		const tag = reply.value ? String.fromCharCode(reply.value[0]) : "(nothing)";
+		const text = reply.value
+			? new TextDecoder().decode(reply.value.subarray(0, 200)).replace(/[^\x20-\x7e]+/g, " ").trim()
+			: "";
+		r2.releaseLock();
+		stages.push({
+			stage: "startup",
+			ms: Date.now() - t,
+			ok: tag === "R",
+			detail: `server tag "${tag}" (R = asks to authenticate, E = error) · ${text}`,
+		});
+
+		out.ok = tag === "R";
+		out.conclusion =
+			tag === "R"
+				? "the server completes TLS and asks for authentication — the network, the host, the port and the user routing are all fine, so a hang past this point is the driver"
+				: "TLS is fine but the server did not ask for authentication: read the tag and text above";
 	} catch (e) {
 		stages.push({
 			stage: "failed",
