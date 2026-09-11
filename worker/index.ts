@@ -3,6 +3,7 @@ export { DropReportsCleanupWorkflow } from "./workflow-reports-cleanup";
 export { DropDownloaderWorkflow } from "./workflow-downloader";
 import { chSmokeTest } from "./ch";
 import { dbSmokeTest } from "./db";
+import { logsSmokeTest } from "./logs";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
@@ -149,12 +150,15 @@ export default {
 		}
 
 		// Diagnostics: verify the wiring before running anything.
-		// GET /api/ch-test   GET /api/db-test
+		// GET /api/ch-test   GET /api/db-test   GET /api/logs-test
 		if (url.pathname === "/api/ch-test") {
 			return chSmokeTest(env);
 		}
 		if (url.pathname === "/api/db-test") {
 			return dbSmokeTest(env);
+		}
+		if (url.pathname === "/api/logs-test") {
+			return logsSmokeTest(env);
 		}
 
 		return Response.json({ error: "Not Found" }, { status: 404 });

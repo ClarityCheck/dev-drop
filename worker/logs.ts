@@ -40,8 +40,14 @@ type Entry = Context & {
 	error?: string;
 };
 
+function configured(env: Env): boolean {
+	// A LOGS_HOST left as the <sXXXX...> placeholder is treated as unset, so it
+	// fails quietly instead of throwing on every step.
+	return Boolean(env.LOGS_HOST && !/[<>]/.test(env.LOGS_HOST) && env.LOGS_TOKEN);
+}
+
 async function ship(env: Env, entry: Entry): Promise<void> {
-	if (!env.LOGS_HOST || !env.LOGS_TOKEN) return;
+	if (!configured(env)) return;
 	try {
 		await fetch(`https://${env.LOGS_HOST}/`, {
 			method: "POST",
@@ -146,4 +152,47 @@ export async function logRun(
 		result: numericOnly(extra?.result),
 		error: extra?.error,
 	});
+}
+
+/**
+ * Ships one entry and reports what Better Stack said. GET /api/logs-test
+ * Unlike the workflow path, this one does NOT swallow errors — the point is
+ * to see them.
+ */
+export async function logsSmokeTest(env: Env): Promise<Response> {
+	const out: Record<string, unknown> = {
+		host: env.LOGS_HOST ?? null,
+		token: env.LOGS_TOKEN ? "set" : "missing",
+		configured: configured(env),
+	};
+	if (!configured(env)) {
+		out.hint =
+			"set LOGS_HOST in wrangler.jsonc to the source's ingesting host " +
+			"(s<id>.<region>.betterstackdata.com) and LOGS_TOKEN as a secret, then redeploy";
+		return Response.json(out, { status: 500 });
+	}
+	try {
+		const res = await fetch(`https://${env.LOGS_HOST}/`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${env.LOGS_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				dt: new Date().toISOString(),
+				level: "info",
+				message: "logs-test from the Worker",
+				workflow: "(smoke test)",
+				step: "(none)",
+				phase: "completed",
+			}),
+		});
+		out.status = res.status;
+		out.body = (await res.text()).slice(0, 300);
+		out.ok = res.ok;
+	} catch (e) {
+		out.ok = false;
+		out.error = String(e);
+	}
+	return Response.json(out, { status: out.ok ? 200 : 500 });
 }

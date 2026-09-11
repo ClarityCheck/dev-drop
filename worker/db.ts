@@ -95,9 +95,51 @@ function describe(env: Env): string {
  * exclusively ours between statements; `fetch_types: false` saves a round trip
  * on connect. Hyperdrive keeps the real pool, so this is cheap.
  */
+/**
+ * Everything that can be wrong with the connection string, said plainly.
+ * Without this, a placeholder left in the secret surfaces as
+ * "TypeError: Invalid URL string." from inside the driver, four retries deep.
+ */
+function checkUrl(url: string): void {
+	if (/[<>]/.test(url)) {
+		throw new Error(
+			"SUPABASE_DB_URL still contains a placeholder (< or >). Paste the real " +
+				"connection string from Supabase → Connect → Session pooler.",
+		);
+	}
+
+	let u: URL;
+	try {
+		u = new URL(url);
+	} catch {
+		throw new Error(
+			"SUPABASE_DB_URL is not a valid connection string. Expected " +
+				"postgresql://<role>.<project-ref>:<password>@<pooler-host>:5432/postgres",
+		);
+	}
+
+	if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") {
+		throw new Error(`SUPABASE_DB_URL has protocol ${u.protocol}, expected postgresql:`);
+	}
+	if (/^db\..*\.supabase\.co$/.test(u.hostname)) {
+		throw new Error(
+			`${u.hostname} is the direct host, which Supabase serves over IPv6 only ` +
+				"unless the project has the IPv4 add-on — a Worker socket hangs on it. " +
+				"Use the shared pooler in session mode instead (aws-N-<region>.pooler.supabase.com:5432). " +
+				"The direct host is what the Hyperdrive config wants, not the Worker.",
+		);
+	}
+	if (u.hostname.endsWith(".pooler.supabase.com") && !u.username.includes(".")) {
+		throw new Error(
+			`the pooler needs the username as <role>.<project-ref>, got "${u.username}"`,
+		);
+	}
+}
+
 function connect(env: Env) {
 	const url = connectionString(env);
 	if (!url) throw new Error("no database: add the DROP_DB Hyperdrive binding or set SUPABASE_DB_URL");
+	checkUrl(url);
 	return postgres(url, {
 		max: 1,
 		idle_timeout: 10,
@@ -143,8 +185,21 @@ export async function dbSmokeTest(env: Env): Promise<Response> {
 		via: (env as unknown as { DROP_DB?: unknown }).DROP_DB ? "hyperdrive" : "SUPABASE_DB_URL",
 		target: describe(env),
 	};
+	out.logging = {
+		host: env.LOGS_HOST && !/[<>]/.test(env.LOGS_HOST) ? env.LOGS_HOST : "not configured",
+		token: env.LOGS_TOKEN ? "set" : "missing",
+	};
 	if (!hasDb(env)) {
 		out.hint = "create the Hyperdrive config, or set SUPABASE_DB_URL as a secret";
+		return Response.json(out, { status: 500 });
+	}
+
+	const url = connectionString(env);
+	try {
+		if (url) checkUrl(url);
+	} catch (e) {
+		out.ok = false;
+		out.error = String(e);
 		return Response.json(out, { status: 500 });
 	}
 
