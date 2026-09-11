@@ -28,3 +28,8 @@ dist-ssr
 !.dev.vars.example
 .env*
 !.env.example
+
+# Supabase root CA: only an input to `wrangler cert upload`, never read at
+# runtime. Kept out of git — after the upload the certificate lives in
+# Cloudflare, and this file can be deleted.
+supabase-ca.pem
