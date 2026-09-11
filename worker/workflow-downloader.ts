@@ -160,17 +160,29 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 		// -------------------------------------------------------------
 		let cleared = 0;
 		if (clearKv) {
+			// One pass, driven by the cursor — NOT by re-listing until a page
+			// comes back empty. kv.list is eventually consistent: it keeps
+			// returning keys that were just deleted, so an "until empty" loop
+			// deletes the same keys over and over and never terminates.
+			let cursor: string | undefined;
 			let page = 0;
 			for (;;) {
 				page += 1;
 				if (page > maxClearPages) throw new Error(`clear KV: stopped after ${maxClearPages} pages`);
-				const n: number = await step.do(`clear KV · page ${page}`, async () => {
-					const listed = await this.env.kv.list({ limit: pageSize });
-					for (const k of listed.keys) await this.env.kv.delete(k.name);
-					return listed.keys.length;
-				});
-				cleared += n;
-				if (n === 0) break;
+				const result: { cursor?: string; deleted: number } = await step.do(
+					`clear KV · page ${page}`,
+					async () => {
+						const listed = await this.env.kv.list({ limit: pageSize, cursor });
+						for (const k of listed.keys) await this.env.kv.delete(k.name);
+						return {
+							cursor: listed.list_complete ? undefined : listed.cursor,
+							deleted: listed.keys.length,
+						};
+					},
+				);
+				cleared += result.deleted;
+				cursor = result.cursor;
+				if (!cursor) break;
 			}
 		}
 
