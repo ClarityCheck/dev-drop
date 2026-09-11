@@ -5,6 +5,7 @@
  *
  *   npx wrangler secret put CH_PASSWORD
  *   npx wrangler secret put SUPABASE_DB_URL
+ *   npx wrangler secret put LOGS_TOKEN
  *
  * SUPABASE_DB_URL is the fallback used until the DROP_DB Hyperdrive binding
  * exists; db.ts prefers the binding when it is there.
@@ -12,4 +13,6 @@
 interface Env {
 	CH_PASSWORD: string;
 	SUPABASE_DB_URL?: string;
+	/** Better Stack source token. Absent = step logging is simply off. */
+	LOGS_TOKEN?: string;
 }

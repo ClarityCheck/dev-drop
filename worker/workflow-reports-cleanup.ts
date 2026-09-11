@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chQuery, chInsert } from "./ch";
+import { logRun, tracer } from "./logs";
 
 /**
  * Cron C — ClickHouse check  (workflow: drop-reports-cleanup)
@@ -59,6 +60,12 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		const refreshView = event.payload?.refreshView ?? false;
 		const skipKvSync = event.payload?.skipKvSync ?? false;
 		const maxKvPages = event.payload?.maxKvPages ?? 500;
+
+		// Every step below reports started / completed / failed to Better Stack.
+		const ctx = { workflow: "drop-reports-cleanup", run_id: runId };
+		const tracedStep = tracer(this.env, step, ctx);
+		const runStartedAt = Date.now();
+		await logRun(this.env, ctx, "started");
 		const keepFullDropSet = event.payload?.keepFullDropSet ?? false;
 
 		// Progress for the UI. Outside step.do, so it may repeat — updateStep is
@@ -81,14 +88,14 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		// ---------------------------------------------------------------
 		if (refreshView) {
 			await notifyStep("refresh view", "running");
-			await step.do("refresh combined view", async () => {
+			await tracedStep("refresh combined view", async () => {
 				await chQuery(
 					this.env,
 					"SYSTEM REFRESH VIEW default.ca_drop_combined_search_result",
 				);
 			});
 			// SYSTEM REFRESH VIEW returns immediately; wait for it to settle.
-			await step.do(
+			await tracedStep(
 				"await refresh",
 				{ retries: { limit: 60, delay: "10 seconds", backoff: "constant" } },
 				async () => {
@@ -130,7 +137,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				}
 
 				// The cursor is returned by the step, so a retry resumes here.
-				const result: { cursor?: string; inserted: number; ignored: number } = await step.do(
+				const result: { cursor?: string; inserted: number; ignored: number } = await tracedStep(
 					`sync DROP set · page ${page}`,
 					async () => {
 						const listed = await this.env.kv.list<KvMeta>({ limit: kvPageSize, cursor });
@@ -180,7 +187,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		const matched: Record<string, number> = {};
 
 		for (const listType of LISTS) {
-			matched[listType] = await step.do(
+			matched[listType] = await tracedStep(
 				`match ${listType}`,
 				{ timeout: "15 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "linear" } },
 				async () => {
@@ -214,7 +221,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let prunedTo = -1;
 		if (!keepFullDropSet) {
 			await notifyStep("prune DROP set", "running");
-			prunedTo = await step.do(
+			prunedTo = await tracedStep(
 				"prune DROP set · keep matched only",
 				{ timeout: "15 minutes", retries: { limit: 2, delay: "30 seconds", backoff: "linear" } },
 				async () => {
@@ -249,7 +256,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		// ④ summary
 		// ---------------------------------------------------------------
 		await notifyStep("summary", "running");
-		const summary = await step.do("summary · count run rows", async () => {
+		const summary = await tracedStep("summary · count run rows", async () => {
 			const [row] = await chQuery<{ rows: number; work_items: number; identifiers: number }>(
 				this.env,
 				`SELECT uniqExact((list_type, work_item_id, hash, type, normalized_value)) AS rows,
@@ -272,6 +279,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		await notifyStep("summary", "completed");
 
 		console.log("Cron C partial run finished:", summary);
+		await logRun(this.env, ctx, "completed", {
+			result: summary,
+			duration_ms: Date.now() - runStartedAt,
+		});
 		return summary;
 	}
 }

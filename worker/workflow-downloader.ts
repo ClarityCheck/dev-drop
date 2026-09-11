@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { hasDb, upsertWorkItems } from "./db";
+import { logRun, tracer } from "./logs";
 import { LISTS, listTypeOf, parseCsv, unzip } from "./zip";
 import type { ListType } from "./zip";
 
@@ -62,10 +63,53 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 
 		const parsedPrefix = `${PARSED_PREFIX}${runId}/`;
 
+		// Every step below reports started / completed / failed to Better Stack.
+		const tracedStep = tracer(this.env, step, { workflow: "drop-downloader", run_id: runId });
+		const runStartedAt = Date.now();
+		await logRun(this.env, { workflow: "drop-downloader", run_id: runId }, "started");
+
+		try {
+			return await this.ingest(event, tracedStep, {
+				runId,
+				pageSize,
+				clearKv,
+				keepParsedPages,
+				maxClearPages,
+				useSupabase,
+				parsedPrefix,
+				runStartedAt,
+			});
+		} catch (e) {
+			await logRun(
+				this.env,
+				{ workflow: "drop-downloader", run_id: runId },
+				"failed",
+				{ error: e instanceof Error ? `${e.name}: ${e.message}` : String(e), duration_ms: Date.now() - runStartedAt },
+			);
+			throw e;
+		}
+	}
+
+	private async ingest(
+		event: WorkflowEvent<Params>,
+		step: ReturnType<typeof tracer>,
+		o: {
+			runId: string;
+			pageSize: number;
+			clearKv: boolean;
+			keepParsedPages: boolean;
+			maxClearPages: number;
+			useSupabase: boolean;
+			parsedPrefix: string;
+			runStartedAt: number;
+		},
+	) {
+		const { runId, pageSize, clearKv, keepParsedPages, maxClearPages, useSupabase, parsedPrefix } = o;
+
 		// -------------------------------------------------------------
 		// ① download from the DROP API — enable once the account exists.
 		//
-		// const zipKey = await step.do("download list", async () => {
+		// const zipKey = await step("download list", async () => {
 		//   const res = await fetch("https://api.drop.privacy.ca.gov/data/download", {
 		//     headers: { "X-API-KEY": this.env.DROP_API_KEY },
 		//   });
@@ -83,7 +127,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 		// -------------------------------------------------------------
 		// ② the archive — for now, whatever was put there by hand
 		// -------------------------------------------------------------
-		const zipKey = await step.do("locate ZIP in R2", async () => {
+		const zipKey = await step("locate ZIP in R2", async () => {
 			if (event.payload?.r2Key) return event.payload.r2Key;
 			const listed = await this.env.r2.list({ prefix: RAW_PREFIX });
 			const zips = listed.objects.filter((o) => o.key.toLowerCase().endsWith(".zip"));
@@ -97,7 +141,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 		// -------------------------------------------------------------
 		// ③ unzip → parse → pages in R2
 		// -------------------------------------------------------------
-		const parsed = await step.do(
+		const parsed = await step(
 			"parse ZIP → pages",
 			{ timeout: "5 minutes" },
 			async () => {
@@ -169,7 +213,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			for (;;) {
 				page += 1;
 				if (page > maxClearPages) throw new Error(`clear KV: stopped after ${maxClearPages} pages`);
-				const result: { cursor?: string; deleted: number } = await step.do(
+				const result: { cursor?: string; deleted: number } = await step(
 					`clear KV · page ${page}`,
 					async () => {
 						const listed = await this.env.kv.list({ limit: pageSize, cursor });
@@ -191,7 +235,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			const pageCount = parsed.pages[listType] ?? 0;
 			let count = 0;
 			for (let page = 1; page <= pageCount; page++) {
-				count += await step.do(
+				count += await step(
 					`load KV · ${listType} · page ${page}`,
 					{ timeout: "5 minutes" },
 					async () => {
@@ -222,7 +266,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 				const pageCount = parsed.pages[listType] ?? 0;
 				let count = 0;
 				for (let page = 1; page <= pageCount; page++) {
-					count += await step.do(
+					count += await step(
 						`save Supabase · ${listType} · page ${page}`,
 						{ timeout: "5 minutes", retries: { limit: 3, delay: "10 seconds", backoff: "linear" } },
 						async () => {
@@ -251,7 +295,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 		let removed = 0;
 		const removedPages = parsed.pages.removed ?? 0;
 		for (let page = 1; page <= removedPages; page++) {
-			removed += await step.do(`apply removals · page ${page}`, async () => {
+			removed += await step(`apply removals · page ${page}`, async () => {
 				const obj = await this.env.r2.get(`${parsedPrefix}removed/${page}.json`);
 				if (!obj) return 0;
 				const rows = (await obj.json()) as RemovedRow[];
@@ -261,7 +305,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 		}
 
 		if (!keepParsedPages) {
-			await step.do("drop parsed pages", async () => {
+			await step("drop parsed pages", async () => {
 				const listed = await this.env.r2.list({ prefix: parsedPrefix });
 				const keys = listed.objects.map((o) => o.key);
 				if (keys.length > 0) await this.env.r2.delete(keys);
@@ -280,6 +324,10 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			removalsApplied: removed,
 		};
 		console.log("drop-downloader finished:", summary);
+		await logRun(this.env, { workflow: "drop-downloader", run_id: runId }, "completed", {
+			result: { rows: Object.values(loadedKv).reduce((a, b) => a + b, 0), kvCleared: cleared, removalsApplied: removed },
+			duration_ms: Date.now() - o.runStartedAt,
+		});
 		return summary;
 	}
 

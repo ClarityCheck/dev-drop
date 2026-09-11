@@ -8,6 +8,7 @@
  * Secrets are NOT here:
  *     npx wrangler secret put CH_PASSWORD
  *     npx wrangler secret put SUPABASE_DB_URL      (only until Hyperdrive exists)
+ *     npx wrangler secret put LOGS_TOKEN           (Better Stack source token)
  *
  * SUPABASE_DB_URL must use the SHARED POOLER in session mode:
  *     postgresql://drop_workflow.<project-ref>:<password>@<pooler-host>:5432/postgres
@@ -89,7 +90,10 @@
 	],
 	"vars": {
 		"CH_URL": "https://cu7iy7dd3r.eu-central-1.aws.clickhouse.cloud:8443",
-		"CH_USER": "drop_workflow"
+		"CH_USER": "drop_workflow",
+		// Better Stack source → Data ingestion → "Ingesting host". Not a secret.
+		// The token is:  npx wrangler secret put LOGS_TOKEN
+		"LOGS_HOST": "<sXXXXXXX.eu-central-1a.betterstackdata.com>"
 	},
 	"triggers": {
 		"crons": []
