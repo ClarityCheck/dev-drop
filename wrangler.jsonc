@@ -7,9 +7,7 @@
  *
  * Secrets are NOT here:
  *     npx wrangler secret put CH_PASSWORD
- *     npx wrangler secret put SUPABASE_URL
- *     npx wrangler secret put SUPABASE_ANON_KEY
- *     npx wrangler secret put SUPABASE_JWT_SECRET
+ *     npx wrangler secret put SUPABASE_DB_URL      (only until Hyperdrive exists)
  *
  * The KV namespace `id` below is the namespace UUID, not its name. Get it with:
  *     npx wrangler kv namespace list
@@ -26,18 +24,34 @@
 	"observability": {
 		"enabled": true
 	},
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
 	"workflows": [
 		{
-			"name": "drop-reports",
-			"binding": "DROP_REPORTS",
-			"class_name": "DropReportsWorkflow"
+			"name": "drop-reports-cleanup",
+			"binding": "DROP_REPORTS_CLEANUP",
+			"class_name": "DropReportsCleanupWorkflow"
 		},
 		{
-			"name": "drop-sync",
-			"binding": "DROP_SYNC",
-			"class_name": "DropSyncWorkflow"
+			"name": "drop-downloader",
+			"binding": "DROP_DOWNLOADER",
+			"class_name": "DropDownloaderWorkflow"
 		}
 	],
+	// Postgres for the Workflows. Create it once, then paste the id here:
+	//   npx wrangler cert upload certificate-authority \
+	//       --ca-cert supabase-ca.pem --name supabase-ca
+	//   npx wrangler hyperdrive create drop-db \
+	//       --connection-string="postgresql://drop_workflow:<PASSWORD>@db.vsqxnmrvvjsgcrudpruy.supabase.co:5432/postgres" \
+	//       --sslmode verify-full --ca-certificate-id <UUID>
+	// Until then the code falls back to the SUPABASE_DB_URL secret.
+	// "hyperdrive": [
+	// 	{
+	// 		"binding": "DROP_DB",
+	// 		"id": "<HYPERDRIVE_CONFIG_ID>"
+	// 	}
+	// ],
 	"durable_objects": {
 		"bindings": [
 			{

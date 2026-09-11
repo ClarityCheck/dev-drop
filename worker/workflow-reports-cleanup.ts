@@ -1,9 +1,9 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { chQuery, chInsert, fromB64Url } from "./ch";
+import { chQuery, chInsert } from "./ch";
 
 /**
- * Cron C — ClickHouse check  (workflow: drop-reports)
+ * Cron C — ClickHouse check  (workflow: drop-reports-cleanup)
  *
  *   ⓿ optionally refresh ca_drop_combined_search_result
  *   ① copy the DROP hash set from KV into default.ca_drop_work_items
@@ -50,9 +50,9 @@ type Params = {
 	keepFullDropSet?: boolean;
 };
 
-type KvMeta = { work_item_id?: string; request_date?: string };
+type KvMeta = { work_item_id?: string; list_type?: string; request_date?: string };
 
-export class DropReportsWorkflow extends WorkflowEntrypoint<Env, Params> {
+export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
 		const runId = event.instanceId;
 		const kvPageSize = event.payload?.kvPageSize ?? 400;
@@ -110,70 +110,62 @@ export class DropReportsWorkflow extends WorkflowEntrypoint<Env, Params> {
 		// ① KV -> ClickHouse. One page per step, so each step stays well
 		//    inside the subrequest cap. Cron A is untouched by this.
 		// ---------------------------------------------------------------
-		const synced: Record<string, number> = {};
+		let synced = 0;
+		let skipped = 0;
 
 		if (!skipKvSync) {
 			await notifyStep("sync DROP set", "running");
 
-			for (const listType of LISTS) {
-				const prefix = `drop:${listType}:`;
-				let cursor: string | undefined;
-				let page = 0;
-				let count = 0;
+			// One pass over the whole namespace: the key IS the hash, Base64
+			// exactly as DROP published it, with no prefix to filter on. What
+			// list a hash belongs to lives in the metadata the downloader
+			// wrote, and kv.list returns metadata, so this needs no kv.get.
+			let cursor: string | undefined;
+			let page = 0;
 
-				for (;;) {
-					page += 1;
-					if (page > maxKvPages) {
-						throw new Error(
-							`sync ${listType}: stopped after ${maxKvPages} pages — raise maxKvPages deliberately`,
-						);
-					}
-
-					// The cursor is returned by the step, so a retry resumes here.
-					const result: { cursor?: string; inserted: number } = await step.do(
-						`sync ${listType} · page ${page}`,
-						async () => {
-							const listed = await this.env.kv.list<KvMeta>({
-								prefix,
-								limit: kvPageSize,
-								cursor,
-							});
-
-							const rows: object[] = [];
-							for (const k of listed.keys) {
-								// The hash is the key name (base64url); the work item id is
-								// the value, or the metadata when Cron A wrote it there.
-								const hash = fromB64Url(k.name.slice(prefix.length));
-								const meta = k.metadata;
-								const workItemId =
-									meta?.work_item_id ?? (await this.env.kv.get(k.name)) ?? "";
-
-								const row: Record<string, string | number> = {
-									list_type: listType,
-									hash,
-									work_item_id: workItemId,
-								};
-								if (meta?.request_date) row.request_date = meta.request_date;
-								rows.push(row);
-							}
-
-							if (rows.length > 0) {
-								await chInsert(this.env, "default.ca_drop_work_items", rows);
-							}
-
-							return {
-								cursor: listed.list_complete ? undefined : listed.cursor,
-								inserted: rows.length,
-							};
-						},
-					);
-
-					count += result.inserted;
-					cursor = result.cursor;
-					if (!cursor) break;
+			for (;;) {
+				page += 1;
+				if (page > maxKvPages) {
+					throw new Error(`sync: stopped after ${maxKvPages} pages — raise maxKvPages deliberately`);
 				}
 
-				synced[listType] = count;
+				// The cursor is returned by the step, so a retry resumes here.
+				const result: { cursor?: string; inserted: number; ignored: number } = await step.do(
+					`sync DROP set · page ${page}`,
+					async () => {
+						const listed = await this.env.kv.list<KvMeta>({ limit: kvPageSize, cursor });
+
+						const rows: object[] = [];
+						for (const k of listed.keys) {
+							const meta = k.metadata;
+							// Without list_type there is nothing to match against, so
+							// the key is counted and left alone rather than guessed at.
+							if (!meta?.list_type || !meta.work_item_id) continue;
+							const row: Record<string, string> = {
+								list_type: meta.list_type,
+								hash: k.name,
+								work_item_id: meta.work_item_id,
+							};
+							if (meta.request_date) row.request_date = meta.request_date;
+							rows.push(row);
+						}
+
+						if (rows.length > 0) {
+							await chInsert(this.env, "default.ca_drop_work_items", rows);
+						}
+
+						return {
+							cursor: listed.list_complete ? undefined : listed.cursor,
+							inserted: rows.length,
+							ignored: listed.keys.length - rows.length,
+						};
+					},
+				);
+
+				synced += result.inserted;
+				skipped += result.ignored;
+				cursor = result.cursor;
+				if (!cursor) break;
 			}
 
 			await notifyStep("sync DROP set", "completed");
@@ -269,6 +261,7 @@ export class DropReportsWorkflow extends WorkflowEntrypoint<Env, Params> {
 			return {
 				runId,
 				syncedFromKv: synced,
+				keysWithoutMetadata: skipped,
 				matchesByList: matched,
 				dropSetRowsKept: prunedTo,
 				rowsInRunTable: Number(row?.rows ?? 0),

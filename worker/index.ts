@@ -1,8 +1,8 @@
 // Export the Workflow and Durable Object classes
-export { DropReportsWorkflow } from "./workflow";
-export { DropSyncWorkflow } from "./workflow-sync";
+export { DropReportsCleanupWorkflow } from "./workflow-reports-cleanup";
+export { DropDownloaderWorkflow } from "./workflow-downloader";
 import { chSmokeTest } from "./ch";
-import { sbSmokeTest } from "./db";
+import { dbSmokeTest } from "./db";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
@@ -29,7 +29,7 @@ export default {
 					// no body — run with defaults
 				}
 
-				const instance = await env.DROP_REPORTS.create({ params });
+				const instance = await env.DROP_REPORTS_CLEANUP.create({ params });
 
 				return Response.json({
 					instanceId: instance.id,
@@ -54,7 +54,7 @@ export default {
 			}
 
 			try {
-				const instance = await env.DROP_REPORTS.get(instanceId);
+				const instance = await env.DROP_REPORTS_CLEANUP.get(instanceId);
 				const status = await instance.status();
 				return Response.json(status);
 			} catch {
@@ -83,7 +83,7 @@ export default {
 					approved: boolean;
 					comment?: string;
 				};
-				const instance = await env.DROP_REPORTS.get(instanceId);
+				const instance = await env.DROP_REPORTS_CLEANUP.get(instanceId);
 
 				await instance.sendEvent({
 					type: "user-approval",
@@ -127,34 +127,34 @@ export default {
 			}
 		}
 
-		// Cron A: start the DROP sync workflow.
-		// POST /api/sync/start   body (all optional):
+		// Cron A: start the downloader.
+		// POST /api/downloader/start   body (all optional):
 		//   { r2Key?, clearKv?, pageSize?, supabase?, keepParsedPages? }
-		if (url.pathname === "/api/sync/start" && request.method === "POST") {
+		if (url.pathname === "/api/downloader/start" && request.method === "POST") {
 			let params: Record<string, unknown> = {};
 			try {
 				params = (await request.json()) as Record<string, unknown>;
 			} catch {
 				// no body — run with defaults
 			}
-			const instance = await env.DROP_SYNC.create({ params });
-			return Response.json({ instanceId: instance.id, workflow: "drop-sync" });
+			const instance = await env.DROP_DOWNLOADER.create({ params });
+			return Response.json({ instanceId: instance.id, workflow: "drop-downloader" });
 		}
 
-		if (url.pathname.startsWith("/api/sync/status/")) {
+		if (url.pathname.startsWith("/api/downloader/status/")) {
 			const instanceId = url.pathname.split("/").pop();
 			if (!instanceId) return Response.json({ error: "Instance ID required" }, { status: 400 });
-			const instance = await env.DROP_SYNC.get(instanceId);
+			const instance = await env.DROP_DOWNLOADER.get(instanceId);
 			return Response.json(await instance.status());
 		}
 
 		// Diagnostics: verify the wiring before running anything.
-		// GET /api/ch-test   GET /api/sb-test
+		// GET /api/ch-test   GET /api/db-test
 		if (url.pathname === "/api/ch-test") {
 			return chSmokeTest(env);
 		}
-		if (url.pathname === "/api/sb-test") {
-			return sbSmokeTest(env);
+		if (url.pathname === "/api/db-test") {
+			return dbSmokeTest(env);
 		}
 
 		return Response.json({ error: "Not Found" }, { status: 404 });

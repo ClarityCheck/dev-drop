@@ -1,118 +1,122 @@
 /**
- * Supabase access for the Workflows, over PostgREST.
+ * Supabase access for the Workflows — Postgres via Hyperdrive.
  *
- * There is no Postgres driver in this Worker (the npm registry is not
- * reachable from the build environment), so Supabase is reached over HTTPS
- * the same way ClickHouse is.
+ * Cloudflare's own guidance: a Worker that opens its own TCP connection
+ * re-does the TLS handshake on every invocation, so Hyperdrive holds the pool
+ * instead. It also allows sslmode=verify-full against an uploaded CA, which a
+ * Worker socket cannot do — that reproduces what the Nest API does with
+ * rejectUnauthorized + DB_CA_CERT.
  *
- * The token is signed here with the project's JWT secret and carries
- * {"role":"drop_workflow"}, so the grants on that role are the actual ceiling.
- * The service_role key is deliberately not used: it bypasses RLS and every
- * grant, which would make the role pointless.
+ * Not PostgREST: it authenticates with a JWT signed by the project's JWT
+ * secret, and that secret can mint a token for any role, service_role
+ * included. A role password is worth exactly the grants on that role — here,
+ * SELECT / INSERT / UPDATE on public.ca_drop_work_item and nothing else.
  *
- * The table lives in public, which PostgREST exposes by default, so the only
- * requirement in Supabase is GRANT drop_workflow TO authenticator. The role is
- * granted on ca_drop_work_item alone, so it cannot touch the OTP tables that
- * share the schema.
+ * Setup, once:
+ *   npx wrangler cert upload certificate-authority \
+ *       --ca-cert supabase-ca.pem --name supabase-ca
+ *   npx wrangler hyperdrive create drop-db \
+ *       --connection-string="postgresql://drop_workflow:<PASSWORD>@db.<ref>.supabase.co:5432/postgres" \
+ *       --sslmode verify-full --ca-certificate-id <UUID>
+ * then put the returned id in wrangler.jsonc as the DROP_DB binding.
+ *
+ * Until that exists, the secret SUPABASE_DB_URL is used instead, so the
+ * workflow can be tested before Hyperdrive is configured.
  */
 
-const ROLE = "drop_workflow";
+import postgres from "postgres";
 
-export function hasSupabase(env: Env): boolean {
-	return Boolean(env.SUPABASE_URL && env.SUPABASE_ANON_KEY && env.SUPABASE_JWT_SECRET);
+export type WorkItemRow = {
+	list_type: string;
+	work_item_id: string;
+	hash: string;
+	request_date: string | null;
+};
+
+/** DROP_DB is declared only when the Hyperdrive binding exists, hence the cast. */
+function connectionString(env: Env): string | null {
+	const hyperdrive = (env as unknown as { DROP_DB?: { connectionString?: string } }).DROP_DB;
+	return hyperdrive?.connectionString ?? env.SUPABASE_DB_URL ?? null;
 }
 
-function b64url(bytes: Uint8Array): string {
-	let s = "";
-	for (const b of bytes) s += String.fromCharCode(b);
-	return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+export function hasDb(env: Env): boolean {
+	return Boolean(connectionString(env));
 }
 
-/** Short-lived HS256 token for the drop_workflow role. */
-async function roleToken(env: Env): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
-	const payload = b64url(
-		new TextEncoder().encode(JSON.stringify({ role: ROLE, iat: now, exp: now + 300 })),
-	);
-	const key = await crypto.subtle.importKey(
-		"raw",
-		new TextEncoder().encode(env.SUPABASE_JWT_SECRET),
-		{ name: "HMAC", hash: "SHA-256" },
-		false,
-		["sign"],
-	);
-	const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${header}.${payload}`));
-	return `${header}.${payload}.${b64url(new Uint8Array(sig))}`;
+/**
+ * One client per step. `prepare: false` because the connection is not
+ * exclusively ours between statements; `fetch_types: false` saves a round trip
+ * on connect. Hyperdrive keeps the real pool, so this is cheap.
+ */
+function connect(env: Env) {
+	const url = connectionString(env);
+	if (!url) throw new Error("no database: add the DROP_DB Hyperdrive binding or set SUPABASE_DB_URL");
+	return postgres(url, {
+		max: 1,
+		idle_timeout: 10,
+		connect_timeout: 15,
+		prepare: false,
+		fetch_types: false,
+	});
 }
 
-async function headers(env: Env, extra: Record<string, string> = {}): Promise<HeadersInit> {
-	return {
-		apikey: env.SUPABASE_ANON_KEY,
-		Authorization: `Bearer ${await roleToken(env)}`,
-		"Content-Type": "application/json",
-		...extra,
-	};
-}
-
-/** INSERT ... ON CONFLICT DO UPDATE. Returns the number of rows sent. */
-export async function sbUpsert(
-	env: Env,
-	table: string,
-	rows: object[],
-	onConflict: string,
-): Promise<number> {
+/**
+ * Upsert on (list_type, work_item_id), so a retried step is a no-op instead of
+ * a duplicate. Deliberately does not touch status / matched / status_set_at:
+ * those belong to the report and cleanup runs, and re-downloading a list must
+ * never reset a status that was already reported to DROP.
+ */
+export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<number> {
 	if (rows.length === 0) return 0;
-	const url = `${env.SUPABASE_URL}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`;
-	const res = await fetch(url, {
-		method: "POST",
-		headers: await headers(env, { Prefer: "resolution=merge-duplicates,return=minimal" }),
-		body: JSON.stringify(rows),
-	});
-	if (!res.ok) {
-		throw new Error(`Supabase upsert ${table} ${res.status}: ${(await res.text()).slice(0, 400)}`);
-	}
-	return rows.length;
-}
-
-/** PATCH with a PostgREST filter, e.g. { list_type: "eq.phone" }. */
-export async function sbUpdate(
-	env: Env,
-	table: string,
-	filter: Record<string, string>,
-	patch: object,
-): Promise<void> {
-	const qs = Object.entries(filter)
-		.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-		.join("&");
-	const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${qs}`, {
-		method: "PATCH",
-		headers: await headers(env, { Prefer: "return=minimal" }),
-		body: JSON.stringify(patch),
-	});
-	if (!res.ok) {
-		throw new Error(`Supabase update ${table} ${res.status}: ${(await res.text()).slice(0, 400)}`);
+	const sql = connect(env);
+	try {
+		await sql`
+			INSERT INTO public.ca_drop_work_item
+				${sql(rows, "list_type", "work_item_id", "hash", "request_date")}
+			ON CONFLICT (list_type, work_item_id) DO UPDATE
+				SET hash         = EXCLUDED.hash,
+				    request_date = EXCLUDED.request_date
+		`;
+		return rows.length;
+	} finally {
+		await sql.end();
 	}
 }
 
-/** Connectivity + privilege check. GET /api/sb-test */
-export async function sbSmokeTest(env: Env): Promise<Response> {
-	const out: Record<string, unknown> = { configured: hasSupabase(env) };
-	if (!hasSupabase(env)) {
-		out.hint = "set SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_JWT_SECRET as secrets";
+/** Connectivity + privilege check. GET /api/db-test */
+export async function dbSmokeTest(env: Env): Promise<Response> {
+	const out: Record<string, unknown> = {
+		configured: hasDb(env),
+		via: (env as unknown as { DROP_DB?: unknown }).DROP_DB ? "hyperdrive" : "SUPABASE_DB_URL",
+	};
+	if (!hasDb(env)) {
+		out.hint = "create the Hyperdrive config, or set SUPABASE_DB_URL as a secret";
 		return Response.json(out, { status: 500 });
 	}
+
+	const sql = connect(env);
 	try {
-		const res = await fetch(
-			`${env.SUPABASE_URL}/rest/v1/ca_drop_work_item?select=id&limit=1`,
-			{ headers: await headers(env) },
-		);
-		out.status = res.status;
-		out.body = (await res.text()).slice(0, 300);
-		out.ok = res.ok;
+		const [who] = await sql`SELECT current_user AS role, current_database() AS db`;
+		out.identity = who;
+
+		const [rows] = await sql`SELECT count(*)::int AS n FROM public.ca_drop_work_item`;
+		out.work_item_rows = rows.n;
+
+		// The grant should reach exactly one table. Anything higher means the
+		// role can see tables it has no business seeing.
+		const [reach] = await sql`
+			SELECT count(DISTINCT table_name)::int AS n
+			FROM information_schema.table_privileges
+			WHERE grantee = current_user AND privilege_type = 'SELECT'
+		`;
+		out.selectable_tables = reach.n;
+
+		out.ok = true;
 	} catch (e) {
 		out.ok = false;
 		out.error = String(e);
+	} finally {
+		await sql.end();
 	}
 	return Response.json(out, { status: out.ok ? 200 : 500 });
 }
