@@ -9,6 +9,12 @@
  *     npx wrangler secret put CH_PASSWORD
  *     npx wrangler secret put SUPABASE_DB_URL      (only until Hyperdrive exists)
  *
+ * SUPABASE_DB_URL must use the SHARED POOLER in session mode:
+ *     postgresql://drop_workflow.<project-ref>:<password>@<pooler-host>:5432/postgres
+ * The direct host (db.<ref>.supabase.co) is IPv6-only without the IPv4
+ * add-on, and a Worker socket will hang on it rather than fail. Hyperdrive is
+ * the opposite: give IT the direct string, it pools on Cloudflare's side.
+ *
  * The KV namespace `id` below is the namespace UUID, not its name. Get it with:
  *     npx wrangler kv namespace list
  */
