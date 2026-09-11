@@ -82,12 +82,6 @@ function numericOnly(value: unknown): Record<string, number> | undefined {
  * Wraps step.do. Same call shapes as the original — (name, fn) and
  * (name, config, fn) — so it is a drop-in replacement.
  */
-/** The deployed version that is answering, from the version_metadata binding. */
-export function version(env: Env): string {
-	const v = (env as unknown as { CF_VERSION?: { id?: string; tag?: string } }).CF_VERSION;
-	return v?.tag || v?.id?.slice(0, 8) || "unknown";
-}
-
 export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 	return async function tracedStep<T extends Rpc.Serializable<T>>(
 		name: string,
@@ -140,31 +134,6 @@ export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 	};
 }
 
-/**
- * One-off event, for things that are not workflow steps — the diagnostic
- * endpoints. Same guarantees: never throws, and only numeric fields of
- * `result` are shipped.
- */
-export async function logEvent(
-	env: Env,
-	what: string,
-	ok: boolean,
-	extra?: { error?: string; result?: unknown; duration_ms?: number },
-): Promise<void> {
-	await ship(env, {
-		workflow: "(diagnostics)",
-		run_id: "-",
-		dt: new Date().toISOString(),
-		level: ok ? "info" : "error",
-		message: `${what}: ${ok ? "ok" : "failed"}`,
-		step: what,
-		phase: ok ? "completed" : "failed",
-		attempt_duration_ms: extra?.duration_ms,
-		result: numericOnly(extra?.result),
-		error: extra?.error,
-	});
-}
-
 /** Run-level bookend, so a run that dies between steps is still visible. */
 export async function logRun(
 	env: Env,
@@ -183,48 +152,4 @@ export async function logRun(
 		result: numericOnly(extra?.result),
 		error: extra?.error,
 	});
-}
-
-/**
- * Ships one entry and reports what Better Stack said. GET /api/logs-test
- * Unlike the workflow path, this one does NOT swallow errors — the point is
- * to see them.
- */
-export async function logsSmokeTest(env: Env): Promise<Response> {
-	const out: Record<string, unknown> = {
-		version: version(env),
-		host: env.LOGS_HOST ?? null,
-		token: env.LOGS_TOKEN ? "set" : "missing",
-		configured: configured(env),
-	};
-	if (!configured(env)) {
-		out.hint =
-			"set LOGS_HOST in wrangler.jsonc to the source's ingesting host " +
-			"(s<id>.<region>.betterstackdata.com) and LOGS_TOKEN as a secret, then redeploy";
-		return Response.json(out);
-	}
-	try {
-		const res = await fetch(`https://${env.LOGS_HOST}/`, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${env.LOGS_TOKEN}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				dt: new Date().toISOString(),
-				level: "info",
-				message: "logs-test from the Worker",
-				workflow: "(smoke test)",
-				step: "(none)",
-				phase: "completed",
-			}),
-		});
-		out.status = res.status;
-		out.body = (await res.text()).slice(0, 300);
-		out.ok = res.ok;
-	} catch (e) {
-		out.ok = false;
-		out.error = String(e);
-	}
-	return Response.json(out);
 }

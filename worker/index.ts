@@ -1,11 +1,6 @@
 // Export the Workflow and Durable Object classes
 export { DropReportsCleanupWorkflow } from "./workflow-reports-cleanup";
 export { DropDownloaderWorkflow } from "./workflow-downloader";
-import { chSmokeTest } from "./ch";
-import { dbSmokeTest } from "./db";
-import { logsSmokeTest } from "./logs";
-import { socketProbe } from "./probe";
-import { version } from "./logs";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
@@ -16,6 +11,8 @@ export { WorkflowStatusDO } from "./durable-object";
  * - GET /api/workflow/status/:id - Get workflow status
  * - POST /api/workflow/event/:id - Send events to workflow
  * - GET /ws - WebSocket connection for real-time updates
+ * - POST /api/downloader/start - Start the drop-downloader workflow
+ * - GET /api/downloader/status/:id - Its status
  */
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -151,99 +148,6 @@ export default {
 			return Response.json(await instance.status());
 		}
 
-		// Diagnostics: verify the wiring before running anything.
-		// GET /api/diag runs all of them; individually:
-		// GET /api/ch-test   GET /api/db-test   GET /api/logs-test   GET /api/socket-test
-		const diagnostics: Record<string, (e: Env) => Promise<Response>> = {
-			"/api/ch-test": chSmokeTest,
-			"/api/db-test": dbSmokeTest,
-			"/api/logs-test": logsSmokeTest,
-		};
-		// Everything at once: GET /api/diag
-		// In parallel — in series the socket probe's stages plus the database
-		// timeout add up past most clients' patience, and a caller that gives
-		// up learns nothing.
-		if (url.pathname === "/api/diag") {
-			const checks: [string, () => Promise<Response>][] = [
-				["socket", () => socketProbe(env, url)],
-				["db", () => dbSmokeTest(env)],
-				["clickhouse", () => chSmokeTest(env)],
-				["logs", () => logsSmokeTest(env)],
-			];
-			const settled = await Promise.all(
-				checks.map(async ([name, run]) => {
-					try {
-						return [name, await (await capped(run(), name, version(env))).json()] as const;
-					} catch (e) {
-						return [
-							name,
-							{ ok: false, error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) },
-						] as const;
-					}
-				}),
-			);
-			const report = Object.fromEntries(settled);
-			return Response.json({
-				ok: settled.every(([, r]) => (r as { ok?: boolean }).ok === true),
-				...report,
-			});
-		}
-
-		if (url.pathname === "/api/socket-test") {
-			try {
-				return await capped(socketProbe(env, url), url.pathname, version(env));
-			} catch (e) {
-				return Response.json({
-					ok: false,
-					error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-					where: url.pathname,
-				});
-			}
-		}
-
-		const diagnostic = diagnostics[url.pathname];
-		if (diagnostic) {
-			try {
-				return await capped(diagnostic(env), url.pathname, version(env));
-			} catch (e) {
-				// A diagnostic that 500s tells you nothing. Report the throw instead.
-				return Response.json({
-					ok: false,
-					error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-					where: url.pathname,
-				});
-			}
-		}
-
 		return Response.json({ error: "Not Found" }, { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
-
-/**
- * A diagnostic that does not answer tells you nothing — and the two failures
- * we hit (a hung socket, then a hung sql.end) both showed up as an empty 500
- * or a client-side read timeout. Whatever happens inside, something JSON
- * comes back.
- */
-async function capped(work: Promise<Response>, where: string, v: string): Promise<Response> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const bail = new Promise<Response>((resolve) => {
-		timer = setTimeout(
-			() =>
-				resolve(
-					Response.json({
-						ok: false,
-						version: v,
-						where,
-						error: "the check did not answer within 12s — it is hanging, not failing",
-					}),
-				),
-			12000,
-		);
-	});
-	try {
-		return await Promise.race([work, bail]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}

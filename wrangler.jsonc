@@ -72,11 +72,6 @@
 		}
 	],
 	"upload_source_maps": true,
-	// Lets every diagnostic report which deployed version answered it, so
-	// "is my code live?" stops being a guess.
-	"version_metadata": {
-		"binding": "CF_VERSION"
-	},
 	"kv_namespaces": [
 		{
 			"binding": "kv",

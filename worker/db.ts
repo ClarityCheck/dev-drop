@@ -32,7 +32,6 @@
  */
 
 import postgres from "postgres";
-import { logEvent, version } from "./logs";
 
 export type WorkItemRow = {
 	list_type: string;
@@ -216,81 +215,4 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 	} finally {
 		await closeQuietly(sql);
 	}
-}
-
-/** Connectivity + privilege check. GET /api/db-test */
-export async function dbSmokeTest(env: Env): Promise<Response> {
-	const out: Record<string, unknown> = {
-		version: version(env),
-		configured: hasDb(env),
-		via: (env as unknown as { DROP_DB?: unknown }).DROP_DB ? "hyperdrive" : "SUPABASE_DB_URL",
-		target: describe(env),
-	};
-	out.logging = {
-		host: env.LOGS_HOST && !/[<>]/.test(env.LOGS_HOST) ? env.LOGS_HOST : "not configured",
-		token: env.LOGS_TOKEN ? "set" : "missing",
-	};
-	if (!hasDb(env)) {
-		out.hint = "create the Hyperdrive config, or set SUPABASE_DB_URL as a secret";
-		return Response.json(out);
-	}
-
-	const url = connectionString(env);
-	const timings: Record<string, number> = {};
-	const t0 = Date.now();
-	// Everything from here is inside one try: connect() and postgres() can both
-	// throw synchronously, and a throw that escapes turns this into a bare 500
-	// with no body — which is the one thing a diagnostic must never do.
-	let sql: ReturnType<typeof connect> | undefined;
-	try {
-		if (url) checkUrl(url);
-		sql = connect(env);
-
-		let t = Date.now();
-		const [who] = await withTimeout(
-			sql`SELECT current_user AS role, current_database() AS db`,
-			8000,
-			"connect",
-		);
-		timings.connect_and_first_query_ms = Date.now() - t;
-		out.identity = who;
-
-		t = Date.now();
-		const [rows] = await withTimeout(
-			sql`SELECT count(*)::int AS n FROM public.ca_drop_work_item`,
-			8000,
-			"count ca_drop_work_item",
-		);
-		timings.count_ms = Date.now() - t;
-		out.work_item_rows = rows.n;
-
-		// The grant should reach exactly one table. Anything higher means the
-		// role can see tables it has no business seeing.
-		const [reach] = await withTimeout(
-			sql`
-				SELECT count(DISTINCT table_name)::int AS n
-				FROM information_schema.table_privileges
-				WHERE grantee = current_user AND privilege_type = 'SELECT'
-			`,
-			8000,
-			"privilege check",
-		);
-		out.selectable_tables = reach.n;
-
-		out.ok = true;
-	} catch (e) {
-		out.ok = false;
-		out.error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-	} finally {
-		await closeQuietly(sql);
-	}
-	timings.total_ms = Date.now() - t0;
-	out.timings = timings;
-	// So a failed check is in the log stream too, not only in whoever's browser.
-	await logEvent(env, "db-test", out.ok === true, {
-		error: out.error as string | undefined,
-		result: { ...timings, work_item_rows: Number(out.work_item_rows ?? -1) },
-		duration_ms: timings.total_ms,
-	});
-	return Response.json(out);
 }
