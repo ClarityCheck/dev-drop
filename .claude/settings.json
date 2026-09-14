@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_ClickHouse__get_organizations",
+      "mcp__claude_ai_ClickHouse__get_services_list",
+      "mcp__claude_ai_ClickHouse__run_select_query",
+      "mcp__claude_ai_Cloudflare_Developer_Platform__search_cloudflare_documentation",
+      "Bash(npx tsc *)",
+      "Bash(npx eslint *)",
+      "Bash(npx wrangler *)",
+      "Bash(npx json *)",
+      "Bash(node -e \"const c=require\\('./dist/dev_drop/wrangler.json'\\);console.log\\(JSON.stringify\\({limits:c.limits,workflows:c.workflows},null,2\\)\\)\")",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(git stash *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)"
+    ]
+  }
+}

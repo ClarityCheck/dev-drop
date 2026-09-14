@@ -22,7 +22,7 @@
 
 import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 
-type Phase = "started" | "completed" | "failed";
+type Phase = "started" | "completed" | "failed" | "match";
 
 type Context = {
 	workflow: string;
@@ -31,13 +31,33 @@ type Context = {
 
 type Entry = Context & {
 	dt: string;
-	level: "info" | "error";
+	level: "info" | "warn" | "error";
 	message: string;
 	step: string;
 	phase: Phase;
 	attempt_duration_ms?: number;
 	result?: Record<string, number>;
 	error?: string;
+	/** Match alerts only — see logMatches. */
+	text?: string;
+	matched?: MatchAlert[];
+	match_count?: number;
+	batch?: number;
+};
+
+/**
+ * One matched work item, as it is allowed to appear in a log.
+ *
+ * The matched normalized_value — the e-mail address or phone number itself —
+ * is deliberately absent. It is consumer PII, it is what the record is keyed
+ * on, and the log stream is not where it belongs; the durable link lives in
+ * public.ca_drop_work_item_match instead. work_item_id and hash are DROP's own
+ * published identifiers and carry no plaintext, so they may be logged.
+ */
+export type MatchAlert = {
+	list_type: string;
+	work_item_id: string;
+	hash: string;
 };
 
 function configured(env: Env): boolean {
@@ -132,6 +152,61 @@ export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 
 		return config ? step.do(name, config, traced) : step.do(name, traced);
 	};
+}
+
+/** How many matches the text log spells out before it summarises the rest. */
+const MATCHES_IN_TEXT = 50;
+
+/**
+ * The match alert. A DROP match means a consumer on California's delete list
+ * is present in our data, so it is reported at `warn` — it is not an error
+ * (the pipeline is working exactly as intended) but it is the one thing in
+ * this workflow a human may want to see without going looking for it.
+ *
+ * Shipped as both a rendered text block (`text`, for reading in the Better
+ * Stack UI) and structured fields (`matched`, for querying and alerting on).
+ * Returns the text so the caller can put it in the run summary.
+ */
+export async function logMatches(
+	env: Env,
+	ctx: Context,
+	batch: number,
+	matches: MatchAlert[],
+): Promise<string> {
+	const at = new Date();
+	const shown = matches.slice(0, MATCHES_IN_TEXT);
+	const lines = [
+		`CA DROP suppression match`,
+		`at: ${at.toISOString()}`,
+		`workflow: ${ctx.workflow}`,
+		`run_id: ${ctx.run_id}`,
+		`batch: ${batch}`,
+		`matches: ${matches.length}`,
+		``,
+		...shown.map((m) => `  ${m.list_type}\t${m.work_item_id}\t${m.hash}`),
+	];
+	if (matches.length > shown.length) {
+		lines.push(`  ... and ${matches.length - shown.length} more`);
+	}
+	const text = lines.join("\n");
+
+	await ship(env, {
+		...ctx,
+		dt: at.toISOString(),
+		level: "warn",
+		message: `DROP match: ${matches.length} work item(s) found in ClickHouse (batch ${batch})`,
+		step: `scan · batch ${batch}`,
+		phase: "match",
+		text,
+		// Capped for the same reason the text block is: a single batch can
+		// match thousands of items and a log line is not a bulk transport.
+		// The complete set is in public.ca_drop_work_item_match.
+		matched: shown,
+		match_count: matches.length,
+		batch,
+	});
+
+	return text;
 }
 
 /** Run-level bookend, so a run that dies between steps is still visible. */
