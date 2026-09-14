@@ -399,7 +399,7 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					FROM linked
 					ON CONFLICT (ca_drop_work_item_id, matched_normalized_value) DO NOTHING
 					RETURNING 1
-				),
+				)
 				SELECT (SELECT count(*) FROM v)      AS submitted,
 				       (SELECT count(*) FROM linked) AS linked,
 				       (SELECT count(*) FROM items)  AS work_items,
