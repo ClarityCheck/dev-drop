@@ -3,7 +3,7 @@ import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chQuery } from "./ch";
 import { recordMatches } from "./db";
 import type { MatchRow } from "./db";
-import { logMatches, logRun, tracer } from "./logs";
+import { logMatches, logRun, Pending, tracer } from "./logs";
 import type { MatchAlert } from "./logs";
 
 /**
@@ -176,13 +176,23 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 							 FROM system.view_refreshes
 							 WHERE view = 'ca_drop_combined_search_result'`,
 						);
+						// These two are real faults — the view vanished, or the
+						// refresh itself threw. Neither improves by waiting, but
+						// the retry policy cannot be selective, so they burn the
+						// remaining attempts before the run gives up. They are at
+						// least logged as errors from the first attempt on.
 						if (!r) throw new Error("view_refreshes has no row for the view");
 						if (r.exception) throw new Error(`refresh failed: ${r.exception}`);
+
+						// These two are the poll doing its job. Throwing is how a
+						// step asks Workflows for another attempt, so on a healthy
+						// run this happens several times before the refresh lands;
+						// Pending keeps those out of the error stream.
 						const lastSuccess = Number(r.last_success);
 						if (lastSuccess <= refreshedAfter) {
-							throw new Error(`refresh not finished yet (status ${r.status})`);
+							throw new Pending(`refresh not finished yet (status ${r.status})`);
 						}
-						if (r.status !== "Scheduled") throw new Error(`refresh still ${r.status}`);
+						if (r.status !== "Scheduled") throw new Pending(`refresh still ${r.status}`);
 						return lastSuccess;
 					},
 				);
