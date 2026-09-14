@@ -408,12 +408,39 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		limit: number,
 		dryRun: boolean,
 	) {
-		const matches = await chQuery<MatchResult>(
-			this.env,
-			`${MATCH_SQL}
-			 ORDER BY list_type, work_item_id, type, normalized_value
-			 LIMIT {limit:UInt64} OFFSET {offset:UInt64}`,
-			{ limit, offset },
+		// A chunk touches ClickHouse twice, Postgres twice, Better Stack and R2,
+		// and when one of them dies the Workflow reports only that the step
+		// failed. "Network connection lost" at 1.8 seconds could be any of six
+		// calls. This names each one as it runs — visible live in
+		// `wrangler tail` — and stamps the phase into the error message, so the
+		// Better Stack entry says where it died rather than merely that it did.
+		//
+		// The error object itself is re-thrown, not wrapped: NonRetryableError
+		// has to stay a NonRetryableError or a consistency failure would start
+		// burning five attempts again.
+		const phase = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+			const startedAt = Date.now();
+			console.log(`chunk ${chunk} > ${name}`);
+			try {
+				const out = await fn();
+				console.log(`chunk ${chunk} ok ${name} (${Date.now() - startedAt}ms)`);
+				return out;
+			} catch (e) {
+				const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+				console.error(`chunk ${chunk} FAILED ${name} (${Date.now() - startedAt}ms) - ${detail}`);
+				if (e instanceof Error) e.message = `[${name}] ${e.message}`;
+				throw e;
+			}
+		};
+
+		const matches = await phase("clickhouse: select matches", () =>
+			chQuery<MatchResult>(
+				this.env,
+				`${MATCH_SQL}
+				 ORDER BY list_type, work_item_id, type, normalized_value
+				 LIMIT {limit:UInt64} OFFSET {offset:UInt64}`,
+				{ limit, offset },
+			),
 		);
 
 		if (matches.length === 0) {
@@ -444,12 +471,16 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 		if (dryRun) {
 			const outcome: MatchOutcome = { ok: false, reason: "dryRun — nothing written or erased" };
-			const text = await logMatches(this.env, ctx, chunk, alerts, outcome);
+			const text = await phase("betterstack: dry-run alert", () =>
+				logMatches(this.env, ctx, chunk, alerts, outcome),
+			);
 			return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: text };
 		}
 
 		// the match rows first — the erase destroys the only other evidence
-		const written = await recordMatches(this.env, matchRows);
+		const written = await phase("supabase: insert match rows", () =>
+			recordMatches(this.env, matchRows),
+		);
 		const reason = incompleteReason(written);
 		if (reason) {
 			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason });
@@ -459,10 +490,14 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		}
 
 		// announce it, before the data goes
-		const matchLog = await logMatches(this.env, ctx, chunk, alerts, { ok: true });
+		const matchLog = await phase("betterstack: match alert", () =>
+			logMatches(this.env, ctx, chunk, alerts, { ok: true }),
+		);
 
 		// erase, and verify rather than assume
-		const expired = await deleteEntityRows(this.env, [...toExpire.values()]);
+		const expired = await phase("clickhouse: erase matched records", () =>
+			deleteEntityRows(this.env, [...toExpire.values()]),
+		);
 		if (expired.after > 0) {
 			const why = `${expired.after} of ${expired.before} entity_search_results row(s) survived the delete`;
 			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
@@ -470,7 +505,9 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		}
 
 		// only now is 'deleted' a true statement
-		const statusSet = await markMatchesDeleted(this.env, written.workItemIds);
+		const statusSet = await phase("supabase: set status deleted", () =>
+			markMatchesDeleted(this.env, written.workItemIds),
+		);
 		if (statusSet < written.workItems) {
 			const why =
 				`${written.workItems - statusSet} of ${written.workItems} work item(s) did not end up ` +
@@ -479,11 +516,13 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			throw new Error(`chunk ${chunk}: ${why}`);
 		}
 
-		await writeMatchLog(this.env, {
-			run_id: ctx.run_id,
-			batch: chunk,
-			text: renderMatchLog(ctx, chunk, alerts, new Date(), { ok: true }),
-		});
+		await phase("r2: evidence file", () =>
+			writeMatchLog(this.env, {
+				run_id: ctx.run_id,
+				batch: chunk,
+				text: renderMatchLog(ctx, chunk, alerts, new Date(), { ok: true }),
+			}),
+		);
 
 		return {
 			linked: written.linked,
