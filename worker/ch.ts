@@ -63,3 +63,63 @@ export async function chInsert(env: Env, table: string, rows: object[]): Promise
 	}
 	return rows.length;
 }
+
+/** One identifier as the combined view keys it. */
+export type EntityKey = { type: string; normalized_value: string };
+
+/**
+ * The predicate, shared by the count and the delete so they cannot drift.
+ *
+ * The pairs travel as ONE String parameter holding JSON, not as an
+ * Array(String) and not interpolated. normalized_value is arbitrary consumer
+ * input — an apostrophe, a quote or a backslash in an e-mail address would
+ * break a hand-built IN list, and getting that wrong here deletes the wrong
+ * rows rather than merely erroring.
+ */
+const ENTITY_MATCH = `(type, normalized_value) IN (
+    SELECT tuple(JSONExtractString(p, 1), JSONExtractString(p, 2))
+    FROM (SELECT arrayJoin(JSONExtractArrayRaw({pairs:String})) AS p)
+)`;
+
+/**
+ * Erase every entity_search_results row for the matched identifiers.
+ *
+ * ALTER TABLE ... DELETE, not the lightweight DELETE FROM. The lightweight
+ * form marks rows with the virtual _row_exists column and leaves the data on
+ * disk until a merge happens to rewrite the part; this is a mutation, so the
+ * parts are rewritten without the rows in them. For a statutory deletion
+ * request that difference is the whole point.
+ *
+ * mutations_sync = 2 waits for the mutation to finish on every replica, so
+ * this returns only once the data is actually gone — and the caller can check
+ * `after` rather than take the ALTER's word for it.
+ */
+export async function deleteEntityRows(
+	env: Env,
+	keys: EntityKey[],
+): Promise<{ before: number; after: number }> {
+	if (keys.length === 0) return { before: 0, after: 0 };
+
+	const pairs = JSON.stringify(keys.map((k) => [k.type, k.normalized_value]));
+	const count = async () => {
+		const [r] = await chQuery<{ n: string }>(
+			env,
+			`SELECT count() AS n FROM default.entity_search_results WHERE ${ENTITY_MATCH}`,
+			{ pairs },
+		);
+		return Number(r?.n ?? 0);
+	};
+
+	const before = await count();
+	if (before === 0) return { before: 0, after: 0 };
+
+	await chQuery(
+		env,
+		`ALTER TABLE default.entity_search_results
+		 DELETE WHERE ${ENTITY_MATCH}
+		 SETTINGS mutations_sync = 2`,
+		{ pairs },
+	);
+
+	return { before, after: await count() };
+}

@@ -1,8 +1,9 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { chQuery } from "./ch";
-import { incompleteReason, recordMatches } from "./db";
+import { chQuery, deleteEntityRows } from "./ch";
+import type { EntityKey } from "./ch";
+import { incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
 import { logMatches, logRun, Pending, renderMatchLog, tracer } from "./logs";
 import type { MatchAlert, MatchOutcome } from "./logs";
@@ -14,17 +15,20 @@ import { writeMatchLog } from "./audit";
  *   ① rebuild ca_drop_combined_search_result and wait for it to settle
  *   ② pull candidate keys out of the view, one batch at a time
  *   ③ for every key in the batch, kv.get the hash against the DROP set
- *   ④ on a match: a row in public.ca_drop_work_item_match AND status
- *      'deleted' on the work item, then the Better Stack alert
- *   ⑤ the R2 evidence file — only once ④ has fully landed
- *   ⑥ summary
+ *   ④ on a match: the rows in public.ca_drop_work_item_match
+ *   ⑤ the Better Stack alert
+ *   ⑥ erase the matched records from default.entity_search_results
+ *   ⑦ status 'deleted' on the work item — only once ⑥ has actually erased them
+ *   ⑧ the R2 evidence file
+ *   ⑨ summary
  *
- * A match that is found and not recorded fails the run. It is the worst
- * outcome available here: a consumer on California's delete list was located
- * in our data and the fact was then lost, which is indistinguishable
- * downstream from never having found them. So the batch step throws, the
- * alert goes out at error rather than warn, and no R2 file is written
- * claiming the match was handled.
+ * The order of ④ to ⑦ is the whole point and is not interchangeable. The match
+ * row comes first, because the expire destroys the only other evidence the
+ * consumer was ever there. The alert comes before the expire, so a failure
+ * afterwards still leaves both a record and a warning that someone on the
+ * delete list was found. The status comes last, because Cron B reports it to
+ * California as code 3 Deleted: written before the records are gone it is a
+ * false statement to a regulator; written after, it is simply true.
  *
  * Steps ②–④ are one Workflow step per batch, deliberately. The batch is the
  * unit of progress: the cursor advances only when the keys have been compared
@@ -144,6 +148,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let matchesLinked = 0;
 		let matchesInserted = 0;
 		let matchesStatusSet = 0;
+		let rowsExpired = 0;
 		let matchesSkippedEmpty = 0;
 		let lastMatchLog = "";
 
@@ -272,6 +277,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesLinked += result.linked;
 				matchesInserted += result.inserted;
 				matchesStatusSet += result.statusSet;
+				rowsExpired += result.rowsExpired;
 				matchesSkippedEmpty += result.skippedEmpty;
 				if (result.matchLog) lastMatchLog = result.matchLog;
 
@@ -295,6 +301,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesUnlinked: matchesFound - matchesLinked,
 				matchRowsInserted: matchesInserted,
 				workItemsMarkedDeleted: matchesStatusSet,
+				entityRowsExpired: rowsExpired,
 				matchesSkippedEmpty,
 				dryRun: dryRun ? 1 : 0,
 			};
@@ -323,6 +330,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					matchesLinked,
 					matchRowsInserted: matchesInserted,
 					workItemsMarkedDeleted: matchesStatusSet,
+				entityRowsExpired: rowsExpired,
 					matchesSkippedEmpty,
 				},
 			});
@@ -354,11 +362,16 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 		// Flatten to the keys this batch is responsible for, remembering which
 		// identifier each came from so a match can name it.
-		type Candidate = { listType: string; hash: string; normalizedValue: string };
+		type Candidate = { type: string; listType: string; hash: string; normalizedValue: string };
 		const candidates: Candidate[] = [];
 		for (const r of rows) {
 			for (const [listType, hash] of r.keys) {
-				candidates.push({ listType, hash, normalizedValue: r.normalized_value });
+				candidates.push({
+					type: r.type,
+					listType,
+					hash,
+					normalizedValue: r.normalized_value,
+				});
 			}
 		}
 
@@ -378,6 +391,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				inserted: 0,
 				statusSet: 0,
 				skippedEmpty: 0,
+				rowsExpired: 0,
 				matchLog: "",
 				matchLogKey: "",
 				done,
@@ -414,6 +428,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		// ④ what matched
 		const alerts: MatchAlert[] = [];
 		const matchRows: MatchRow[] = [];
+		// The identifiers whose records have to go, deduped: several keys of
+		// one view row can match separately, and it is one row's worth of
+		// records either way.
+		const toExpire = new Map<string, EntityKey>();
 		for (const hit of hits) {
 			if (!hit) continue;
 			for (const c of byHash.get(hit.hash) ?? []) {
@@ -427,6 +445,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					work_item_id: hit.workItemId,
 					matched_normalized_value: c.normalizedValue,
 				});
+				toExpire.set(`${c.type}\u0000${c.normalizedValue}`, {
+					type: c.type,
+					normalized_value: c.normalizedValue,
+				});
 			}
 		}
 
@@ -434,54 +456,62 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let inserted = 0;
 		let statusSet = 0;
 		let skippedEmpty = 0;
+		let rowsExpired = 0;
 		let matchLog = "";
 		let matchLogKey = "";
 
 		if (matchRows.length > 0) {
-			// ④ Supabase first, and it has to land completely. "Recorded" is both
-			// halves — a row in ca_drop_work_item_match AND status = 'deleted' on
-			// the work item — because either one missing leaves the match
-			// unreportable to DROP.
 			let outcome: MatchOutcome = { ok: true };
 
 			if (opts.dryRun) {
-				outcome = { ok: false, reason: "dryRun — nothing was written" };
+				outcome = { ok: false, reason: "dryRun — nothing was written or erased" };
+				matchLog = await logMatches(this.env, ctx, batch, alerts, outcome);
 			} else {
+				// ④ the match rows first. They are the record that the consumer
+				// was found, and they have to exist before anything is erased —
+				// the expire destroys the only other evidence there was.
 				const written = await recordMatches(this.env, matchRows);
 				linked = written.linked;
 				inserted = written.inserted;
-				statusSet = written.statusSet;
 				skippedEmpty = written.skippedEmpty;
 
 				const reason = incompleteReason(written);
-				if (reason) outcome = { ok: false, reason };
-			}
+				if (reason) {
+					await logMatches(this.env, ctx, batch, alerts, { ok: false, reason });
+					throw new NonRetryableError(
+						`batch ${batch}: found ${matchRows.length} DROP match(es) but could not record them — ${reason}`,
+					);
+				}
 
-			// The alert goes out either way, and its level says which happened:
-			// warn for a match that was recorded, error for one that was not.
-			matchLog = await logMatches(this.env, ctx, batch, alerts, outcome);
+				// ⑤ announce it, before the data goes. If everything after this
+				// fails, there is still a durable match row and an alert saying
+				// a consumer on the delete list was found.
+				matchLog = await logMatches(this.env, ctx, batch, alerts, outcome);
 
-			if (!outcome.ok && !opts.dryRun) {
-				// No R2 log. A file in the audit trail asserting a match was
-				// handled, when the database has no record of it, is worse than
-				// no file — so the run fails here instead and the batch is
-				// retried from the cursor it has not yet moved.
-				// NonRetryableError, so this fails on the first attempt rather
-				// than the fifth. Every reason incompleteReason() gives is a
-				// consistency problem between KV and Supabase -- a work item
-				// that is not there, a status that did not take -- and none of
-				// them resolve by asking again. Retrying would re-read the
-				// batch from ClickHouse and redo its KV lookups four more
-				// times, roughly fifteen minutes, to arrive at the same
-				// answer. Transient faults still get their five attempts:
-				// those throw before ever reaching here.
-				throw new NonRetryableError(
-					`batch ${batch}: found ${matchRows.length} DROP match(es) but did not record them — ${outcome.reason}`,
-				);
-			}
+				// ⑥ erase the records themselves. ALTER TABLE ... DELETE with
+				// mutations_sync = 2, so this returns only once the rows are
+				// gone, and `after` is checked rather than trusted.
+				const expired = await deleteEntityRows(this.env, [...toExpire.values()]);
+				rowsExpired = expired.before - expired.after;
+				if (expired.after > 0) {
+					const why = `${expired.after} of ${expired.before} entity_search_results row(s) survived the delete`;
+					await logMatches(this.env, ctx, batch, alerts, { ok: false, reason: why });
+					throw new Error(`batch ${batch}: ${why}`);
+				}
 
-			// ⑤ Only now, with the matches durable, the evidence file.
-			if (!opts.dryRun) {
+				// ⑦ only now is 'deleted' a true statement. Cron B reports this
+				// to California as code 3, so it must not be written while the
+				// data is still there.
+				statusSet = await markMatchesDeleted(this.env, written.workItemIds);
+				if (statusSet < written.workItems) {
+					const why =
+						`${written.workItems - statusSet} of ${written.workItems} work item(s) did not ` +
+						`end up with status = 'deleted' after the records were erased`;
+					await logMatches(this.env, ctx, batch, alerts, { ok: false, reason: why });
+					throw new Error(`batch ${batch}: ${why}`);
+				}
+
+				// ⑧ the evidence file, last, once every earlier step has held.
 				matchLogKey = await writeMatchLog(this.env, {
 					run_id: ctx.run_id,
 					batch,
@@ -499,6 +529,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			inserted,
 			statusSet,
 			skippedEmpty,
+			rowsExpired,
 			matchLog,
 			matchLogKey,
 			done: false,

@@ -238,22 +238,19 @@ export type MatchWriteResult = {
 	workItems: number;
 	/** match rows written — lower than `linked` when a previous attempt wrote them */
 	inserted: number;
-	/** linked work items now carrying status = 'deleted' */
-	statusSet: number;
+	/** ids of those work items, for the status write once ClickHouse is clear */
+	workItemIds: string[];
 };
 
 /**
- * Why this write did not fully land, or null if it did.
+ * Why the match rows did not all land, or null if they did.
  *
- * "Recorded" means both halves: a row in ca_drop_work_item_match AND the
- * status on the work item. Either one missing and the match is not reportable
- * to DROP, so the caller is expected to fail the run rather than carry on —
- * a match that is found and not recorded is the one outcome this pipeline
- * must never shrug off.
+ * Only about the insert. The status is written later and separately, because
+ * it may not be written until the rows are actually gone from ClickHouse.
  *
  * `inserted` is deliberately not part of the test. It is lower than `linked`
- * whenever a previous attempt already wrote the rows, which is exactly what
- * a retried step should do.
+ * whenever a previous attempt already wrote the rows, which is exactly what a
+ * retried step should do.
  */
 export function incompleteReason(r: MatchWriteResult): string | null {
 	if (r.skippedEmpty > 0) {
@@ -264,12 +261,6 @@ export function incompleteReason(r: MatchWriteResult): string | null {
 			`${r.submitted - r.linked} of ${r.submitted} match(es) had no row in ` +
 			`ca_drop_work_item — KV and Supabase have drifted, or Cron A has not run since ` +
 			`the table was last rebuilt`
-		);
-	}
-	if (r.statusSet < r.workItems) {
-		return (
-			`${r.workItems - r.statusSet} of ${r.workItems} work item(s) did not end up ` +
-			`with status = 'deleted'`
 		);
 	}
 	return null;
@@ -327,7 +318,7 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 	}
 
 	if (usable.length === 0) {
-		return { submitted: rows.length, skippedEmpty, linked: 0, workItems: 0, inserted: 0, statusSet: 0 };
+		return { submitted: rows.length, skippedEmpty, linked: 0, workItems: 0, inserted: 0, workItemIds: [] };
 	}
 
 	console.log(`db: recording ${usable.length} match(es) → ${describe(env)}`);
@@ -340,8 +331,7 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					linked: string;
 					work_items: string;
 					inserted: string;
-					status_updated: string;
-					status_already: string;
+					item_ids: string;
 				}[]
 			>`
 				WITH v AS (
@@ -366,38 +356,11 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					ON CONFLICT (ca_drop_work_item_id, matched_normalized_value) DO NOTHING
 					RETURNING 1
 				),
-				-- Work items that already carry the status, from an earlier batch
-				-- or an earlier run. They are counted, not rewritten.
-				already AS (
-					SELECT w.id
-					FROM items i
-					JOIN public.ca_drop_work_item w ON w.id = i.id
-					WHERE w.status = 'deleted'
-				),
-				-- IS DISTINCT FROM 'deleted' is what keeps this to once per work
-				-- item. A DROP work item is matched again in every later batch
-				-- that turns up another of its identifiers -- NDZ and NameVIN
-				-- hashes stand for a person, so that is normal, not rare -- and
-				-- without the guard each of those would rewrite the row and push
-				-- status_set_at forward.
-				--
-				-- status_set_at should say when the consumer was FIRST found, not
-				-- when the scan last happened to pass their record again. It is
-				-- the timestamp the audit trail rests on, so it is written once
-				-- and then left alone.
-				upd AS (
-					UPDATE public.ca_drop_work_item w
-					SET status = 'deleted', status_set_at = now()
-					FROM items i
-					WHERE w.id = i.id AND w.status IS DISTINCT FROM 'deleted'
-					RETURNING w.id
-				)
-				SELECT (SELECT count(*) FROM v)       AS submitted,
-				       (SELECT count(*) FROM linked)  AS linked,
-				       (SELECT count(*) FROM items)   AS work_items,
-				       (SELECT count(*) FROM ins)     AS inserted,
-				       (SELECT count(*) FROM upd)     AS status_updated,
-				       (SELECT count(*) FROM already) AS status_already
+				SELECT (SELECT count(*) FROM v)      AS submitted,
+				       (SELECT count(*) FROM linked) AS linked,
+				       (SELECT count(*) FROM items)  AS work_items,
+				       (SELECT count(*) FROM ins)    AS inserted,
+				       (SELECT coalesce(jsonb_agg(id), '[]'::jsonb) FROM items)::text AS item_ids
 			`,
 			30000,
 			"insert ca_drop_work_item_match",
@@ -409,11 +372,61 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 			linked: Number(r?.linked ?? 0),
 			workItems: Number(r?.work_items ?? 0),
 			inserted: Number(r?.inserted ?? 0),
-			// A work item counts as carrying the status whether this call set it
-			// or a previous attempt did — the test is the end state, not the
-			// delta, so a retry does not look like a failure.
-			statusSet: Number(r?.status_updated ?? 0) + Number(r?.status_already ?? 0),
+			workItemIds: JSON.parse(r?.item_ids ?? "[]") as string[],
 		};
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * Mark matched work items as deleted.
+ *
+ * Separate from recordMatches, and called only once the rows are actually
+ * gone from entity_search_results. `status = 'deleted'` is what Cron B
+ * reports to California as code 3, so writing it before the data is erased
+ * would put a false statement in front of a regulator — the match row is a
+ * record that we found the consumer, this is a claim that we acted on it.
+ *
+ * IS DISTINCT FROM 'deleted' keeps the write to once per work item. A work
+ * item is matched again in every later batch that turns up another of its
+ * identifiers, which for NDZ and NameVIN is the normal case, and
+ * status_set_at should say when the consumer was first cleared rather than
+ * when the scan last passed one of their records.
+ *
+ * Returns how many of the given work items now carry the status, counting
+ * the ones a previous attempt set — the test is the end state, not the
+ * delta, so a retried step does not read as a failure.
+ */
+export async function markMatchesDeleted(env: Env, workItemIds: string[]): Promise<number> {
+	if (workItemIds.length === 0) return 0;
+
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ updated: string; already: string }[]>`
+				WITH ids AS (
+					SELECT (jsonb_array_elements_text(${JSON.stringify(workItemIds)}::text::jsonb))::bigint AS id
+				),
+				already AS (
+					SELECT w.id FROM ids i
+					JOIN public.ca_drop_work_item w ON w.id = i.id
+					WHERE w.status = 'deleted'
+				),
+				upd AS (
+					UPDATE public.ca_drop_work_item w
+					SET status = 'deleted', status_set_at = now()
+					FROM ids i
+					WHERE w.id = i.id AND w.status IS DISTINCT FROM 'deleted'
+					RETURNING w.id
+				)
+				SELECT (SELECT count(*) FROM upd)     AS updated,
+				       (SELECT count(*) FROM already) AS already
+			`,
+			30000,
+			"update ca_drop_work_item.status",
+		);
+		return Number(r?.updated ?? 0) + Number(r?.already ?? 0);
 	} finally {
 		await closeQuietly(sql);
 	}

@@ -22,6 +22,7 @@
 --   SELECT  default.ca_drop_combined_search_result   the candidate keys
 --   SYSTEM REFRESH VIEW on that view                 step ①
 --   SELECT  system.view_refreshes                    waiting for step ①
+--   SELECT + ALTER DELETE on entity_search_results   the expire
 -- =====================================================================
 
 
@@ -60,11 +61,27 @@ GRANT SYSTEM VIEWS ON default.ca_drop_combined_search_result TO drop_workflow_ro
 --     query, it's necessary to have the grant SELECT ON system.view_refreshes
 GRANT SELECT ON system.view_refreshes TO drop_workflow_role;
 
--- Deliberately NOT granted: anything on default.entity_search_results.
--- ca_drop_combined_search_result is declared SQL SECURITY DEFINER, so a
--- refresh reads the source table as its definer
--- (sql-console:access@claritycheck.com), never as drop_workflow. Worth
--- knowing that the definer is load-bearing: if that account is removed,
+-- The expire. Cron C now erases the matched records themselves, which is what
+-- makes status = 'deleted' a true statement rather than a claim.
+--
+--   ALTER DELETE  runs ALTER TABLE ... DELETE, a real mutation: the parts are
+--                 rewritten without the rows. NOT the lightweight DELETE FROM,
+--                 which only marks rows and leaves the data on disk until some
+--                 later merge -- not good enough for a statutory deletion.
+--   SELECT        the predicate reads the columns, and the workflow counts the
+--                 matching rows before and after so it can verify the delete
+--                 instead of trusting it.
+--
+-- This is the one real widening of the role. entity_search_results holds the
+-- raw provider payloads, so SELECT on it is broad -- it is the table this whole
+-- pipeline exists to protect. Granted because the alternative is a workflow
+-- that reports deletions it cannot confirm.
+GRANT SELECT, ALTER DELETE ON default.entity_search_results TO drop_workflow_role;
+
+-- Note the asymmetry: reading through ca_drop_combined_search_result never
+-- needed this. That view is declared SQL SECURITY DEFINER, so a refresh reads
+-- the source as its definer (sql-console:access@claritycheck.com), never as
+-- drop_workflow. The definer is load-bearing: if that account is removed,
 -- refreshes break and no grant in this file will fix it.
 
 
@@ -125,11 +142,13 @@ ALTER USER drop_workflow SETTINGS
 -- 5. Verify — run as admin
 -- =====================================================================
 
--- Expect EXACTLY these three rows. Anything naming ca_drop_work_items or
+-- Expect EXACTLY these five rows. Anything naming ca_drop_work_items or
 -- ca_drop_match_run means the REVOKE in section 1 did not run.
 --
 --   SELECT        default   ca_drop_combined_search_result
 --   SYSTEM VIEWS  default   ca_drop_combined_search_result
+--   SELECT        default   entity_search_results
+--   ALTER DELETE  default   entity_search_results
 --   SELECT        system    view_refreshes
 SELECT access_type, database, table
 FROM system.grants

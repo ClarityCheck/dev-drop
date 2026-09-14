@@ -21,7 +21,11 @@ function batchResult(over: Partial<Record<string, unknown>> = {}) {
 		matchesFound: 0,
 		linked: 0,
 		inserted: 0,
+		statusSet: 0,
+		skippedEmpty: 0,
+		rowsExpired: 0,
 		matchLog: "",
+		matchLogKey: "",
 		done: false,
 		cursorType: "",
 		cursorValue: "",
@@ -126,38 +130,36 @@ describe("DropReportsCleanupWorkflow", () => {
 });
 
 /**
- * What counts as "the match was recorded". Cron C fails the run when this
- * returns a reason, so a false positive here stops a healthy pipeline and a
- * false negative loses a deletion request quietly.
+ * What counts as the match rows having landed. Cron C fails the run when this
+ * returns a reason, so a false positive stops a healthy pipeline and a false
+ * negative loses a deletion request quietly.
+ *
+ * The status is NOT judged here. It is written later, and only once the
+ * records are gone from ClickHouse.
  */
 describe("incompleteReason", () => {
-	const ok = { submitted: 3, skippedEmpty: 0, linked: 3, workItems: 2, inserted: 3, statusSet: 2 };
+	const ok = {
+		submitted: 3,
+		skippedEmpty: 0,
+		linked: 3,
+		workItems: 2,
+		inserted: 3,
+		workItemIds: ["1", "2"],
+	};
 
-	it("passes when every match is linked and every work item has the status", () => {
+	it("passes when every match linked to a work item", () => {
 		expect(incompleteReason(ok)).toBeNull();
 	});
 
 	it("passes when a retry re-runs the write and inserts nothing new", () => {
 		// The rows were already written by the previous attempt. inserted drops
-		// to 0 while the end state is still correct -- this must not be read as
-		// a failure, or no retried batch could ever succeed.
+		// to 0 while the end state is still correct -- this must not read as a
+		// failure, or no retried batch could ever succeed.
 		expect(incompleteReason({ ...ok, inserted: 0 })).toBeNull();
-	});
-
-	it("passes when the status was already set by an earlier batch", () => {
-		// A work item matched again in a later batch is normal: NDZ and NameVIN
-		// hashes stand for a person, so each of their identifiers turns up
-		// separately. Nothing is rewritten -- statusSet counts the rows that
-		// already carry it -- and that must still read as recorded.
-		expect(incompleteReason({ ...ok, inserted: 0, statusSet: 2 })).toBeNull();
 	});
 
 	it("fails when a match has no work item to link to", () => {
 		expect(incompleteReason({ ...ok, linked: 1 })).toContain("no row in ca_drop_work_item");
-	});
-
-	it("fails when a work item did not get status = deleted", () => {
-		expect(incompleteReason({ ...ok, statusSet: 1 })).toContain("status = 'deleted'");
 	});
 
 	it("fails when a match was dropped for an empty identifier", () => {
