@@ -559,3 +559,81 @@ export async function dbPing(env: Env): Promise<Record<string, unknown>> {
 	await closeQuietly(sql);
 	return { ...out, ok: true };
 }
+
+/** How many work items exist. The number KV is expected to match. */
+export async function countWorkItems(env: Env): Promise<number> {
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ n: string }[]>`SELECT count(*)::text AS n FROM public.ca_drop_work_item`,
+			15000,
+			"count ca_drop_work_item",
+		);
+		return Number(r?.n ?? 0);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * A page of work items, for rebuilding KV.
+ *
+ * Keyset pagination on the primary key, not OFFSET: the repair walks the whole
+ * table, and OFFSET re-reads everything before the page on every call, so the
+ * last pages of a large rebuild cost more than the first. `id > $after` costs
+ * the same at row 1 and row 3,000,000.
+ */
+export async function pageWorkItems(
+	env: Env,
+	afterId: string,
+	limit: number,
+): Promise<{ id: string; list_type: string; work_item_id: string; hash: string; request_date: string | null }[]> {
+	const sql = connect(env);
+	try {
+		return await withTimeout(
+			sql<
+				{ id: string; list_type: string; work_item_id: string; hash: string; request_date: string | null }[]
+			>`
+				SELECT id::text AS id, list_type, work_item_id, hash,
+				       to_char(request_date, 'YYYY-MM-DD') AS request_date
+				FROM public.ca_drop_work_item
+				WHERE id > ${afterId}::bigint
+				ORDER BY id
+				LIMIT ${limit}
+			`,
+			30000,
+			"page ca_drop_work_item",
+		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * A random handful of work items, to spot-check KV against.
+ *
+ * Counting KV means listing all of it, which is one call per 1,000 keys — fine
+ * as part of a run that is listing anyway, far too slow for a health check.
+ * Sampling costs one query and N reads, and it catches the failure that
+ * matters most: if KV has been emptied, every sampled key misses at once.
+ */
+export async function sampleWorkItems(
+	env: Env,
+	n: number,
+): Promise<{ list_type: string; work_item_id: string; hash: string }[]> {
+	const sql = connect(env);
+	try {
+		return await withTimeout(
+			sql<{ list_type: string; work_item_id: string; hash: string }[]>`
+				SELECT list_type, work_item_id, hash
+				FROM public.ca_drop_work_item
+				ORDER BY random()
+				LIMIT ${n}
+			`,
+			20000,
+			"sample ca_drop_work_item",
+		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}

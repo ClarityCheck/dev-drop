@@ -2,8 +2,9 @@
 export { DropReportsCleanupWorkflow } from "./workflow-reports-cleanup";
 export { DropDownloaderWorkflow } from "./workflow-downloader";
 export { WorkflowStatusDO } from "./durable-object";
+export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 
-import { dbPing } from "./db";
+import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 
 /**
  * Main Worker fetch handler
@@ -16,6 +17,8 @@ import { dbPing } from "./db";
  * - POST /api/downloader/start - Start the drop-downloader workflow
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
+ * - GET /api/kv-health - is the DROP set in KV still complete?
+ * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -148,6 +151,82 @@ export default {
 			const instanceId = url.pathname.split("/").pop();
 			if (!instanceId) return Response.json({ error: "Instance ID required" }, { status: 400 });
 			const instance = await env.DROP_DOWNLOADER.get(instanceId);
+			return Response.json(await instance.status());
+		}
+
+		// Is the DROP set in KV still complete?
+		//
+		// KV cannot be counted without listing it, which is one call per 1,000
+		// keys — fine inside a job that is listing anyway, far too slow here. So
+		// this samples instead: a handful of hashes taken at random from
+		// Supabase, looked up in KV one by one. That catches the failure that
+		// matters, because if KV has been emptied every sample misses at once,
+		// and it catches partial loss with a probability that rises with the
+		// sample size.
+		//
+		// Missing keys are the dangerous direction: the gate stops suppressing
+		// someone who asked to be deleted, and a miss looks exactly like never
+		// having been listed.
+		if (url.pathname === "/api/kv-health") {
+			const sampleSize = Math.max(
+				1,
+				Math.min(500, Number(url.searchParams.get("sample") ?? 100)),
+			);
+			try {
+				const [expected, sample] = await Promise.all([
+					countWorkItems(env),
+					sampleWorkItems(env, sampleSize),
+				]);
+
+				const missing: { list_type: string; work_item_id: string }[] = [];
+				for (const row of sample) {
+					const hit = await env.kv.get(row.hash);
+					if (hit === null) {
+						missing.push({ list_type: row.list_type, work_item_id: row.work_item_id });
+					}
+				}
+
+				const ok = missing.length === 0;
+				return Response.json(
+					{
+						ok,
+						workItemsInSupabase: expected,
+						sampled: sample.length,
+						missingFromKv: missing.length,
+						// Capped: a wiped namespace would otherwise list the lot.
+						missing: missing.slice(0, 20),
+						verdict: ok
+							? "every sampled hash is present in KV"
+							: `${missing.length} of ${sample.length} sampled hashes are MISSING from KV — ` +
+								"the real-time gate is under-suppressing. Run POST /api/kv-repair/start",
+					},
+					{ status: ok ? 200 : 500 },
+				);
+			} catch (e) {
+				return Response.json(
+					{ ok: false, error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) },
+					{ status: 500 },
+				);
+			}
+		}
+
+		// Rebuild KV from Supabase. Body (all optional):
+		//   { pageSize?, maxPages?, afterId?, dryRun? }
+		if (url.pathname === "/api/kv-repair/start" && request.method === "POST") {
+			let params: Record<string, unknown> = {};
+			try {
+				params = (await request.json()) as Record<string, unknown>;
+			} catch {
+				// no body — run with defaults
+			}
+			const instance = await env.DROP_KV_REPAIR.create({ params });
+			return Response.json({ instanceId: instance.id, workflow: "drop-kv-repair" });
+		}
+
+		if (url.pathname.startsWith("/api/kv-repair/status/")) {
+			const instanceId = url.pathname.split("/").pop();
+			if (!instanceId) return Response.json({ error: "Instance ID required" }, { status: 400 });
+			const instance = await env.DROP_KV_REPAIR.get(instanceId);
 			return Response.json(await instance.status());
 		}
 

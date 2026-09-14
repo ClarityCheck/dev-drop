@@ -68,6 +68,14 @@
 			"name": "drop-downloader",
 			"binding": "DROP_DOWNLOADER",
 			"class_name": "DropDownloaderWorkflow"
+		},
+		{
+			// Rebuilds the DROP hash set in KV from Supabase. Run on evidence,
+			// not on a schedule: it is a bulk write to what the real-time gate
+			// reads. See /api/kv-health for the evidence.
+			"name": "drop-kv-repair",
+			"binding": "DROP_KV_REPAIR",
+			"class_name": "DropKvRepairWorkflow"
 		}
 	],
 	"durable_objects": {

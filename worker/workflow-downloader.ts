@@ -37,7 +37,7 @@ import type { ListType } from "./zip";
 type Params = {
 	/** the ZIP to ingest; defaults to the newest object under ca-drop/raw/ */
 	r2Key?: string;
-	/** wipe KV before loading (see the note on step ④) */
+	/** wipe KV before loading. Default false — see the note where it is read. */
 	clearKv?: boolean;
 	/** rows per page — also the KV writes per step, keep well under 1000 */
 	pageSize?: number;
@@ -54,7 +54,12 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
 		const runId = event.instanceId;
 		const pageSize = event.payload?.pageSize ?? 400;
-		const clearKv = event.payload?.clearKv ?? true;
+		// Cumulative by default. Every download after the first is a delta, so
+		// wiping first leaves KV holding only the newest one — and the real-time
+		// gate then stops suppressing anyone listed in an earlier cycle, silently,
+		// because a missing key is indistinguishable from never having been listed.
+		// The upsert into Supabase already accumulates; this makes KV match it.
+		const clearKv = event.payload?.clearKv ?? false;
 		const maxClearPages = event.payload?.maxClearPages ?? 200;
 
 		const ctx = { workflow: "drop-downloader", run_id: runId };

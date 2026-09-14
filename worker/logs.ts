@@ -416,3 +416,32 @@ export async function logRun(
 		),
 	});
 }
+
+/**
+ * KV has drifted from Supabase.
+ *
+ * Its own entry rather than a field on the summary, because the summary is
+ * shipped with only its numeric fields and this needs to say what to do about
+ * it. Error when KV is short — that is the gate failing to suppress someone
+ * who asked to be deleted — and warn when it is long, which only means stale
+ * entries suppressing someone who should have got a result.
+ */
+export async function logKvDrift(
+	env: Env,
+	ctx: Context,
+	d: { level: "warn" | "error"; expected: number; inKv: number; message: string },
+): Promise<void> {
+	await ship(env, {
+		...ctx,
+		dt: new Date().toISOString(),
+		level: d.level,
+		message: d.message,
+		step: "check DROP set is complete",
+		phase: d.level === "error" ? "failed" : "match",
+		result: {
+			work_items_in_supabase: d.expected,
+			hashes_in_kv: d.inKv,
+			shortfall: d.expected - d.inKv,
+		},
+	});
+}

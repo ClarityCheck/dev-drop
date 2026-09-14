@@ -3,9 +3,18 @@ import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chInsert, chQuery, deleteEntityRows } from "./ch";
 import type { EntityKey } from "./ch";
-import { incompleteReason, markMatchesDeleted, recordMatches } from "./db";
+import { countWorkItems, incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
-import { describeError, logMatches, logRun, Pending, phaseTracer, renderMatchLog, tracer } from "./logs";
+import {
+	describeError,
+	logKvDrift,
+	logMatches,
+	logRun,
+	Pending,
+	phaseTracer,
+	renderMatchLog,
+	tracer,
+} from "./logs";
 import type { MatchAlert, MatchOutcome } from "./logs";
 import { writeMatchLog } from "./audit";
 
@@ -349,9 +358,56 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			}
 
 			// ---------------------------------------------------------------
-			// ⑦ summary
+			// ⑦ is KV still complete?
+			//
+			// Free, because both numbers are already here: dropSetRows is what
+			// came out of KV, and Supabase holds what should have. They are the
+			// only two places the DROP set exists in a countable form.
+			//
+			// This matters more than it looks. An empty or partial KV does not
+			// make Cron C fail — it makes it match less and report a clean run,
+			// which is indistinguishable from there being nothing to delete. The
+			// comparison is what turns that silence into a number.
+			//
+			// KV short is the dangerous direction: the real-time gate stops
+			// suppressing people who asked to be deleted. KV long is stale
+			// entries — over-suppression, unhelpful but not a breach.
+			// ---------------------------------------------------------------
+			let workItemsInSupabase = -1;
+			if (!skipKvSync) {
+				workItemsInSupabase = await tracedStep("check DROP set is complete", async () => {
+					const expected = await countWorkItems(this.env);
+					const shortfall = expected - dropSetRows;
+
+					if (shortfall > 0) {
+						await logKvDrift(this.env, ctx, {
+							level: "error",
+							expected,
+							inKv: dropSetRows,
+							message:
+								`KV is missing ${shortfall} of ${expected} DROP hashes — the real-time gate ` +
+								`is under-suppressing. Rebuild with POST /api/kv-repair/start`,
+						});
+					} else if (shortfall < 0) {
+						await logKvDrift(this.env, ctx, {
+							level: "warn",
+							expected,
+							inKv: dropSetRows,
+							message:
+								`KV holds ${-shortfall} more hashes than Supabase has work items — stale ` +
+								`entries over-suppress. Harmless, but they should not be there.`,
+						});
+					}
+					return expected;
+				});
+			}
+
+			// ---------------------------------------------------------------
+			// ⑧ summary
 			// ---------------------------------------------------------------
 			const summary = {
+				workItemsInSupabase,
+				kvShortfall: workItemsInSupabase < 0 ? 0 : workItemsInSupabase - dropSetRows,
 				runId,
 				dropSetRows,
 				kvKeysWithoutMeta,
