@@ -183,27 +183,25 @@ export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 	};
 }
 
-/** How many matches the text log spells out before it summarises the rest. */
+/** How many matches the Better Stack entry spells out before it summarises. */
 const MATCHES_IN_TEXT = 50;
 
 /**
- * The match alert. A DROP match means a consumer on California's delete list
- * is present in our data, so it is reported at `warn` — it is not an error
- * (the pipeline is working exactly as intended) but it is the one thing in
- * this workflow a human may want to see without going looking for it.
+ * The match log, as plain text.
  *
- * Shipped as both a rendered text block (`text`, for reading in the Better
- * Stack UI) and structured fields (`matched`, for querying and alerting on).
- * Returns the text so the caller can put it in the run summary.
+ * `limit` caps how many matches are spelled out — Better Stack gets a capped
+ * view because a log line is not a bulk transport, R2 gets all of them
+ * because it is the durable record.
  */
-export async function logMatches(
-	env: Env,
+export function renderMatchLog(
 	ctx: Context,
 	batch: number,
 	matches: MatchAlert[],
-): Promise<string> {
-	const at = new Date();
-	const shown = matches.slice(0, MATCHES_IN_TEXT);
+	at: Date,
+	outcome: MatchOutcome,
+	limit = Number.POSITIVE_INFINITY,
+): string {
+	const shown = Number.isFinite(limit) ? matches.slice(0, limit) : matches;
 	const lines = [
 		`CA DROP suppression match`,
 		`at: ${at.toISOString()}`,
@@ -211,26 +209,57 @@ export async function logMatches(
 		`run_id: ${ctx.run_id}`,
 		`batch: ${batch}`,
 		`matches: ${matches.length}`,
+		`recorded: ${outcome.ok ? "yes" : `NO — ${outcome.reason}`}`,
 		``,
 		...shown.map((m) => `  ${m.list_type}\t${m.work_item_id}\t${m.hash}`),
 	];
 	if (matches.length > shown.length) {
 		lines.push(`  ... and ${matches.length - shown.length} more`);
 	}
-	const text = lines.join("\n");
+	return lines.join("\n");
+}
+
+/** Whether the batch's matches actually made it into Supabase. */
+export type MatchOutcome = { ok: true } | { ok: false; reason: string };
+
+/**
+ * The match alert.
+ *
+ * A match that WAS recorded goes out at `warn`: the pipeline is working
+ * exactly as intended, but it is the one event here someone may want to see
+ * without going looking for it.
+ *
+ * A match that was NOT recorded goes out at `error`, because it is the worst
+ * thing this workflow can do. A consumer on California's delete list was
+ * found in our data and the fact was then lost — which looks, from every
+ * report downstream, identical to never having found them at all.
+ *
+ * Returns the text so the caller can put it in R2 and in the run summary.
+ */
+export async function logMatches(
+	env: Env,
+	ctx: Context,
+	batch: number,
+	matches: MatchAlert[],
+	outcome: MatchOutcome,
+): Promise<string> {
+	const at = new Date();
+	const text = renderMatchLog(ctx, batch, matches, at, outcome, MATCHES_IN_TEXT);
 
 	await ship(env, {
 		...ctx,
 		dt: at.toISOString(),
-		level: "warn",
-		message: `DROP match: ${matches.length} work item(s) found in ClickHouse (batch ${batch})`,
+		level: outcome.ok ? "warn" : "error",
+		message: outcome.ok
+			? `DROP match: ${matches.length} work item(s) found and recorded (batch ${batch})`
+			: `DROP match NOT RECORDED: ${matches.length} work item(s) found in batch ${batch} — ${outcome.reason}`,
 		step: `scan · batch ${batch}`,
-		phase: "match",
+		phase: outcome.ok ? "match" : "failed",
 		text,
 		// Capped for the same reason the text block is: a single batch can
 		// match thousands of items and a log line is not a bulk transport.
-		// The complete set is in public.ca_drop_work_item_match.
-		matched: shown,
+		// The complete set is in R2, and in public.ca_drop_work_item_match.
+		matched: matches.slice(0, MATCHES_IN_TEXT),
 		match_count: matches.length,
 		batch,
 	});

@@ -1,10 +1,11 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chQuery } from "./ch";
-import { recordMatches } from "./db";
+import { incompleteReason, recordMatches } from "./db";
 import type { MatchRow } from "./db";
-import { logMatches, logRun, Pending, tracer } from "./logs";
-import type { MatchAlert } from "./logs";
+import { logMatches, logRun, Pending, renderMatchLog, tracer } from "./logs";
+import type { MatchAlert, MatchOutcome } from "./logs";
+import { writeMatchLog } from "./audit";
 
 /**
  * Cron C — ClickHouse check  (workflow: drop-reports-cleanup)
@@ -12,9 +13,17 @@ import type { MatchAlert } from "./logs";
  *   ① rebuild ca_drop_combined_search_result and wait for it to settle
  *   ② pull candidate keys out of the view, one batch at a time
  *   ③ for every key in the batch, kv.get the hash against the DROP set
- *   ④ on a match: a row in public.ca_drop_work_item_match, a text log, and a
- *      Better Stack alert at warn
- *   ⑤ summary
+ *   ④ on a match: a row in public.ca_drop_work_item_match AND status
+ *      'deleted' on the work item, then the Better Stack alert
+ *   ⑤ the R2 evidence file — only once ④ has fully landed
+ *   ⑥ summary
+ *
+ * A match that is found and not recorded fails the run. It is the worst
+ * outcome available here: a consumer on California's delete list was located
+ * in our data and the fact was then lost, which is indistinguishable
+ * downstream from never having found them. So the batch step throws, the
+ * alert goes out at error rather than warn, and no R2 file is written
+ * claiming the match was handled.
  *
  * Steps ②–④ are one Workflow step per batch, deliberately. The batch is the
  * unit of progress: the cursor advances only when the keys have been compared
@@ -212,6 +221,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			let matchesFound = 0;
 			let matchesLinked = 0;
 			let matchesInserted = 0;
+			let matchesStatusSet = 0;
 			let matchesSkippedEmpty = 0;
 			let lastMatchLog = "";
 
@@ -241,6 +251,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesFound += result.matchesFound;
 				matchesLinked += result.linked;
 				matchesInserted += result.inserted;
+				matchesStatusSet += result.statusSet;
 				matchesSkippedEmpty += result.skippedEmpty;
 				if (result.matchLog) lastMatchLog = result.matchLog;
 
@@ -263,6 +274,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesLinked,
 				matchesUnlinked: matchesFound - matchesLinked,
 				matchRowsInserted: matchesInserted,
+				workItemsMarkedDeleted: matchesStatusSet,
 				matchesSkippedEmpty,
 				dryRun: dryRun ? 1 : 0,
 			};
@@ -331,8 +343,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesFound: 0,
 				linked: 0,
 				inserted: 0,
+				statusSet: 0,
 				skippedEmpty: 0,
 				matchLog: "",
+				matchLogKey: "",
 				done,
 				// Still advance, or a run of key-less rows would be rescanned forever.
 				cursorType: last?.type ?? cursor.type,
@@ -385,17 +399,53 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 		let linked = 0;
 		let inserted = 0;
+		let statusSet = 0;
 		let skippedEmpty = 0;
 		let matchLog = "";
+		let matchLogKey = "";
 
 		if (matchRows.length > 0) {
-			if (!opts.dryRun) {
+			// ④ Supabase first, and it has to land completely. "Recorded" is both
+			// halves — a row in ca_drop_work_item_match AND status = 'deleted' on
+			// the work item — because either one missing leaves the match
+			// unreportable to DROP.
+			let outcome: MatchOutcome = { ok: true };
+
+			if (opts.dryRun) {
+				outcome = { ok: false, reason: "dryRun — nothing was written" };
+			} else {
 				const written = await recordMatches(this.env, matchRows);
 				linked = written.linked;
 				inserted = written.inserted;
+				statusSet = written.statusSet;
 				skippedEmpty = written.skippedEmpty;
+
+				const reason = incompleteReason(written);
+				if (reason) outcome = { ok: false, reason };
 			}
-			matchLog = await logMatches(this.env, ctx, batch, alerts);
+
+			// The alert goes out either way, and its level says which happened:
+			// warn for a match that was recorded, error for one that was not.
+			matchLog = await logMatches(this.env, ctx, batch, alerts, outcome);
+
+			if (!outcome.ok && !opts.dryRun) {
+				// No R2 log. A file in the audit trail asserting a match was
+				// handled, when the database has no record of it, is worse than
+				// no file — so the run fails here instead and the batch is
+				// retried from the cursor it has not yet moved.
+				throw new Error(
+					`batch ${batch}: found ${matchRows.length} DROP match(es) but did not record them — ${outcome.reason}`,
+				);
+			}
+
+			// ⑤ Only now, with the matches durable, the evidence file.
+			if (!opts.dryRun) {
+				matchLogKey = await writeMatchLog(this.env, {
+					run_id: ctx.run_id,
+					batch,
+					text: renderMatchLog(ctx, batch, alerts, new Date(), outcome),
+				});
+			}
 		}
 
 		return {
@@ -405,8 +455,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			matchesFound: matchRows.length,
 			linked,
 			inserted,
+			statusSet,
 			skippedEmpty,
 			matchLog,
+			matchLogKey,
 			done: false,
 			cursorType: last.type,
 			cursorValue: last.normalized_value,
