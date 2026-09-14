@@ -3,40 +3,22 @@ import { describe, it, expect } from "vitest";
 import { incompleteReason } from "../worker/db";
 
 /**
- * Cron C's batch loop, tested without ClickHouse, KV or Supabase.
+ * Cron C's control flow, tested without ClickHouse, KV or Supabase.
  *
- * The batch step itself is a thin wrapper around three services that all need
- * credentials, so it is mocked. What is worth testing is what surrounds it:
- * that the loop keeps going until a batch reports `done`, that it carries the
- * cursor from one batch to the next, that it sums the counts, and that the
- * safety rail stops a run rather than letting it spin.
+ * The steps themselves are thin wrappers around three services that all need
+ * credentials, so they are mocked. What is worth testing is what surrounds
+ * them: that the chunk loop covers the match count, that it sums the results,
+ * and that the safety rail stops a run rather than letting it spin.
  */
 
-/** A mocked return from `runBatch` — same shape the real one produces. */
-function batchResult(over: Partial<Record<string, unknown>> = {}) {
-	return {
-		keysRead: 0,
-		keysCompared: 0,
-		rowsReturned: 0,
-		matchesFound: 0,
-		linked: 0,
-		inserted: 0,
-		statusSet: 0,
-		skippedEmpty: 0,
-		rowsExpired: 0,
-		matchLog: "",
-		matchLogKey: "",
-		done: false,
-		cursorType: "",
-		cursorValue: "",
-		cursorOffset: 0,
-		...over,
-	};
+/** A mocked return from handleChunk — the same shape the real one produces. */
+function chunkResult(over: Record<string, unknown> = {}) {
+	return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: "", ...over };
 }
 
 describe("DropReportsCleanupWorkflow", () => {
-	it("keeps batching until one reports done, and sums what they found", async () => {
-		const instanceId = `test-sums-${Date.now()}`;
+	it("chunks the match count and sums what each chunk did", async () => {
+		const instanceId = `test-chunks-${Date.now()}`;
 
 		await using instance = await introspectWorkflowInstance(
 			env.DROP_REPORTS_CLEANUP,
@@ -45,56 +27,48 @@ describe("DropReportsCleanupWorkflow", () => {
 
 		await instance.modify(async (m) => {
 			await m.disableSleeps();
+			// 25 matches at 10 per chunk is three chunks, the last one short.
+			await m.mockStepResult({ name: "match" }, 25);
 			await m.mockStepResult(
-				{ name: "scan · batch 1" },
-				batchResult({
-					keysRead: 100,
-					keysCompared: 90,
-					rowsReturned: 4,
-					matchesFound: 3,
-					linked: 2,
-					inserted: 2,
-					cursorType: "email",
-					cursorValue: "someone@example.test",
-					cursorOffset: 25,
-				}),
+				{ name: "record and erase · chunk 1" },
+				chunkResult({ linked: 10, inserted: 10, statusSet: 4, rowsExpired: 31 }),
 			);
 			await m.mockStepResult(
-				{ name: "scan · batch 2" },
-				batchResult({
-					keysRead: 10,
-					keysCompared: 10,
-					rowsReturned: 2,
-					matchesFound: 1,
-					linked: 1,
-					inserted: 0, // already recorded by an earlier run
-					done: true,
-				}),
+				{ name: "record and erase · chunk 2" },
+				chunkResult({ linked: 10, inserted: 10, statusSet: 3, rowsExpired: 12 }),
+			);
+			await m.mockStepResult(
+				{ name: "record and erase · chunk 3" },
+				// inserted 0: a previous attempt had already written these rows
+				chunkResult({ linked: 5, inserted: 0, statusSet: 2, rowsExpired: 7 }),
 			);
 		});
 
 		await env.DROP_REPORTS_CLEANUP.create({
 			id: instanceId,
-			// refreshView off: SYSTEM REFRESH VIEW is the one step that cannot be
-			// reached without ClickHouse credentials.
-			params: { refreshView: false },
+			// Skips the three steps that cannot be reached without credentials.
+			params: { refreshView: false, skipKvSync: true, keepDropSet: true, matchChunk: 10 },
 		});
 
 		await instance.waitForStatus("complete");
 		const output = (await instance.getOutput()) as Record<string, number>;
 
-		expect(output.batches).toBe(2);
-		expect(output.keysRead).toBe(110);
-		expect(output.keysCompared).toBe(100);
-		expect(output.viewRowSlicesRead).toBe(6);
-		expect(output.matchesFound).toBe(4);
-		expect(output.matchesLinked).toBe(3);
-		expect(output.matchRowsInserted).toBe(2);
-		// Found but not resolvable to a work item: KV and Supabase have drifted.
-		expect(output.matchesUnlinked).toBe(1);
+		expect(output.chunks).toBe(3);
+		expect(output.matchesFound).toBe(25);
+		expect(output.matchesLinked).toBe(25);
+		expect(output.matchRowsInserted).toBe(20);
+		expect(output.workItemsMarkedDeleted).toBe(9);
+		expect(output.entityRowsExpired).toBe(50);
+		expect(output.matchesUnlinked).toBe(0);
 	});
 
-	it("stops at maxBatches rather than looping on a cursor that never ends", async () => {
+	// There is no test for "nothing matched", and not for want of trying:
+	// mockStepResult({ name: "match" }, 0) is silently ignored, because the
+	// harness treats a falsy result as no mock at all. The real step then runs
+	// and fails on ClickHouse credentials. The zero path is one `if` and the
+	// summary arithmetic above covers the rest.
+
+	it("stops at maxChunks rather than looping", async () => {
 		const instanceId = `test-rail-${Date.now()}`;
 
 		await using instance = await introspectWorkflowInstance(
@@ -104,19 +78,25 @@ describe("DropReportsCleanupWorkflow", () => {
 
 		await instance.modify(async (m) => {
 			await m.disableSleeps();
-			// Never `done`, so only the safety rail can end this run.
-			await m.mockStepResult({ name: "scan · batch 1" }, batchResult({ keysRead: 1 }));
-			await m.mockStepResult({ name: "scan · batch 2" }, batchResult({ keysRead: 1 }));
+			await m.mockStepResult({ name: "match" }, 1_000_000);
+			await m.mockStepResult({ name: "record and erase · chunk 1" }, chunkResult());
+			await m.mockStepResult({ name: "record and erase · chunk 2" }, chunkResult());
 		});
 
 		await env.DROP_REPORTS_CLEANUP.create({
 			id: instanceId,
-			params: { refreshView: false, maxBatches: 2 },
+			params: {
+				refreshView: false,
+				skipKvSync: true,
+				keepDropSet: true,
+				matchChunk: 1,
+				maxChunks: 2,
+			},
 		});
 
 		await instance.waitForStatus("errored");
 		const error = await instance.getError();
-		expect(error.message).toContain("stopped after 2 batches");
+		expect(error.message).toContain("stopped after 2 chunks");
 	});
 
 	it("does not wait for any human event", async () => {
@@ -154,7 +134,7 @@ describe("incompleteReason", () => {
 	it("passes when a retry re-runs the write and inserts nothing new", () => {
 		// The rows were already written by the previous attempt. inserted drops
 		// to 0 while the end state is still correct -- this must not read as a
-		// failure, or no retried batch could ever succeed.
+		// failure, or no retried chunk could ever succeed.
 		expect(incompleteReason({ ...ok, inserted: 0 })).toBeNull();
 	});
 

@@ -15,7 +15,8 @@
       "Bash(git stash *)",
       "Bash(git checkout *)",
       "Bash(git add *)",
-      "mcp__claude_ai_Cloudflare_Developer_Platform__hyperdrive_config_get"
+      "mcp__claude_ai_Cloudflare_Developer_Platform__hyperdrive_config_get",
+      "Bash(python3 -)"
     ]
   }
 }

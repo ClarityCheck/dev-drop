@@ -7,11 +7,9 @@
 --
 -- Do not cherry-pick the REVOKE in section 1. It is written to run BEFORE
 -- the grants in section 2, and on its own it takes those grants away with
--- everything else. To clear the dangling grants without disturbing the live
--- ones, revoke them by name instead:
+-- everything else. To clear one grant without disturbing the live ones,
+-- revoke it by name instead, e.g.:
 --     REVOKE SELECT, INSERT ON default.ca_drop_match_run FROM drop_workflow_role;
---     REVOKE SELECT, INSERT, ALTER DELETE
---            ON default.ca_drop_work_items FROM drop_workflow_role;
 --
 -- No ON CLUSTER anywhere. Access entities in ClickHouse Cloud are stored
 -- replicated (system.users.storage = 'replicated'), so users, roles and
@@ -23,6 +21,7 @@
 --   SYSTEM REFRESH VIEW on that view                 step ①
 --   SELECT  system.view_refreshes                    waiting for step ①
 --   SELECT + ALTER DELETE on entity_search_results   the expire
+--   SELECT + INSERT + TRUNCATE on ca_drop_work_items  the DROP set, while matching
 -- =====================================================================
 
 
@@ -31,12 +30,14 @@
 -- ---------------------------------------------------------------------
 CREATE ROLE IF NOT EXISTS drop_workflow_role;
 
--- Start from nothing. This is what clears the grants left behind by
--- ca_drop_work_items and ca_drop_match_run: dropping those tables did NOT
--- remove their privileges, because ClickHouse records privileges against the
--- NAME rather than the object. They are still in system.grants today,
--- pointing at nothing — and would silently apply again to any future table
--- that reuses either name.
+-- Start from nothing, then grant only what section 2 lists.
+--
+-- This also clears any grant left behind by a dropped table. ClickHouse
+-- records privileges against the NAME rather than the object, so dropping a
+-- table leaves its grants in system.grants pointing at nothing — and they
+-- apply again, silently, to any future table that reuses the name.
+-- ca_drop_match_run is the one to watch: it is gone for good, and matches now
+-- come back in the query result rather than landing in a table.
 REVOKE ALL ON *.* FROM drop_workflow_role;
 
 
@@ -60,6 +61,42 @@ GRANT SYSTEM VIEWS ON default.ca_drop_combined_search_result TO drop_workflow_ro
 --     Code: 497. drop_workflow: Not enough privileges. To execute this
 --     query, it's necessary to have the grant SELECT ON system.view_refreshes
 GRANT SELECT ON system.view_refreshes TO drop_workflow_role;
+
+
+-- ---------------------------------------------------------------------
+-- The helper table, and the reason it exists.
+--
+-- The match is a join between the DROP hash set and the candidate keys,
+-- and the only question is which side travels. The DROP set is the small
+-- one; the candidate keys are 2.5M in dev and far more in production.
+-- ClickHouse cannot join against KV, so the small side is copied in here
+-- and the join happens next to the data.
+--
+-- The measured difference is not marginal. Comparing the keys one at a
+-- time from the Worker takes about five hours and exceeds the Worker CPU
+-- limit; the same join inside ClickHouse returns in 0.33 seconds.
+--
+-- It is a working copy, not a store. Truncated at the start of every run
+-- and again at the end, so the DROP hashes are resident only while a run
+-- is using them. KV remains the source of truth.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS default.ca_drop_work_items
+(
+    list_type    LowCardinality(String),
+    hash         String,                       -- Base64, exactly as DROP published it
+    work_item_id String,                       -- DROP's Id, case-sensitive
+    request_date Nullable(Date),
+    loaded_at    DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(loaded_at)
+ORDER BY (list_type, hash);
+-- ReplacingMergeTree because a retried sync page re-inserts rows it already
+-- wrote. Dedup is not immediate, so the match query also groups by
+-- (list_type, hash) rather than relying on a merge having happened.
+
+-- TRUNCATE is what lets the workflow clear the table itself, at the start of
+-- a run and again when it finishes.
+GRANT SELECT, INSERT, TRUNCATE ON default.ca_drop_work_items TO drop_workflow_role;
 
 -- The expire. Cron C now erases the matched records themselves, which is what
 -- makes status = 'deleted' a true statement rather than a claim.
@@ -142,11 +179,14 @@ ALTER USER drop_workflow SETTINGS
 -- 5. Verify — run as admin
 -- =====================================================================
 
--- Expect EXACTLY these five rows. Anything naming ca_drop_work_items or
--- ca_drop_match_run means the REVOKE in section 1 did not run.
+-- Expect EXACTLY these eight rows. Anything naming ca_drop_match_run means
+-- the REVOKE in section 1 did not run — that table is not coming back.
 --
 --   SELECT        default   ca_drop_combined_search_result
 --   SYSTEM VIEWS  default   ca_drop_combined_search_result
+--   SELECT        default   ca_drop_work_items
+--   INSERT        default   ca_drop_work_items
+--   TRUNCATE      default   ca_drop_work_items
 --   SELECT        default   entity_search_results
 --   ALTER DELETE  default   entity_search_results
 --   SELECT        system    view_refreshes

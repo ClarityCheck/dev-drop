@@ -1,7 +1,7 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { chQuery, deleteEntityRows } from "./ch";
+import { chInsert, chQuery, deleteEntityRows } from "./ch";
 import type { EntityKey } from "./ch";
 import { incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
@@ -10,119 +10,120 @@ import type { MatchAlert, MatchOutcome } from "./logs";
 import { writeMatchLog } from "./audit";
 
 /**
- * Cron C — ClickHouse check  (workflow: drop-reports-cleanup)
+ * Cron C — match and erase  (workflow: drop-reports-cleanup)
  *
  *   ① rebuild ca_drop_combined_search_result and wait for it to settle
- *   ② pull candidate keys out of the view, one batch at a time
- *   ③ for every key in the batch, kv.get the hash against the DROP set
- *   ④ on a match: the rows in public.ca_drop_work_item_match
- *   ⑤ the Better Stack alert
- *   ⑥ erase the matched records from default.entity_search_results
- *   ⑦ status 'deleted' on the work item — only once ⑥ has actually erased them
- *   ⑧ the R2 evidence file
- *   ⑨ summary
+ *   ② clear default.ca_drop_work_items
+ *   ③ copy the DROP hash set from KV into it, one page per step
+ *   ④ match, in SQL, inside ClickHouse
+ *   ⑤ per chunk of matches:
+ *        the rows in public.ca_drop_work_item_match
+ *        the Better Stack alert
+ *        erase the matched records from default.entity_search_results
+ *        status 'deleted' on the work item — only once the erase is verified
+ *        the R2 evidence file
+ *   ⑥ clear ca_drop_work_items again
+ *   ⑦ summary
  *
- * The order of ④ to ⑦ is the whole point and is not interchangeable. The match
- * row comes first, because the expire destroys the only other evidence the
- * consumer was ever there. The alert comes before the expire, so a failure
- * afterwards still leaves both a record and a warning that someone on the
- * delete list was found. The status comes last, because Cron B reports it to
- * California as code 3 Deleted: written before the records are gone it is a
- * false statement to a regulator; written after, it is simply true.
- *
- * Steps ②–④ are one Workflow step per batch, deliberately. The batch is the
- * unit of progress: the cursor advances only when the keys have been compared
- * AND the matches are in Supabase, so a step that dies anywhere in the middle
- * replays that batch and nothing else. Re-running a batch is harmless — the
- * KV reads have no side effects and the insert is idempotent.
- *
- * Nothing is mirrored into ClickHouse and no run table is written. The only
- * record a run leaves behind is public.ca_drop_work_item_match, which is also
- * the one place the link from a DROP work_item_id to the matched identifier
- * survives.
+ * The order inside ⑤ is the design, not an implementation detail. The match
+ * row is written first because the erase destroys the only other evidence the
+ * consumer was ever in the data. The alert comes before the erase, so a
+ * failure afterwards still leaves a record and a warning. The status comes
+ * last, because Cron B reports it to California as code 3 Deleted: written
+ * before the records are gone it is a false statement to a regulator; written
+ * after, it is simply true.
  *
  * ---------------------------------------------------------------------------
- * SIZING — read this before raising anything.
+ * WHY THE MATCH IS IN SQL
  *
- * One kv.get per candidate key means one subrequest per candidate key, and
- * the view holds far more keys than rows: ndz_keys is the cross product of
- * first names x last names x dates of birth x ZIPs for an identifier, so a
- * single row can carry over a million keys. In dev today: 1,965 rows and
- * 2,505,630 keys, 98% of them from three rows that are junk e-mail addresses
- * seen alongside hundreds of different people.
+ * A previous build read every candidate key out of ClickHouse and did one
+ * kv.get per key. The shape of the data makes that hopeless: ndz_keys is the
+ * cross product of first names x last names x dates of birth x ZIPs, so dev's
+ * 1,965 view rows carry 2,505,630 keys and one row alone carries 1,209,008.
+ * One subrequest per key meant 2.5M subrequests, roughly five hours, and
+ * enough CPU per batch to exceed the Worker limit and have the isolate killed
+ * mid-write — which is what CONNECTION_CLOSED to hyperdrive.local was.
  *
- * That is why batching is by KEY and not by row — a row-at-a-time loop would
- * try to pull 1.2M keys into one step — and why wrangler.jsonc has to raise
- * limits.subrequests well above its 10,000 default. The ceiling is 10 million
- * per Workflow instance, which dev fits inside and production will not.
+ * The same match as a join inside ClickHouse returns in 0.33 seconds.
+ *
+ * The only difference is which side travels. The DROP set is small and the
+ * candidate keys are many, so the small side is copied into ClickHouse and
+ * the join happens next to the data. ca_drop_work_items is a working copy
+ * that exists only for the duration of a run — KV stays the source of truth,
+ * and still serves the real-time gate in the fetch handler, where one
+ * kv.get per request is exactly the right shape.
  * ---------------------------------------------------------------------------
  */
 
-/** Where the walk over the view's key stream has got to. */
-type Cursor = {
-	/** view's `type` — '' before the first batch */
-	type: string;
-	/** view's `normalized_value` */
-	value: string;
-	/** keys already consumed from that row */
-	offset: number;
+const LISTS = ["email", "phone", "ndz", "namevin"] as const;
+type ListType = (typeof LISTS)[number];
+
+const KEY_COLUMN: Record<ListType, string> = {
+	email: "email_keys",
+	phone: "phone_keys",
+	ndz: "ndz_keys",
+	namevin: "namevin_keys",
 };
 
 type Params = {
 	/** run SYSTEM REFRESH VIEW first — needs the SYSTEM VIEWS privilege */
 	refreshView?: boolean;
-	/** candidate keys compared per step. Also the KV subrequests per step. */
-	batchSize?: number;
-	/** view rows a batch query may examine. See the note on sizing below. */
-	rowScan?: number;
-	/** safety rail on the batch loop */
-	maxBatches?: number;
-	/** KV reads in flight at once */
-	kvConcurrency?: number;
-	/** compare and log, but write nothing to Supabase */
+	/** KV keys listed and inserted per sync step */
+	kvPageSize?: number;
+	/** safety rail on the sync loop */
+	maxKvPages?: number;
+	/** match against whatever is already in ca_drop_work_items */
+	skipKvSync?: boolean;
+	/** matches handled per step. Each chunk is one ClickHouse mutation. */
+	matchChunk?: number;
+	/** safety rail on the match loop */
+	maxChunks?: number;
+	/** leave the DROP set in ClickHouse after the run, for inspection */
+	keepDropSet?: boolean;
+	/** find and report, but write nothing and erase nothing */
 	dryRun?: boolean;
 };
 
 /** The KV metadata Cron A writes alongside each hash. */
 type KvMeta = { work_item_id?: string; list_type?: string; request_date?: string };
 
-/**
- * One row of a batch query: a slice of one view row's key stream.
- *
- * total_keys and base are Int64 in ClickHouse and arrive as strings, because
- * JSONEachRow quotes 64-bit integers by default so they survive a round trip
- * through a JSON number. Hence the Number() at every use.
- */
-type BatchRow = {
+/** One row of the match result. */
+type MatchResult = {
+	list_type: string;
+	work_item_id: string;
 	type: string;
 	normalized_value: string;
-	total_keys: string;
-	base: string;
-	/** [list_type, hash] pairs — ClickHouse tuples arrive as arrays */
-	keys: [string, string][];
+	hash: string;
 };
 
 export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
 		const runId = event.instanceId;
 		const refreshView = event.payload?.refreshView ?? true;
-		const batchSize = Math.max(1, event.payload?.batchSize ?? 25_000);
-		// At least two, always. A batch query that can only ever see the cursor
-		// row has no way to step past it once its keys are spent, so rowScan = 1
-		// walks the first row and then loops on it until maxBatches trips.
-		const rowScan = Math.max(2, event.payload?.rowScan ?? 200);
-		const maxBatches = event.payload?.maxBatches ?? 2_000;
-		const kvConcurrency = event.payload?.kvConcurrency ?? 6;
+		const kvPageSize = Math.min(1000, Math.max(1, event.payload?.kvPageSize ?? 1000));
+		const maxKvPages = event.payload?.maxKvPages ?? 20_000;
+		const skipKvSync = event.payload?.skipKvSync ?? false;
+		const matchChunk = Math.max(1, event.payload?.matchChunk ?? 5_000);
+		const maxChunks = event.payload?.maxChunks ?? 2_000;
+		const keepDropSet = event.payload?.keepDropSet ?? false;
 		const dryRun = event.payload?.dryRun ?? false;
 
-		// Every step below reports started / completed / failed to Better Stack.
 		const ctx = { workflow: "drop-reports-cleanup", run_id: runId };
 		const tracedStep = tracer(this.env, step, ctx);
 		const runStartedAt = Date.now();
 		await logRun(this.env, ctx, "started");
 
-		// Progress for the UI. Outside step.do, so it may repeat — updateStep is
-		// idempotent, which is why that is safe.
+		// Declared out here so the run-level failure log can say where it got to.
+		let dropSetRows = 0;
+		let kvKeysWithoutMeta = 0;
+		let totalMatches = 0;
+		let chunk = 0;
+		let matchesLinked = 0;
+		let matchRowsInserted = 0;
+		let workItemsMarked = 0;
+		let entityRowsExpired = 0;
+		let lastMatchLog = "";
+
 		const notifyStep = async (
 			stepName: string,
 			status: "running" | "completed" | "waiting",
@@ -132,47 +133,27 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				const stub = this.env.WORKFLOW_STATUS.get(doId);
 				await stub.updateStep(stepName, status);
 			} catch {
-				// Silently fail — progress reporting must never break the run.
+				// Progress reporting must never break the run.
 			}
 		};
 
-		// Declared out here so the run-level failure log can say which batch was
-		// in flight and how far the run had got. Inside the try they would be
-		// out of scope exactly when something has gone wrong.
-		let cursor: Cursor = { type: "", value: "", offset: 0 };
-		let batch = 0;
-		let keysRead = 0;
-		let keysCompared = 0;
-		let rowsSeen = 0;
-		let matchesFound = 0;
-		let matchesLinked = 0;
-		let matchesInserted = 0;
-		let matchesStatusSet = 0;
-		let rowsExpired = 0;
-		let matchesSkippedEmpty = 0;
-		let lastMatchLog = "";
-
 		try {
 			// ---------------------------------------------------------------
-			// ① rebuild the view, so the scan sees current data
+			// ① rebuild the view, so the match sees current data
 			// ---------------------------------------------------------------
 			if (refreshView) {
 				await notifyStep("refresh view", "running");
 
 				// The timestamp of the last successful refresh, read BEFORE asking
 				// for a new one. Waiting on `status` alone does not work: the view
-				// is declared REFRESH EVERY 1 YEAR, so 'Scheduled' is its resting
-				// state as well as its finished state, and SYSTEM REFRESH VIEW
-				// returns the moment the refresh is queued. A poll that lands in
-				// the gap before the status turns 'Running' sees 'Scheduled', calls
-				// it done, and the whole scan then runs against last year's data —
-				// silently, and looking entirely healthy. Success is this number
-				// moving, not the status.
+				// is REFRESH EVERY 1 YEAR, so 'Scheduled' is its resting state as
+				// well as its finished state, and SYSTEM REFRESH VIEW returns the
+				// moment the refresh is queued. A poll landing in the gap before
+				// the status turns 'Running' sees 'Scheduled', calls it done, and
+				// the match then runs against last year's data — silently, and
+				// looking entirely healthy. Success is this number moving.
 				const refreshedAfter = await tracedStep(
 					"refresh combined view",
-					// A few attempts, so a dropped connection to ClickHouse does
-					// not end the run before it starts. A missing privilege still
-					// surfaces inside half a minute.
 					{ retries: { limit: 2, delay: "10 seconds", backoff: "constant" } },
 					async () => {
 						const [before] = await chQuery<{ last_success: string }>(
@@ -181,9 +162,6 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 							 FROM system.view_refreshes
 							 WHERE view = 'ca_drop_combined_search_result'`,
 						);
-						// No row here is a permissions or naming problem, not a slow
-						// refresh. Caught now it names itself; left to the poll below it
-						// spends 15 minutes retrying before saying anything.
 						if (!before) {
 							throw new Error(
 								"system.view_refreshes has no row for ca_drop_combined_search_result — " +
@@ -213,18 +191,13 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 							 FROM system.view_refreshes
 							 WHERE view = 'ca_drop_combined_search_result'`,
 						);
-						// These two are real faults — the view vanished, or the
-						// refresh itself threw. Neither improves by waiting, but
-						// the retry policy cannot be selective, so they burn the
-						// remaining attempts before the run gives up. They are at
-						// least logged as errors from the first attempt on.
+						// Real faults, reported from the first attempt.
 						if (!r) throw new Error("view_refreshes has no row for the view");
 						if (r.exception) throw new Error(`refresh failed: ${r.exception}`);
 
-						// These two are the poll doing its job. Throwing is how a
-						// step asks Workflows for another attempt, so on a healthy
-						// run this happens several times before the refresh lands;
-						// Pending keeps those out of the error stream.
+						// The poll doing its job. Throwing is how a step asks for
+						// another attempt, so this happens several times on a
+						// healthy run; Pending keeps it out of the error stream.
 						const lastSuccess = Number(r.last_success);
 						if (lastSuccess <= refreshedAfter) {
 							throw new Pending(`refresh not finished yet (status ${r.status})`);
@@ -237,72 +210,158 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			}
 
 			// ---------------------------------------------------------------
-			// ②③④ walk the view's keys, compare each against KV, record matches
+			// ②③ the DROP set into ClickHouse, so the join has both sides
 			// ---------------------------------------------------------------
-			await notifyStep("scan", "running");
+			if (!skipKvSync) {
+				await notifyStep("sync DROP set", "running");
 
+				await tracedStep("clear DROP set", async () => {
+					await chQuery(this.env, "TRUNCATE TABLE default.ca_drop_work_items");
+				});
 
-			for (;;) {
-				batch += 1;
-				if (batch > maxBatches) {
-					throw new Error(
-						`scan: stopped after ${maxBatches} batches with the view not exhausted — ` +
-							`raise maxBatches or batchSize deliberately`,
-					);
+				// One pass over the namespace. The key IS the hash, Base64 exactly
+				// as DROP published it and with no prefix; what list it belongs to
+				// lives in the metadata Cron A wrote, and kv.list returns metadata,
+				// so this needs no kv.get at all — 1,000 keys per subrequest.
+				let cursor: string | undefined;
+				let page = 0;
+
+				for (;;) {
+					page += 1;
+					if (page > maxKvPages) {
+						throw new Error(
+							`sync: stopped after ${maxKvPages} pages — raise maxKvPages deliberately`,
+						);
+					}
+
+					const result: { cursor?: string; inserted: number; ignored: number } =
+						await tracedStep(`sync DROP set · page ${page}`, async () => {
+							const listed = await this.env.kv.list<KvMeta>({
+								limit: kvPageSize,
+								cursor,
+							});
+
+							const rows: Record<string, string>[] = [];
+							for (const k of listed.keys) {
+								const meta = k.metadata;
+								// Without a list_type there is nothing to match against,
+								// so the key is counted and left alone rather than guessed.
+								if (!meta?.list_type || !meta.work_item_id) continue;
+								const row: Record<string, string> = {
+									list_type: meta.list_type,
+									hash: k.name,
+									work_item_id: meta.work_item_id,
+								};
+								if (meta.request_date) row.request_date = meta.request_date;
+								rows.push(row);
+							}
+
+							if (rows.length > 0) {
+								await chInsert(this.env, "default.ca_drop_work_items", rows);
+							}
+
+							return {
+								cursor: listed.list_complete ? undefined : listed.cursor,
+								inserted: rows.length,
+								ignored: listed.keys.length - rows.length,
+							};
+						});
+
+					dropSetRows += result.inserted;
+					kvKeysWithoutMeta += result.ignored;
+					cursor = result.cursor;
+					if (!cursor) break;
 				}
 
-				const result = await tracedStep(
-					`scan · batch ${batch}`,
-					{
-						timeout: "30 minutes",
-						// limit is RETRIES, not attempts: `attempt` is 1-indexed and
-						// is 2 on the first retry. So 4 here is 5 attempts in all.
-						// Each one re-reads the batch from ClickHouse and re-does
-						// its KV lookups, which is what covers a transient
-						// ClickHouse 5xx, a dropped socket or a Hyperdrive blip.
-						retries: { limit: 4, delay: "30 seconds", backoff: "linear" },
-					},
-					async () => this.runBatch(ctx, batch, cursor, {
-						batchSize,
-						rowScan,
-						kvConcurrency,
-						dryRun,
-					}),
-				);
-
-				keysRead += result.keysRead;
-				keysCompared += result.keysCompared;
-				rowsSeen += result.rowsReturned;
-				matchesFound += result.matchesFound;
-				matchesLinked += result.linked;
-				matchesInserted += result.inserted;
-				matchesStatusSet += result.statusSet;
-				rowsExpired += result.rowsExpired;
-				matchesSkippedEmpty += result.skippedEmpty;
-				if (result.matchLog) lastMatchLog = result.matchLog;
-
-				if (result.done) break;
-				cursor = { type: result.cursorType, value: result.cursorValue, offset: result.cursorOffset };
+				await notifyStep("sync DROP set", "completed");
 			}
 
-			await notifyStep("scan", "completed");
+			// ---------------------------------------------------------------
+			// ④ the match — one query, entirely inside ClickHouse
+			// ---------------------------------------------------------------
+			await notifyStep("match", "running");
+			totalMatches = await tracedStep(
+				"match",
+				{ timeout: "30 minutes", retries: { limit: 4, delay: "30 seconds", backoff: "linear" } },
+				async () => {
+					const [r] = await chQuery<{ n: string }>(
+						this.env,
+						`SELECT count() AS n FROM (${MATCH_SQL})`,
+					);
+					return Number(r?.n ?? 0);
+				},
+			);
+			await notifyStep("match", "completed");
 
 			// ---------------------------------------------------------------
-			// ⑤ summary
+			// ⑤ act on them, a chunk at a time
+			//
+			// Paging with LIMIT/OFFSET over the match stays stable even while the
+			// erase is running: the match reads the materialized view, and
+			// deleting from entity_search_results does not change the view until
+			// it is refreshed again.
+			// ---------------------------------------------------------------
+			if (totalMatches > 0) {
+				await notifyStep("record and erase", "running");
+
+				for (let offset = 0; offset < totalMatches; offset += matchChunk) {
+					chunk += 1;
+					if (chunk > maxChunks) {
+						throw new Error(
+							`stopped after ${maxChunks} chunks — raise maxChunks or matchChunk deliberately`,
+						);
+					}
+
+					const result = await tracedStep(
+						`record and erase · chunk ${chunk}`,
+						{
+							timeout: "30 minutes",
+							retries: { limit: 4, delay: "30 seconds", backoff: "linear" },
+						},
+						async () => this.handleChunk(ctx, chunk, offset, matchChunk, dryRun),
+					);
+
+					matchesLinked += result.linked;
+					matchRowsInserted += result.inserted;
+					workItemsMarked += result.statusSet;
+					entityRowsExpired += result.rowsExpired;
+					if (result.matchLog) lastMatchLog = result.matchLog;
+				}
+
+				await notifyStep("record and erase", "completed");
+			}
+
+			// ---------------------------------------------------------------
+			// ⑥ put the DROP set away again. It is a working copy, and there is
+			//    no reason for consumer hashes to sit in ClickHouse between runs.
+			// ---------------------------------------------------------------
+			if (!keepDropSet && !dryRun) {
+				await tracedStep("clear DROP set · after run", async () => {
+					await chQuery(this.env, "TRUNCATE TABLE default.ca_drop_work_items");
+					const [r] = await chQuery<{ n: string }>(
+						this.env,
+						"SELECT count() AS n FROM default.ca_drop_work_items",
+					);
+					const left = Number(r?.n ?? 0);
+					if (left > 0) throw new Error(`${left} row(s) left in ca_drop_work_items`);
+					return left;
+				});
+			}
+
+			// ---------------------------------------------------------------
+			// ⑦ summary
 			// ---------------------------------------------------------------
 			const summary = {
 				runId,
-				batches: batch,
-				viewRowSlicesRead: rowsSeen,
-				keysRead,
-				keysCompared,
-				matchesFound,
+				dropSetRows,
+				kvKeysWithoutMeta,
+				matchesFound: totalMatches,
 				matchesLinked,
-				matchesUnlinked: matchesFound - matchesLinked,
-				matchRowsInserted: matchesInserted,
-				workItemsMarkedDeleted: matchesStatusSet,
-				entityRowsExpired: rowsExpired,
-				matchesSkippedEmpty,
+				matchesUnlinked: totalMatches - matchesLinked,
+				matchRowsInserted,
+				workItemsMarkedDeleted: workItemsMarked,
+				entityRowsExpired,
+				chunks: chunk,
 				dryRun: dryRun ? 1 : 0,
 			};
 
@@ -314,24 +373,20 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			});
 			return summary;
 		} catch (e) {
-			// The tracer logged the individual attempt that threw. This says the
-			// run as a whole is over and where it stopped, which a step-level
-			// log cannot — a batch that exhausted its retries otherwise leaves
-			// five identical step failures and nothing tying them together.
+			// The tracer logged the attempt that threw. This says the run as a
+			// whole is over and how far it got, which a step-level log cannot.
 			await logRun(this.env, ctx, "failed", {
 				error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
 				duration_ms: Date.now() - runStartedAt,
-				failedAtBatch: batch,
+				failedAtBatch: chunk,
 				result: {
-					batches: batch,
-					keysRead,
-					keysCompared,
-					matchesFound,
+					dropSetRows,
+					matchesFound: totalMatches,
+					chunks: chunk,
 					matchesLinked,
-					matchRowsInserted: matchesInserted,
-					workItemsMarkedDeleted: matchesStatusSet,
-				entityRowsExpired: rowsExpired,
-					matchesSkippedEmpty,
+					matchRowsInserted,
+					workItemsMarkedDeleted: workItemsMarked,
+					entityRowsExpired,
 				},
 			});
 			throw e;
@@ -339,318 +394,144 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 	}
 
 	/**
-	 * One batch: read up to `batchSize` candidate keys from the view starting
-	 * at the cursor, ask KV about each of them, and record whatever matched.
+	 * One chunk of matches: record, announce, erase, mark, log — in that order.
 	 *
-	 * Everything it returns is a count or a cursor. Step return values are
-	 * persisted and size-capped, so keys and identifiers never travel between
-	 * steps — the next batch re-reads from ClickHouse using the cursor.
+	 * Everything it returns is a count. Step return values are persisted and
+	 * size-capped, so identifiers never travel between steps; the next chunk
+	 * re-runs the match query at its own offset, which costs a fraction of a
+	 * second because the join is the thing ClickHouse is good at.
 	 */
-	private async runBatch(
+	private async handleChunk(
 		ctx: { workflow: string; run_id: string },
-		batch: number,
-		cursor: Cursor,
-		opts: { batchSize: number; rowScan: number; kvConcurrency: number; dryRun: boolean },
+		chunk: number,
+		offset: number,
+		limit: number,
+		dryRun: boolean,
 	) {
-		const rows = await chQuery<BatchRow>(this.env, BATCH_SQL, {
-			cur_type: cursor.type,
-			cur_value: cursor.value,
-			cur_offset: cursor.offset,
-			budget: opts.batchSize,
-			row_scan: opts.rowScan,
-		});
+		const matches = await chQuery<MatchResult>(
+			this.env,
+			`${MATCH_SQL}
+			 ORDER BY list_type, work_item_id, type, normalized_value
+			 LIMIT {limit:UInt64} OFFSET {offset:UInt64}`,
+			{ limit, offset },
+		);
 
-		// Flatten to the keys this batch is responsible for, remembering which
-		// identifier each came from so a match can name it.
-		type Candidate = { type: string; listType: string; hash: string; normalizedValue: string };
-		const candidates: Candidate[] = [];
-		for (const r of rows) {
-			for (const [listType, hash] of r.keys) {
-				candidates.push({
-					type: r.type,
-					listType,
-					hash,
-					normalizedValue: r.normalized_value,
-				});
-			}
+		if (matches.length === 0) {
+			return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: "" };
 		}
 
-		const last = rows[rows.length - 1];
-		const emittedFromLast = last ? last.keys.length : 0;
+		const alerts: MatchAlert[] = matches.map((m) => ({
+			list_type: m.list_type,
+			work_item_id: m.work_item_id,
+			hash: m.hash,
+		}));
+		const matchRows: MatchRow[] = matches.map((m) => ({
+			list_type: m.list_type,
+			work_item_id: m.work_item_id,
+			matched_normalized_value: m.normalized_value,
+		}));
 
-		// Nothing left to emit and the scan reached the end of the view.
-		const done = candidates.length === 0 && rows.length < opts.rowScan;
-
-		if (candidates.length === 0) {
-			return {
-				keysRead: 0,
-				keysCompared: 0,
-				rowsReturned: rows.length,
-				matchesFound: 0,
-				linked: 0,
-				inserted: 0,
-				statusSet: 0,
-				skippedEmpty: 0,
-				rowsExpired: 0,
-				matchLog: "",
-				matchLogKey: "",
-				done,
-				// Still advance, or a run of key-less rows would be rescanned forever.
-				cursorType: last?.type ?? cursor.type,
-				cursorValue: last?.normalized_value ?? cursor.value,
-				cursorOffset: last ? Number(last.base) + emittedFromLast : cursor.offset,
-			};
-		}
-
-		// The same hash can be reached from several identifiers in one batch;
-		// asking KV once per distinct hash is the only free saving available
-		// here, and subrequests are this workflow's scarcest resource.
-		const byHash = new Map<string, Candidate[]>();
-		for (const c of candidates) {
-			const seen = byHash.get(c.hash);
-			if (seen) seen.push(c);
-			else byHash.set(c.hash, [c]);
-		}
-		const distinctHashes = [...byHash.keys()];
-
-		// ③ the comparison — one kv.get per distinct hash. The key IS the hash,
-		// Base64 exactly as DROP published it and with no prefix, so a hit is a
-		// hit with no parsing. What the hash belongs to rides in the metadata,
-		// which getWithMetadata returns in the same read.
-		const hits = await mapPool(distinctHashes, opts.kvConcurrency, async (hash) => {
-			const { value, metadata } = await this.env.kv.getWithMetadata<KvMeta>(hash);
-			if (value === null && !metadata) return null;
-			const workItemId = metadata?.work_item_id ?? value ?? "";
-			if (!workItemId) return null;
-			return { hash, workItemId, listType: metadata?.list_type ?? "" };
-		});
-
-		// ④ what matched
-		const alerts: MatchAlert[] = [];
-		const matchRows: MatchRow[] = [];
-		// The identifiers whose records have to go, deduped: several keys of
-		// one view row can match separately, and it is one row's worth of
-		// records either way.
+		// The identifiers whose records have to go. Deduped: one identifier can
+		// match more than one work item, and it is one row's worth of records
+		// either way.
 		const toExpire = new Map<string, EntityKey>();
-		for (const hit of hits) {
-			if (!hit) continue;
-			for (const c of byHash.get(hit.hash) ?? []) {
-				// KV's metadata is authoritative for the list: ca_drop_work_item is
-				// keyed on (list_type, work_item_id) as DROP published it, and the
-				// key column the hash came out of is only our own derivation.
-				const listType = hit.listType || c.listType;
-				alerts.push({ list_type: listType, work_item_id: hit.workItemId, hash: hit.hash });
-				matchRows.push({
-					list_type: listType,
-					work_item_id: hit.workItemId,
-					matched_normalized_value: c.normalizedValue,
-				});
-				toExpire.set(`${c.type}\u0000${c.normalizedValue}`, {
-					type: c.type,
-					normalized_value: c.normalizedValue,
-				});
-			}
+		for (const m of matches) {
+			toExpire.set(`${m.type}::${m.normalized_value}`, {
+				type: m.type,
+				normalized_value: m.normalized_value,
+			});
 		}
 
-		let linked = 0;
-		let inserted = 0;
-		let statusSet = 0;
-		let skippedEmpty = 0;
-		let rowsExpired = 0;
-		let matchLog = "";
-		let matchLogKey = "";
-
-		if (matchRows.length > 0) {
-			let outcome: MatchOutcome = { ok: true };
-
-			if (opts.dryRun) {
-				outcome = { ok: false, reason: "dryRun — nothing was written or erased" };
-				matchLog = await logMatches(this.env, ctx, batch, alerts, outcome);
-			} else {
-				// ④ the match rows first. They are the record that the consumer
-				// was found, and they have to exist before anything is erased —
-				// the expire destroys the only other evidence there was.
-				const written = await recordMatches(this.env, matchRows);
-				linked = written.linked;
-				inserted = written.inserted;
-				skippedEmpty = written.skippedEmpty;
-
-				const reason = incompleteReason(written);
-				if (reason) {
-					await logMatches(this.env, ctx, batch, alerts, { ok: false, reason });
-					throw new NonRetryableError(
-						`batch ${batch}: found ${matchRows.length} DROP match(es) but could not record them — ${reason}`,
-					);
-				}
-
-				// ⑤ announce it, before the data goes. If everything after this
-				// fails, there is still a durable match row and an alert saying
-				// a consumer on the delete list was found.
-				matchLog = await logMatches(this.env, ctx, batch, alerts, outcome);
-
-				// ⑥ erase the records themselves. ALTER TABLE ... DELETE with
-				// mutations_sync = 2, so this returns only once the rows are
-				// gone, and `after` is checked rather than trusted.
-				const expired = await deleteEntityRows(this.env, [...toExpire.values()]);
-				rowsExpired = expired.before - expired.after;
-				if (expired.after > 0) {
-					const why = `${expired.after} of ${expired.before} entity_search_results row(s) survived the delete`;
-					await logMatches(this.env, ctx, batch, alerts, { ok: false, reason: why });
-					throw new Error(`batch ${batch}: ${why}`);
-				}
-
-				// ⑦ only now is 'deleted' a true statement. Cron B reports this
-				// to California as code 3, so it must not be written while the
-				// data is still there.
-				statusSet = await markMatchesDeleted(this.env, written.workItemIds);
-				if (statusSet < written.workItems) {
-					const why =
-						`${written.workItems - statusSet} of ${written.workItems} work item(s) did not ` +
-						`end up with status = 'deleted' after the records were erased`;
-					await logMatches(this.env, ctx, batch, alerts, { ok: false, reason: why });
-					throw new Error(`batch ${batch}: ${why}`);
-				}
-
-				// ⑧ the evidence file, last, once every earlier step has held.
-				matchLogKey = await writeMatchLog(this.env, {
-					run_id: ctx.run_id,
-					batch,
-					text: renderMatchLog(ctx, batch, alerts, new Date(), outcome),
-				});
-			}
+		if (dryRun) {
+			const outcome: MatchOutcome = { ok: false, reason: "dryRun — nothing written or erased" };
+			const text = await logMatches(this.env, ctx, chunk, alerts, outcome);
+			return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: text };
 		}
+
+		// the match rows first — the erase destroys the only other evidence
+		const written = await recordMatches(this.env, matchRows);
+		const reason = incompleteReason(written);
+		if (reason) {
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason });
+			throw new NonRetryableError(
+				`chunk ${chunk}: found ${matchRows.length} DROP match(es) but could not record them — ${reason}`,
+			);
+		}
+
+		// announce it, before the data goes
+		const matchLog = await logMatches(this.env, ctx, chunk, alerts, { ok: true });
+
+		// erase, and verify rather than assume
+		const expired = await deleteEntityRows(this.env, [...toExpire.values()]);
+		if (expired.after > 0) {
+			const why = `${expired.after} of ${expired.before} entity_search_results row(s) survived the delete`;
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+			throw new Error(`chunk ${chunk}: ${why}`);
+		}
+
+		// only now is 'deleted' a true statement
+		const statusSet = await markMatchesDeleted(this.env, written.workItemIds);
+		if (statusSet < written.workItems) {
+			const why =
+				`${written.workItems - statusSet} of ${written.workItems} work item(s) did not end up ` +
+				`with status = 'deleted' after the records were erased`;
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+			throw new Error(`chunk ${chunk}: ${why}`);
+		}
+
+		await writeMatchLog(this.env, {
+			run_id: ctx.run_id,
+			batch: chunk,
+			text: renderMatchLog(ctx, chunk, alerts, new Date(), { ok: true }),
+		});
 
 		return {
-			keysRead: candidates.length,
-			keysCompared: distinctHashes.length,
-			rowsReturned: rows.length,
-			matchesFound: matchRows.length,
-			linked,
-			inserted,
+			linked: written.linked,
+			inserted: written.inserted,
 			statusSet,
-			skippedEmpty,
-			rowsExpired,
+			rowsExpired: expired.before - expired.after,
 			matchLog,
-			matchLogKey,
-			done: false,
-			cursorType: last.type,
-			cursorValue: last.normalized_value,
-			cursorOffset: Number(last.base) + emittedFromLast,
 		};
 	}
 }
 
 /**
- * Run `fn` over `items` with at most `limit` of them in flight.
+ * The match.
  *
- * A Worker invocation may only have six connections waiting on response
- * headers at once, so firing tens of thousands of kv.get calls with
- * Promise.all does not make them faster — it makes them queue, and it holds
- * every pending promise in memory while they do.
+ * Candidate keys are expanded with arrayJoin and streamed past the DROP set,
+ * which ClickHouse hashes into memory as the build side — the cheap direction,
+ * because the DROP set is small and the candidate side is millions of rows.
+ * Measured at 0.33 seconds over dev's 2,505,630 keys.
+ *
+ * The GROUP BY on the DROP side is not decoration. ca_drop_work_items is a
+ * ReplacingMergeTree and a retried sync page re-inserts rows it already wrote;
+ * dedup happens on merge, which may not have run yet, so the query collapses
+ * duplicates itself rather than trusting that it has.
+ *
+ * Joining on (list_type, hash) rather than hash alone keeps a key matched
+ * against the list it was derived for. A collision across lists is not a real
+ * risk with SHA-256 — this is about saying what is meant.
  */
-async function mapPool<T, R>(
-	items: T[],
-	limit: number,
-	fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-	const out = new Array<R>(items.length);
-	let next = 0;
-
-	const worker = async () => {
-		for (;;) {
-			const i = next++;
-			if (i >= items.length) return;
-			out[i] = await fn(items[i]);
-		}
-	};
-
-	await Promise.all(
-		Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker),
-	);
-	return out;
-}
-
-/**
- * One batch of candidate keys, starting at the cursor.
- *
- * The view is one row per identifier holding four arrays of keys, and those
- * arrays are wildly uneven — most rows carry a single key, a few carry over a
- * million. So the unit of work is the key, not the row: the arrays are
- * concatenated into one stream per row, the cursor addresses a position
- * inside that stream, and a running total cuts the batch off at `budget`
- * wherever that falls, mid-row if need be.
- *
- *   src   the next `row_scan` rows at or after the cursor row. ORDER BY
- *         matches the view's own ORDER BY (type, normalized_value), so this
- *         is an index seek and not a scan from the beginning.
- *   adj   drop the part of the cursor row a previous batch already consumed,
- *         and cap each row at `budget` — without that cap a single row's
- *         1.2M keys would be materialised in full just to take 25k of them.
- *   cum   a running key count in cursor order.
- *
- * The final WHERE keeps rows until the budget is used up — `running - n` is
- * the key count before this row, so a row is in if the budget had anything
- * left when the scan reached it. That one condition covers key-less rows
- * correctly too, and it has to be the only condition: an `OR n = 0` also
- * looks right, but it readmits key-less rows from PAST the cutoff, and since
- * the cursor follows the last row returned, the key-bearing rows in between
- * get jumped over and never compared against KV. A skipped key is a DROP
- * match that silently does not happen.
- *
- * Every value is a server-side parameter. normalized_value is arbitrary text
- * and the hashes are Base64 containing + / = — neither belongs in SQL built
- * by hand.
- */
-const BATCH_SQL = `
-WITH
-src AS (
-    SELECT
-        type,
-        normalized_value,
-        toInt64(length(email_keys) + length(phone_keys)
-              + length(ndz_keys)   + length(namevin_keys)) AS total_keys,
-        arrayConcat(
-            arrayMap(h -> ('email', h),   email_keys),
-            arrayMap(h -> ('phone', h),   phone_keys),
-            arrayMap(h -> ('ndz', h),     ndz_keys),
-            arrayMap(h -> ('namevin', h), namevin_keys)
-        ) AS all_keys
-    FROM default.ca_drop_combined_search_result
-    WHERE {cur_type:String} = ''
-       OR (type, normalized_value) >= ({cur_type:String}, {cur_value:String})
-    ORDER BY type, normalized_value
-    LIMIT {row_scan:UInt64}
-),
-adj AS (
-    SELECT
-        type,
-        normalized_value,
-        total_keys,
-        toInt64(if(type = {cur_type:String} AND normalized_value = {cur_value:String},
-                   {cur_offset:UInt64}, 0)) AS base,
-        arraySlice(
-            all_keys,
-            if(type = {cur_type:String} AND normalized_value = {cur_value:String},
-               toInt64({cur_offset:UInt64}) + 1, 1),
-            {budget:Int64}
-        ) AS keys
-    FROM src
-),
-cum AS (
-    SELECT
-        type, normalized_value, total_keys, base, keys,
-        toInt64(length(keys)) AS n,
-        toInt64(sum(length(keys)) OVER (ORDER BY type, normalized_value
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS running
-    FROM adj
-)
+const MATCH_SQL = `
 SELECT
-    type,
-    normalized_value,
-    total_keys,
-    base,
-    arraySlice(keys, 1, if(running <= {budget:Int64}, n, {budget:Int64} - (running - n))) AS keys
-FROM cum
-WHERE (running - n) < {budget:Int64}
-ORDER BY type, normalized_value
+    d.list_type        AS list_type,
+    d.work_item_id     AS work_item_id,
+    c.type             AS type,
+    c.normalized_value AS normalized_value,
+    c.hash             AS hash
+FROM
+(
+${LISTS.map(
+	(l) => `    SELECT '${l}' AS list_type, type, normalized_value, arrayJoin(${KEY_COLUMN[l]}) AS hash
+    FROM default.ca_drop_combined_search_result
+    WHERE notEmpty(${KEY_COLUMN[l]})`,
+).join("\n    UNION ALL\n")}
+) AS c
+INNER JOIN
+(
+    SELECT list_type, hash, argMax(work_item_id, loaded_at) AS work_item_id
+    FROM default.ca_drop_work_items
+    GROUP BY list_type, hash
+) AS d
+ON c.list_type = d.list_type AND c.hash = d.hash
 `;
