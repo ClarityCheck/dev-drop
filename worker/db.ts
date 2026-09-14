@@ -248,6 +248,15 @@ export type MatchWriteResult = {
  * the driver inferring an array type, which `fetch_types: false` leaves it
  * unable to do.
  *
+ * The cast is `::text::jsonb` and the extra hop is load-bearing. Written as
+ * `::jsonb`, Postgres describes the parameter as jsonb, and postgres.js then
+ * serializes it with its own jsonb encoder — JSON.stringify over a value that
+ * JSON.stringify already produced. The result is a JSON *string* rather than
+ * a JSON array, and jsonb_to_recordset rejects it with "cannot call
+ * jsonb_to_recordset on a non-array". Going through text pins the parameter
+ * to the type it actually is, so the driver ships the string verbatim and
+ * Postgres does the one parse.
+ *
  * Idempotent twice over, because a retried Workflow step re-runs it verbatim:
  * DISTINCT ON collapses duplicates inside the batch, ON CONFLICT DO NOTHING
  * absorbs whatever a previous attempt already wrote.
@@ -266,7 +275,7 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 			sql<{ submitted: string; linked: string; inserted: string }[]>`
 				WITH v AS (
 					SELECT *
-					FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+					FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb)
 						AS v(list_type text, work_item_id text, matched_normalized_value text)
 				),
 				linked AS (
