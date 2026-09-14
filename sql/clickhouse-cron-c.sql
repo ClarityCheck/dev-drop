@@ -2,8 +2,16 @@
 -- Cron C (drop-reports-cleanup) — ClickHouse setup.
 -- Service: ClarityCheck - DEV  (cu7iy7dd3r.eu-central-1.aws.clickhouse.cloud)
 --
--- Run as an admin user, top to bottom. Safe to re-run: every statement is
--- either IF NOT EXISTS, a REVOKE, or an idempotent GRANT.
+-- Run as an admin user, TOP TO BOTTOM. Safe to re-run in full: every
+-- statement is either IF NOT EXISTS, a REVOKE, or an idempotent GRANT.
+--
+-- Do not cherry-pick the REVOKE in section 1. It is written to run BEFORE
+-- the grants in section 2, and on its own it takes those grants away with
+-- everything else. To clear the dangling grants without disturbing the live
+-- ones, revoke them by name instead:
+--     REVOKE SELECT, INSERT ON default.ca_drop_match_run FROM drop_workflow_role;
+--     REVOKE SELECT, INSERT, ALTER DELETE
+--            ON default.ca_drop_work_items FROM drop_workflow_role;
 --
 -- No ON CLUSTER anywhere. Access entities in ClickHouse Cloud are stored
 -- replicated (system.users.storage = 'replicated'), so users, roles and
@@ -44,10 +52,12 @@ GRANT SELECT ON default.ca_drop_combined_search_result TO drop_workflow_role;
 -- refreshView parameter had to default to false.
 GRANT SYSTEM VIEWS ON default.ca_drop_combined_search_result TO drop_workflow_role;
 
--- Having asked for a refresh, the workflow waits for it by polling here.
--- Reads of system tables are usually implicit and row-filtered by what the
--- user can see, so this may well be redundant — it costs nothing, and the
--- failure it prevents is an opaque one.
+-- REQUIRED, and confirmed the hard way. Having asked for a refresh, the
+-- workflow waits for it by polling here. Reads of system tables are implicit
+-- and row-filtered for many tables, which is why this looked optional when
+-- this file was first written. It is not. Without it, the first run fails:
+--     Code: 497. drop_workflow: Not enough privileges. To execute this
+--     query, it's necessary to have the grant SELECT ON system.view_refreshes
 GRANT SELECT ON system.view_refreshes TO drop_workflow_role;
 
 -- Deliberately NOT granted: anything on default.entity_search_results.
