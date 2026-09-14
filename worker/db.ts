@@ -260,8 +260,17 @@ export type MatchWriteResult = {
  * Postgres does the one parse.
  *
  * Idempotent twice over, because a retried Workflow step re-runs it verbatim:
- * DISTINCT ON collapses duplicates inside the batch, ON CONFLICT DO NOTHING
+ * DISTINCT collapses duplicates inside the batch, ON CONFLICT DO NOTHING
  * absorbs whatever a previous attempt already wrote.
+ *
+ * The conflict target is the (work item, identifier) PAIR, so a work item may
+ * match more than one identifier and all of them are kept. That matters most
+ * for NDZ and NameVIN: those hashes stand for a person — a name with a date
+ * of birth and a ZIP — not for a single contact detail, so one DROP work item
+ * legitimately matches every e-mail address and phone number that person
+ * appears under. Keyed on the work item alone, the first match would win and
+ * the rest would be silently dropped, and since the expire destroys the
+ * matched rows there would be nothing left to recover them from.
  *
  * `submitted - linked` is worth watching. It counts hashes that are in KV but
  * whose work item is missing from Supabase, which means the two stores have
@@ -303,10 +312,9 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 				ins AS (
 					INSERT INTO public.ca_drop_work_item_match
 						(ca_drop_work_item_id, matched_normalized_value)
-					SELECT DISTINCT ON (id) id, matched_normalized_value
+					SELECT DISTINCT id, matched_normalized_value
 					FROM linked
-					ORDER BY id
-					ON CONFLICT (ca_drop_work_item_id) DO NOTHING
+					ON CONFLICT (ca_drop_work_item_id, matched_normalized_value) DO NOTHING
 					RETURNING 1
 				)
 				SELECT (SELECT count(*) FROM v)      AS submitted,
