@@ -230,7 +230,9 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 export type MatchWriteResult = {
 	/** rows Cron C handed over */
 	submitted: number;
-	/** of those, the ones that resolved to a row in ca_drop_work_item */
+	/** dropped before the insert because the CHECK constraint would reject them */
+	skippedEmpty: number;
+	/** of those sent, the ones that resolved to a row in ca_drop_work_item */
 	linked: number;
 	/** of those, the ones that were not already recorded */
 	inserted: number;
@@ -266,16 +268,30 @@ export type MatchWriteResult = {
  * drifted and Cron B would under-report.
  */
 export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWriteResult> {
-	if (rows.length === 0) return { submitted: 0, linked: 0, inserted: 0 };
+	// ca_drop_work_item_match has CHECK (matched_normalized_value <> ''), and a
+	// failed CHECK aborts the whole statement — so a single empty identifier
+	// would throw away every match in the batch alongside it, then burn the
+	// step's retries reproducing the same failure. There are none in the view
+	// today; this keeps one appearing later a counted skip rather than a run
+	// that dies at batch 40 of 100.
+	const usable = rows.filter((r) => r.matched_normalized_value !== "");
+	const skippedEmpty = rows.length - usable.length;
+	if (skippedEmpty > 0) {
+		console.warn(`db: skipped ${skippedEmpty} match(es) with an empty normalized value`);
+	}
 
-	console.log(`db: recording ${rows.length} match(es) → ${describe(env)}`);
+	if (usable.length === 0) {
+		return { submitted: rows.length, skippedEmpty, linked: 0, inserted: 0 };
+	}
+
+	console.log(`db: recording ${usable.length} match(es) → ${describe(env)}`);
 	const sql = connect(env);
 	try {
 		const [r] = await withTimeout(
 			sql<{ submitted: string; linked: string; inserted: string }[]>`
 				WITH v AS (
 					SELECT *
-					FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb)
+					FROM jsonb_to_recordset(${JSON.stringify(usable)}::text::jsonb)
 						AS v(list_type text, work_item_id text, matched_normalized_value text)
 				),
 				linked AS (
@@ -302,7 +318,8 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 		);
 
 		return {
-			submitted: Number(r?.submitted ?? 0),
+			submitted: Number(r?.submitted ?? 0) + skippedEmpty,
+			skippedEmpty,
 			linked: Number(r?.linked ?? 0),
 			inserted: Number(r?.inserted ?? 0),
 		};
