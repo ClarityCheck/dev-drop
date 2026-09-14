@@ -69,6 +69,10 @@ type Entry = Context & {
 	matched?: MatchAlert[];
 	match_count?: number;
 	batch?: number;
+	/** which call inside a step — see phaseTracer */
+	sub_phase?: string;
+	/** error detail from describeError; shape depends on what threw */
+	[key: string]: unknown;
 };
 
 /**
@@ -172,14 +176,128 @@ export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 					phase: waiting ? "waiting" : "failed",
 					attempt_duration_ms: Date.now() - startedAt,
 					// On a waiting attempt this is why it is still waiting, not a
-					// fault — "refresh not finished yet (status Running)".
-					error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+					// fault — "refresh not finished yet (status Running)". A real
+					// failure gets the stack and whatever fields the thrower hung
+					// off the error, which is usually where the cause actually is.
+					...(waiting
+						? { error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }
+						: describeError(e)),
 				});
 				throw e;
 			}
 		};
 
 		return config ? step.do(name, config, traced) : step.do(name, traced);
+	};
+}
+
+/**
+ * Everything an error is carrying, not just its message.
+ *
+ * `${e.name}: ${e.message}` throws away the two things that usually identify
+ * the cause: the stack, and the fields the thrower hung off the error.
+ * postgres.js puts the SQLSTATE in `code` and the server's own explanation in
+ * `severity` / `detail` / `hint` / `constraint_name`; workerd marks a
+ * cancelled I/O with `retryable` and `remote`. Without them, a Postgres
+ * constraint violation and a dead socket both read as one line of prose.
+ *
+ * `parameters` is deliberately never copied: for this workflow it holds the
+ * matched identifiers, and the log stream is not where those belong. The SQL
+ * text is safe — it is parameterised — and is truncated only for length.
+ */
+export function describeError(e: unknown): Record<string, unknown> {
+	if (!(e instanceof Error)) {
+		return { error: String(e), error_type: typeof e };
+	}
+
+	const out: Record<string, unknown> = {
+		error: `${e.name}: ${e.message}`,
+		error_name: e.name,
+		error_message: e.message,
+	};
+	if (e.stack) out.error_stack = e.stack.split("\n").slice(0, 12).join("\n");
+	if (e.cause) {
+		out.error_cause =
+			e.cause instanceof Error ? `${e.cause.name}: ${e.cause.message}` : String(e.cause);
+	}
+
+	const carried = [
+		"code", "errno", "syscall", "severity", "detail", "hint", "routine",
+		"where", "schema_name", "table_name", "constraint_name", "column_name",
+		"position", "retryable", "remote", "durable",
+	];
+	for (const k of carried) {
+		const v = (e as unknown as Record<string, unknown>)[k];
+		if (v !== undefined && v !== null) out[`error_${k}`] = v;
+	}
+	const q = (e as unknown as Record<string, unknown>).query;
+	if (typeof q === "string") out.error_query = q.replace(/\s+/g, " ").slice(0, 300);
+
+	return out;
+}
+
+/**
+ * Wraps the individual calls inside a step, so a failure names which one.
+ *
+ * A step like "record and erase" touches ClickHouse twice, Postgres twice,
+ * Better Stack and R2. When the Workflow reports that the step failed, it says
+ * nothing about which of the six died — and "Network connection lost" at 1.8
+ * seconds could be any of them.
+ *
+ * Both the start and the end of each call are shipped, and the start matters
+ * more than it looks. If the isolate is torn down mid-call — which is exactly
+ * what a lost connection or an exceeded limit does — the failure log never
+ * leaves the Worker. What survives is the last `phase started` with no
+ * matching end, and that alone identifies the call.
+ */
+export function phaseTracer(env: Env, ctx: Context, stepName: string) {
+	return async function phase<T>(name: string, fn: () => Promise<T>): Promise<T> {
+		const startedAt = Date.now();
+		console.log(`${stepName} > ${name}`);
+		await ship(env, {
+			...ctx,
+			dt: new Date().toISOString(),
+			level: "info",
+			message: `phase started: ${name}`,
+			step: stepName,
+			phase: "started",
+			sub_phase: name,
+		});
+
+		try {
+			const out = await fn();
+			const ms = Date.now() - startedAt;
+			console.log(`${stepName} ok ${name} (${ms}ms)`);
+			await ship(env, {
+				...ctx,
+				dt: new Date().toISOString(),
+				level: "info",
+				message: `phase ok: ${name}`,
+				step: stepName,
+				phase: "completed",
+				sub_phase: name,
+				attempt_duration_ms: ms,
+			});
+			return out;
+		} catch (e) {
+			const ms = Date.now() - startedAt;
+			const detail = describeError(e);
+			console.error(`${stepName} FAILED ${name} (${ms}ms)`, detail);
+			await ship(env, {
+				...ctx,
+				dt: new Date().toISOString(),
+				level: "error",
+				message: `phase failed: ${name}`,
+				step: stepName,
+				phase: "failed",
+				sub_phase: name,
+				attempt_duration_ms: ms,
+				...detail,
+			});
+			// Re-thrown, not wrapped: NonRetryableError has to stay one.
+			if (e instanceof Error) e.message = `[${name}] ${e.message}`;
+			throw e;
+		}
 	};
 }
 
@@ -272,7 +390,12 @@ export async function logRun(
 	env: Env,
 	ctx: Context,
 	phase: "started" | "completed" | "failed",
-	extra?: { error?: string; result?: unknown; duration_ms?: number; failedAtBatch?: number },
+	extra?: {
+		error?: string;
+		result?: unknown;
+		duration_ms?: number;
+		failedAtBatch?: number;
+	} & Record<string, unknown>,
 ): Promise<void> {
 	await ship(env, {
 		...ctx,
@@ -283,7 +406,13 @@ export async function logRun(
 		phase: phase === "started" ? "started" : phase === "completed" ? "completed" : "failed",
 		attempt_duration_ms: extra?.duration_ms,
 		result: numericOnly(extra?.result),
-		error: extra?.error,
 		batch: extra?.failedAtBatch,
+		// Whatever describeError produced — stack, SQLSTATE, the server's own
+		// explanation — rather than one line of prose.
+		...Object.fromEntries(
+			Object.entries(extra ?? {}).filter(
+				([k]) => k === "error" || k.startsWith("error_"),
+			),
+		),
 	});
 }

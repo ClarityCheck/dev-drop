@@ -5,7 +5,7 @@ import { chInsert, chQuery, deleteEntityRows } from "./ch";
 import type { EntityKey } from "./ch";
 import { incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
-import { logMatches, logRun, Pending, renderMatchLog, tracer } from "./logs";
+import { describeError, logMatches, logRun, Pending, phaseTracer, renderMatchLog, tracer } from "./logs";
 import type { MatchAlert, MatchOutcome } from "./logs";
 import { writeMatchLog } from "./audit";
 
@@ -376,7 +376,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			// The tracer logged the attempt that threw. This says the run as a
 			// whole is over and how far it got, which a step-level log cannot.
 			await logRun(this.env, ctx, "failed", {
-				error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+				...describeError(e),
 				duration_ms: Date.now() - runStartedAt,
 				failedAtBatch: chunk,
 				result: {
@@ -408,30 +408,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		limit: number,
 		dryRun: boolean,
 	) {
-		// A chunk touches ClickHouse twice, Postgres twice, Better Stack and R2,
-		// and when one of them dies the Workflow reports only that the step
-		// failed. "Network connection lost" at 1.8 seconds could be any of six
-		// calls. This names each one as it runs — visible live in
-		// `wrangler tail` — and stamps the phase into the error message, so the
-		// Better Stack entry says where it died rather than merely that it did.
-		//
-		// The error object itself is re-thrown, not wrapped: NonRetryableError
-		// has to stay a NonRetryableError or a consistency failure would start
-		// burning five attempts again.
-		const phase = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
-			const startedAt = Date.now();
-			console.log(`chunk ${chunk} > ${name}`);
-			try {
-				const out = await fn();
-				console.log(`chunk ${chunk} ok ${name} (${Date.now() - startedAt}ms)`);
-				return out;
-			} catch (e) {
-				const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-				console.error(`chunk ${chunk} FAILED ${name} (${Date.now() - startedAt}ms) - ${detail}`);
-				if (e instanceof Error) e.message = `[${name}] ${e.message}`;
-				throw e;
-			}
-		};
+		// Every call this chunk makes, reported to Better Stack as it happens —
+		// start and end, with the full error on a failure. See phaseTracer for
+		// why the start entries matter as much as the ends.
+		const phase = phaseTracer(this.env, ctx, `record and erase · chunk ${chunk}`);
 
 		const matches = await phase("clickhouse: select matches", () =>
 			chQuery<MatchResult>(
