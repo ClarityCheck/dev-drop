@@ -144,6 +144,14 @@ describe("incompleteReason", () => {
 		expect(incompleteReason({ ...ok, inserted: 0 })).toBeNull();
 	});
 
+	it("passes when the status was already set by an earlier batch", () => {
+		// A work item matched again in a later batch is normal: NDZ and NameVIN
+		// hashes stand for a person, so each of their identifiers turns up
+		// separately. Nothing is rewritten -- statusSet counts the rows that
+		// already carry it -- and that must still read as recorded.
+		expect(incompleteReason({ ...ok, inserted: 0, statusSet: 2 })).toBeNull();
+	});
+
 	it("fails when a match has no work item to link to", () => {
 		expect(incompleteReason({ ...ok, linked: 1 })).toContain("no row in ca_drop_work_item");
 	});

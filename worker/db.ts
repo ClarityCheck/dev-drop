@@ -366,12 +366,25 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					ON CONFLICT (ca_drop_work_item_id, matched_normalized_value) DO NOTHING
 					RETURNING 1
 				),
+				-- Work items that already carry the status, from an earlier batch
+				-- or an earlier run. They are counted, not rewritten.
 				already AS (
 					SELECT w.id
 					FROM items i
 					JOIN public.ca_drop_work_item w ON w.id = i.id
 					WHERE w.status = 'deleted'
 				),
+				-- IS DISTINCT FROM 'deleted' is what keeps this to once per work
+				-- item. A DROP work item is matched again in every later batch
+				-- that turns up another of its identifiers -- NDZ and NameVIN
+				-- hashes stand for a person, so that is normal, not rare -- and
+				-- without the guard each of those would rewrite the row and push
+				-- status_set_at forward.
+				--
+				-- status_set_at should say when the consumer was FIRST found, not
+				-- when the scan last happened to pass their record again. It is
+				-- the timestamp the audit trail rests on, so it is written once
+				-- and then left alone.
 				upd AS (
 					UPDATE public.ca_drop_work_item w
 					SET status = 'deleted', status_set_at = now()
