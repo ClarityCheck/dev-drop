@@ -1,6 +1,8 @@
 -- =====================================================================
--- STEP 2 of 2 — the CA DROP pipeline in Supabase, from nothing.
--- Run after supabase-1-drop-all.sql, in the Supabase SQL editor.
+-- The CA DROP pipeline in Supabase, from nothing.
+-- Run in the Supabase SQL editor, a section at a time -- the editor
+-- submits as one transaction, so a failure late in the script rolls back
+-- everything before it and looks like nothing ran.
 --
 -- Everything the build taught us is folded in, so this is the whole
 -- schema rather than a patch on the old one:
