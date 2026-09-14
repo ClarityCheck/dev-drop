@@ -40,6 +40,16 @@ export type WorkItemRow = {
 	request_date: string | null;
 };
 
+/** One DROP work item found in ClickHouse, as Cron C reports it. */
+export type MatchRow = {
+	/** DROP list the hash came from, per the KV metadata */
+	list_type: string;
+	/** DROP's own Id, case-sensitive */
+	work_item_id: string;
+	/** the identifier the hash matched — e-mail, phone, or the NDZ/NameVIN source value */
+	matched_normalized_value: string;
+};
+
 /**
  * sql.end() waits for the connection to close, and on a half-open TLS socket
  * that wait does not finish — which is why db-test was answering a bare 500:
@@ -212,6 +222,81 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 		);
 		console.log(`db: upserted ${rows.length} rows`);
 		return rows.length;
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+export type MatchWriteResult = {
+	/** rows Cron C handed over */
+	submitted: number;
+	/** of those, the ones that resolved to a row in ca_drop_work_item */
+	linked: number;
+	/** of those, the ones that were not already recorded */
+	inserted: number;
+};
+
+/**
+ * Record the matches Cron C found.
+ *
+ * ca_drop_work_item_match references ca_drop_work_item by its bigint id, but
+ * KV only knows DROP's own (list_type, work_item_id) — so the join happens
+ * here, in one statement, rather than as a lookup per match.
+ *
+ * The rows travel as a single jsonb parameter rather than N placeholders or a
+ * text[]: it is one bind regardless of batch size, and it does not depend on
+ * the driver inferring an array type, which `fetch_types: false` leaves it
+ * unable to do.
+ *
+ * Idempotent twice over, because a retried Workflow step re-runs it verbatim:
+ * DISTINCT ON collapses duplicates inside the batch, ON CONFLICT DO NOTHING
+ * absorbs whatever a previous attempt already wrote.
+ *
+ * `submitted - linked` is worth watching. It counts hashes that are in KV but
+ * whose work item is missing from Supabase, which means the two stores have
+ * drifted and Cron B would under-report.
+ */
+export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWriteResult> {
+	if (rows.length === 0) return { submitted: 0, linked: 0, inserted: 0 };
+
+	console.log(`db: recording ${rows.length} match(es) → ${describe(env)}`);
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ submitted: string; linked: string; inserted: string }[]>`
+				WITH v AS (
+					SELECT *
+					FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+						AS v(list_type text, work_item_id text, matched_normalized_value text)
+				),
+				linked AS (
+					SELECT w.id, v.matched_normalized_value
+					FROM v
+					JOIN public.ca_drop_work_item w
+						ON w.list_type = v.list_type AND w.work_item_id = v.work_item_id
+				),
+				ins AS (
+					INSERT INTO public.ca_drop_work_item_match
+						(ca_drop_work_item_id, matched_normalized_value)
+					SELECT DISTINCT ON (id) id, matched_normalized_value
+					FROM linked
+					ORDER BY id
+					ON CONFLICT (ca_drop_work_item_id) DO NOTHING
+					RETURNING 1
+				)
+				SELECT (SELECT count(*) FROM v)      AS submitted,
+				       (SELECT count(*) FROM linked) AS linked,
+				       (SELECT count(*) FROM ins)    AS inserted
+			`,
+			30000,
+			"insert ca_drop_work_item_match",
+		);
+
+		return {
+			submitted: Number(r?.submitted ?? 0),
+			linked: Number(r?.linked ?? 0),
+			inserted: Number(r?.inserted ?? 0),
+		};
 	} finally {
 		await closeQuietly(sql);
 	}

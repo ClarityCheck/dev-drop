@@ -43,11 +43,26 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	// Cron C compares every candidate key against KV one at a time, so its
+	// subrequest count is the number of keys in the view — millions, not the
+	// 10,000 a Worker gets by default. 10 million is the ceiling Cloudflare
+	// allows; see the sizing note at the top of workflow-reports-cleanup.ts
+	// for why the number is that large and what happens when it is not enough.
+	"limits": {
+		"subrequests": 10000000
+	},
 	"workflows": [
 		{
 			"name": "drop-reports-cleanup",
 			"binding": "DROP_REPORTS_CLEANUP",
-			"class_name": "DropReportsCleanupWorkflow"
+			"class_name": "DropReportsCleanupWorkflow",
+			// One step per batch: 2.5M keys at the default batchSize of 25,000
+			// is ~100 steps, so the 10,000 default is ample. Raised anyway
+			// because a smaller batchSize is the first thing to reach for when
+			// a step runs long, and that multiplies steps.
+			"limits": {
+				"steps": 25000
+			}
 		},
 		{
 			"name": "drop-downloader",
@@ -102,7 +117,14 @@
 	"hyperdrive": [
 		{
 			"binding": "DROP_DB",
-			"id": "df29c50286574600a5f37d7c2490589c"
+			"id": "df29c50286574600a5f37d7c2490589c",
+			// Local only — ignored on deploy. Wrangler refuses to start a local
+			// session (and so does vitest-pool-workers, which is why the test
+			// suite could not boot) unless a Hyperdrive binding has somewhere
+			// local to point. Nothing needs to be listening on it for tests
+			// that do not reach Postgres; point it at a real local database if
+			// you want `wrangler dev` to actually query one.
+			"localConnectionString": "postgresql://postgres:postgres@localhost:5432/postgres"
 		}
 	]
 }
