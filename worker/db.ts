@@ -203,7 +203,29 @@ function connect(env: Env) {
 		return postgres(hyperdrive.connectionString, {
 			max: 5,
 			fetch_types: false,
-			prepare: true,
+			// prepare: false, and this is the important one.
+			//
+			// A named prepared statement is CONNECTION-scoped: Parse names it on
+			// one backend, and Bind/Execute must land on that same backend.
+			// Hyperdrive pools and reuses connections underneath us, so there is
+			// no guarantee the second message reaches the socket the first one
+			// named. When it does not, the protocol desynchronises and the
+			// connection is torn down — which arrives in the Worker as
+			// "Network connection lost", with retryable: true and NO SQLSTATE,
+			// because Postgres never got to answer.
+			//
+			// That matches every symptom: the query runs to completion on the
+			// server (its backend sat idle afterwards with the statement as
+			// last_query) while the Worker sees the socket die; psql against the
+			// same database with the same credentials runs it in 74ms; and it
+			// worked once, early on, when the statement was new to a fresh
+			// connection.
+			//
+			// Unnamed statements still get placeholders and parameter binding —
+			// no SQL is built by hand, and everything below stays parameterised.
+			// The cost is re-planning per execution, which for a handful of
+			// statements per run is nothing.
+			prepare: false,
 		});
 	}
 
