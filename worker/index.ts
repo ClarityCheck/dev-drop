@@ -159,13 +159,15 @@ export default {
 		// The real-time gate.
 		//
 		//   POST /api/drop/check   { "type": "phone", "value": "+12012000776" }
-		//   -> { "type": "phone", "listed": true, "hash": "4Uenb…" }
+		//   -> { "type": "phone", "listed": false }
 		//
-		// POST rather than GET, and the value is never echoed back: an e-mail
-		// address or phone number in a query string ends up in access logs,
-		// browser history and referrers. The hash is safe to return — it is
-		// what DROP publishes — and it is what makes a surprising answer
-		// traceable without the caller re-sending the identifier.
+		// POST rather than GET: an e-mail address or phone number in a query
+		// string ends up in access logs, browser history and referrers.
+		//
+		// The answer is the whole response. Neither the value nor its hash
+		// comes back — the caller already has the value, and the hash is a
+		// stable identifier for a person that nothing downstream needs in
+		// order to act on a yes or a no.
 		//
 		// The important property is what happens when the check CANNOT run.
 		// KV unreachable must never answer "not listed": that is
@@ -196,12 +198,12 @@ export default {
 				// Nothing left after normalization — a phone with no digits, or
 				// an e-mail that was only whitespace. Not listed, and not an
 				// error, but it never reaches KV.
-				return Response.json({ type, listed: false, hash: null, reason: "empty after normalization" });
+				return Response.json({ type, listed: false, reason: "empty after normalization" });
 			}
 
 			try {
 				const hit = await env.kv.get(hash);
-				return Response.json({ type, listed: hit !== null, hash });
+				return Response.json({ type, listed: hit !== null });
 			} catch (e) {
 				return Response.json(
 					{
