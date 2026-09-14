@@ -5,6 +5,7 @@ export { WorkflowStatusDO } from "./durable-object";
 export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
+import { dropKey, isDropListType } from "./drop-normalize";
 
 /**
  * Main Worker fetch handler
@@ -17,6 +18,7 @@ import { countWorkItems, dbPing, sampleWorkItems } from "./db";
  * - POST /api/downloader/start - Start the drop-downloader workflow
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
+ * - POST /api/drop/check - is this e-mail or phone on the DROP list?
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -152,6 +154,64 @@ export default {
 			if (!instanceId) return Response.json({ error: "Instance ID required" }, { status: 400 });
 			const instance = await env.DROP_DOWNLOADER.get(instanceId);
 			return Response.json(await instance.status());
+		}
+
+		// The real-time gate.
+		//
+		//   POST /api/drop/check   { "type": "phone", "value": "+12012000776" }
+		//   -> { "type": "phone", "listed": true, "hash": "4Uenb…" }
+		//
+		// POST rather than GET, and the value is never echoed back: an e-mail
+		// address or phone number in a query string ends up in access logs,
+		// browser history and referrers. The hash is safe to return — it is
+		// what DROP publishes — and it is what makes a surprising answer
+		// traceable without the caller re-sending the identifier.
+		//
+		// The important property is what happens when the check CANNOT run.
+		// KV unreachable must never answer "not listed": that is
+		// indistinguishable from a clean result and would quietly serve data
+		// for someone who asked to be deleted. Failure is a 503 and the caller
+		// is expected to treat it as "unknown", not as "no".
+		if (url.pathname === "/api/drop/check" && request.method === "POST") {
+			let body: { type?: unknown; value?: unknown };
+			try {
+				body = (await request.json()) as { type?: unknown; value?: unknown };
+			} catch {
+				return Response.json({ error: "body must be JSON" }, { status: 400 });
+			}
+
+			const { type, value } = body;
+			if (!isDropListType(type)) {
+				return Response.json(
+					{ error: 'type must be "email" or "phone"' },
+					{ status: 400 },
+				);
+			}
+			if (typeof value !== "string" || value.trim() === "") {
+				return Response.json({ error: "value must be a non-empty string" }, { status: 400 });
+			}
+
+			const { normalized, hash } = await dropKey(type, value);
+			if (normalized === "") {
+				// Nothing left after normalization — a phone with no digits, or
+				// an e-mail that was only whitespace. Not listed, and not an
+				// error, but it never reaches KV.
+				return Response.json({ type, listed: false, hash: null, reason: "empty after normalization" });
+			}
+
+			try {
+				const hit = await env.kv.get(hash);
+				return Response.json({ type, listed: hit !== null, hash });
+			} catch (e) {
+				return Response.json(
+					{
+						error: "check did not run",
+						detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+						hint: "treat as unknown, not as not-listed",
+					},
+					{ status: 503 },
+				);
+			}
 		}
 
 		// Is the DROP set in KV still complete?
