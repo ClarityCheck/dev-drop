@@ -22,7 +22,33 @@
 
 import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 
-type Phase = "started" | "completed" | "failed" | "match";
+type Phase = "started" | "completed" | "failed" | "waiting" | "match";
+
+/**
+ * Thrown by a step that is waiting for something, not failing at it.
+ *
+ * Workflows has no "not ready, ask me again" signal — a step that needs to
+ * poll says so by throwing, and the retry policy turns that into the next
+ * attempt. So the throw is the mechanism, and on the happy path a step like
+ * "await refresh" throws several times before it succeeds. Reporting those
+ * as errors means a healthy run fills the log with failures and any alert
+ * built on level=error fires on nothing at all.
+ *
+ * The tracer logs these at info with phase "waiting" instead. A step that
+ * exhausts its retries still surfaces: the run-level bookend records the run
+ * as failed, at error, with the message that finally got through.
+ */
+export class Pending extends Error {
+	readonly pending = true;
+	constructor(message: string) {
+		super(message);
+		this.name = "Pending";
+	}
+}
+
+function isPending(e: unknown): boolean {
+	return e instanceof Pending || (typeof e === "object" && e !== null && "pending" in e);
+}
 
 type Context = {
 	workflow: string;
@@ -136,14 +162,17 @@ export function tracer(env: Env, step: WorkflowStep, ctx: Context) {
 				});
 				return result;
 			} catch (e) {
+				const waiting = isPending(e);
 				await ship(env, {
 					...ctx,
 					dt: new Date().toISOString(),
-					level: "error",
-					message: `step failed: ${name}`,
+					level: waiting ? "info" : "error",
+					message: waiting ? `step waiting: ${name}` : `step failed: ${name}`,
 					step: name,
-					phase: "failed",
+					phase: waiting ? "waiting" : "failed",
 					attempt_duration_ms: Date.now() - startedAt,
+					// On a waiting attempt this is why it is still waiting, not a
+					// fault — "refresh not finished yet (status Running)".
 					error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
 				});
 				throw e;

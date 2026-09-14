@@ -14,7 +14,8 @@
       "Bash(npm test *)",
       "Bash(git stash *)",
       "Bash(git checkout *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "mcp__claude_ai_Cloudflare_Developer_Platform__hyperdrive_config_get"
     ]
   }
 }

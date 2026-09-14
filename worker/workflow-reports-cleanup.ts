@@ -3,7 +3,7 @@ import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chQuery } from "./ch";
 import { recordMatches } from "./db";
 import type { MatchRow } from "./db";
-import { logMatches, logRun, tracer } from "./logs";
+import { logMatches, logRun, Pending, tracer } from "./logs";
 import type { MatchAlert } from "./logs";
 
 /**
@@ -176,13 +176,23 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 							 FROM system.view_refreshes
 							 WHERE view = 'ca_drop_combined_search_result'`,
 						);
+						// These two are real faults — the view vanished, or the
+						// refresh itself threw. Neither improves by waiting, but
+						// the retry policy cannot be selective, so they burn the
+						// remaining attempts before the run gives up. They are at
+						// least logged as errors from the first attempt on.
 						if (!r) throw new Error("view_refreshes has no row for the view");
 						if (r.exception) throw new Error(`refresh failed: ${r.exception}`);
+
+						// These two are the poll doing its job. Throwing is how a
+						// step asks Workflows for another attempt, so on a healthy
+						// run this happens several times before the refresh lands;
+						// Pending keeps those out of the error stream.
 						const lastSuccess = Number(r.last_success);
 						if (lastSuccess <= refreshedAfter) {
-							throw new Error(`refresh not finished yet (status ${r.status})`);
+							throw new Pending(`refresh not finished yet (status ${r.status})`);
 						}
-						if (r.status !== "Scheduled") throw new Error(`refresh still ${r.status}`);
+						if (r.status !== "Scheduled") throw new Pending(`refresh still ${r.status}`);
 						return lastSuccess;
 					},
 				);
@@ -202,6 +212,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			let matchesFound = 0;
 			let matchesLinked = 0;
 			let matchesInserted = 0;
+			let matchesSkippedEmpty = 0;
 			let lastMatchLog = "";
 
 			for (;;) {
@@ -230,6 +241,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesFound += result.matchesFound;
 				matchesLinked += result.linked;
 				matchesInserted += result.inserted;
+				matchesSkippedEmpty += result.skippedEmpty;
 				if (result.matchLog) lastMatchLog = result.matchLog;
 
 				if (result.done) break;
@@ -251,6 +263,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesLinked,
 				matchesUnlinked: matchesFound - matchesLinked,
 				matchRowsInserted: matchesInserted,
+				matchesSkippedEmpty,
 				dryRun: dryRun ? 1 : 0,
 			};
 
@@ -318,6 +331,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesFound: 0,
 				linked: 0,
 				inserted: 0,
+				skippedEmpty: 0,
 				matchLog: "",
 				done,
 				// Still advance, or a run of key-less rows would be rescanned forever.
@@ -371,6 +385,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 		let linked = 0;
 		let inserted = 0;
+		let skippedEmpty = 0;
 		let matchLog = "";
 
 		if (matchRows.length > 0) {
@@ -378,6 +393,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				const written = await recordMatches(this.env, matchRows);
 				linked = written.linked;
 				inserted = written.inserted;
+				skippedEmpty = written.skippedEmpty;
 			}
 			matchLog = await logMatches(this.env, ctx, batch, alerts);
 		}
@@ -389,6 +405,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			matchesFound: matchRows.length,
 			linked,
 			inserted,
+			skippedEmpty,
 			matchLog,
 			done: false,
 			cursorType: last.type,
