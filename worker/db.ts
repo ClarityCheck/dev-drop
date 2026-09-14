@@ -431,3 +431,87 @@ export async function markMatchesDeleted(env: Env, workItemIds: string[]): Promi
 		await closeQuietly(sql);
 	}
 }
+
+/**
+ * One round trip to Postgres, with whatever went wrong reported verbatim.
+ *
+ * A failure on the Worker -> Hyperdrive -> Supabase path arrives as
+ * "CONNECTION_CLOSED" or "Network connection lost", which says only that the
+ * socket went away. The cause -- wrong password, no CONNECT privilege, the
+ * project asleep, connection limit reached, a query rejected -- happens on the
+ * Hyperdrive -> Supabase hop and never reaches the Worker as itself.
+ *
+ * So this asks a series of increasingly demanding questions and reports which
+ * one stopped answering. Connect, then identity, then each table Cron C needs,
+ * separately: a table that errors on permission is a grant problem, and one
+ * that returns zero rows where rows are expected is RLS hiding them, which
+ * looks identical from inside the workflow.
+ */
+export async function dbPing(env: Env): Promise<Record<string, unknown>> {
+	const out: Record<string, unknown> = { target: describe(env) };
+	if (!hasDb(env)) return { ...out, ok: false, stage: "config", error: "no DROP_DB binding and no SUPABASE_DB_URL" };
+
+	let sql: ReturnType<typeof connect> | undefined;
+	const fail = (stage: string, e: unknown) => ({
+		...out,
+		ok: false,
+		stage,
+		error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+		// postgres.js puts the SQLSTATE here; its absence is itself a signal,
+		// because it means the failure was below the protocol rather than a
+		// database saying no.
+		code: (e as { code?: string })?.code ?? null,
+	});
+
+	try {
+		sql = connect(env);
+	} catch (e) {
+		return fail("connect", e);
+	}
+
+	try {
+		const [who] = await withTimeout(
+			sql`SELECT current_user AS usr, current_database() AS db, version() AS ver`,
+			15000,
+			"db ping",
+		);
+		out.current_user = who?.usr;
+		out.database = who?.db;
+		out.server = String(who?.ver ?? "").split(" on ")[0];
+	} catch (e) {
+		await closeQuietly(sql);
+		return fail("identity", e);
+	}
+
+	for (const table of ["ca_drop_work_item", "ca_drop_work_item_match"]) {
+		try {
+			const [r] = await withTimeout(
+				sql`SELECT count(*)::text AS n FROM public.${sql(table)}`,
+				15000,
+				`count ${table}`,
+			);
+			out[`${table}_rows`] = r?.n ?? null;
+		} catch (e) {
+			out[`${table}_rows`] = null;
+			out[`${table}_error`] =
+				e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+		}
+	}
+
+	// Visible only when RLS is on AND a policy admits this role. Zero rows in a
+	// table that is not empty is the signature of a missing policy.
+	try {
+		const [r] = await withTimeout(
+			sql`SELECT count(*)::text AS n FROM pg_policies
+			    WHERE schemaname = 'public' AND tablename LIKE 'ca\\_drop\\_%'`,
+			15000,
+			"policies",
+		);
+		out.policies_visible = r?.n ?? null;
+	} catch {
+		out.policies_visible = null;
+	}
+
+	await closeQuietly(sql);
+	return { ...out, ok: true };
+}

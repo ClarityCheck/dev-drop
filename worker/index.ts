@@ -3,6 +3,8 @@ export { DropReportsCleanupWorkflow } from "./workflow-reports-cleanup";
 export { DropDownloaderWorkflow } from "./workflow-downloader";
 export { WorkflowStatusDO } from "./durable-object";
 
+import { dbPing } from "./db";
+
 /**
  * Main Worker fetch handler
  *
@@ -13,6 +15,7 @@ export { WorkflowStatusDO } from "./durable-object";
  * - GET /ws - WebSocket connection for real-time updates
  * - POST /api/downloader/start - Start the drop-downloader workflow
  * - GET /api/downloader/status/:id - Its status
+ * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
  */
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -146,6 +149,15 @@ export default {
 			if (!instanceId) return Response.json({ error: "Instance ID required" }, { status: 400 });
 			const instance = await env.DROP_DOWNLOADER.get(instanceId);
 			return Response.json(await instance.status());
+		}
+
+		// Diagnostic: one round trip to Postgres, reporting whatever went wrong
+		// rather than the "CONNECTION_CLOSED" the workflow sees. The real cause
+		// happens on the Hyperdrive -> Supabase hop and never reaches the
+		// Worker as itself.
+		if (url.pathname === "/api/db-test") {
+			const result = await dbPing(env);
+			return Response.json(result, { status: result.ok ? 200 : 500 });
 		}
 
 		return Response.json({ error: "Not Found" }, { status: 404 });
