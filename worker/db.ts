@@ -228,15 +228,52 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 }
 
 export type MatchWriteResult = {
-	/** rows Cron C handed over */
+	/** rows Cron C handed over, including any it could not send */
 	submitted: number;
 	/** dropped before the insert because the CHECK constraint would reject them */
 	skippedEmpty: number;
 	/** of those sent, the ones that resolved to a row in ca_drop_work_item */
 	linked: number;
-	/** of those, the ones that were not already recorded */
+	/** distinct work items among the linked rows */
+	workItems: number;
+	/** match rows written — lower than `linked` when a previous attempt wrote them */
 	inserted: number;
+	/** linked work items now carrying status = 'deleted' */
+	statusSet: number;
 };
+
+/**
+ * Why this write did not fully land, or null if it did.
+ *
+ * "Recorded" means both halves: a row in ca_drop_work_item_match AND the
+ * status on the work item. Either one missing and the match is not reportable
+ * to DROP, so the caller is expected to fail the run rather than carry on —
+ * a match that is found and not recorded is the one outcome this pipeline
+ * must never shrug off.
+ *
+ * `inserted` is deliberately not part of the test. It is lower than `linked`
+ * whenever a previous attempt already wrote the rows, which is exactly what
+ * a retried step should do.
+ */
+export function incompleteReason(r: MatchWriteResult): string | null {
+	if (r.skippedEmpty > 0) {
+		return `${r.skippedEmpty} match(es) had an empty normalized value and could not be stored`;
+	}
+	if (r.linked < r.submitted) {
+		return (
+			`${r.submitted - r.linked} of ${r.submitted} match(es) had no row in ` +
+			`ca_drop_work_item — KV and Supabase have drifted, or Cron A has not run since ` +
+			`the table was last rebuilt`
+		);
+	}
+	if (r.statusSet < r.workItems) {
+		return (
+			`${r.workItems - r.statusSet} of ${r.workItems} work item(s) did not end up ` +
+			`with status = 'deleted'`
+		);
+	}
+	return null;
+}
 
 /**
  * Record the matches Cron C found.
@@ -290,14 +327,23 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 	}
 
 	if (usable.length === 0) {
-		return { submitted: rows.length, skippedEmpty, linked: 0, inserted: 0 };
+		return { submitted: rows.length, skippedEmpty, linked: 0, workItems: 0, inserted: 0, statusSet: 0 };
 	}
 
 	console.log(`db: recording ${usable.length} match(es) → ${describe(env)}`);
 	const sql = connect(env);
 	try {
 		const [r] = await withTimeout(
-			sql<{ submitted: string; linked: string; inserted: string }[]>`
+			sql<
+				{
+					submitted: string;
+					linked: string;
+					work_items: string;
+					inserted: string;
+					status_updated: string;
+					status_already: string;
+				}[]
+			>`
 				WITH v AS (
 					SELECT *
 					FROM jsonb_to_recordset(${JSON.stringify(usable)}::text::jsonb)
@@ -309,6 +355,9 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					JOIN public.ca_drop_work_item w
 						ON w.list_type = v.list_type AND w.work_item_id = v.work_item_id
 				),
+				items AS (
+					SELECT DISTINCT id FROM linked
+				),
 				ins AS (
 					INSERT INTO public.ca_drop_work_item_match
 						(ca_drop_work_item_id, matched_normalized_value)
@@ -316,10 +365,26 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					FROM linked
 					ON CONFLICT (ca_drop_work_item_id, matched_normalized_value) DO NOTHING
 					RETURNING 1
+				),
+				already AS (
+					SELECT w.id
+					FROM items i
+					JOIN public.ca_drop_work_item w ON w.id = i.id
+					WHERE w.status = 'deleted'
+				),
+				upd AS (
+					UPDATE public.ca_drop_work_item w
+					SET status = 'deleted', status_set_at = now()
+					FROM items i
+					WHERE w.id = i.id AND w.status IS DISTINCT FROM 'deleted'
+					RETURNING w.id
 				)
-				SELECT (SELECT count(*) FROM v)      AS submitted,
-				       (SELECT count(*) FROM linked) AS linked,
-				       (SELECT count(*) FROM ins)    AS inserted
+				SELECT (SELECT count(*) FROM v)       AS submitted,
+				       (SELECT count(*) FROM linked)  AS linked,
+				       (SELECT count(*) FROM items)   AS work_items,
+				       (SELECT count(*) FROM ins)     AS inserted,
+				       (SELECT count(*) FROM upd)     AS status_updated,
+				       (SELECT count(*) FROM already) AS status_already
 			`,
 			30000,
 			"insert ca_drop_work_item_match",
@@ -329,7 +394,12 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 			submitted: Number(r?.submitted ?? 0) + skippedEmpty,
 			skippedEmpty,
 			linked: Number(r?.linked ?? 0),
+			workItems: Number(r?.work_items ?? 0),
 			inserted: Number(r?.inserted ?? 0),
+			// A work item counts as carrying the status whether this call set it
+			// or a previous attempt did — the test is the end state, not the
+			// delta, so a retry does not look like a failure.
+			statusSet: Number(r?.status_updated ?? 0) + Number(r?.status_already ?? 0),
 		};
 	} finally {
 		await closeQuietly(sql);
