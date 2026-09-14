@@ -84,6 +84,17 @@ async function closeQuietly(sql: { end: (o?: { timeout?: number }) => Promise<vo
  *  that never establishes would hang the whole step until the Workflow's
  *  timeout. This turns that into a real error with a usable message. */
 async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+	// The same trap closeQuietly fell into. Promise.race does not cancel the
+	// loser: if the timeout below wins, `work` is still in flight, and when it
+	// later rejects — which it will, the query having been abandoned — nothing
+	// is handling that rejection. An unhandled rejection in a Worker does not
+	// warn, it tears down the invocation, and the failure then surfaces
+	// somewhere unrelated as "Network connection lost".
+	//
+	// This extra handler does not affect the race, which still awaits the
+	// original promise. It only guarantees the rejection has somewhere to go.
+	void work.catch(() => {});
+
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		return await Promise.race([
