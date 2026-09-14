@@ -272,7 +272,7 @@ export async function logRun(
 	env: Env,
 	ctx: Context,
 	phase: "started" | "completed" | "failed",
-	extra?: { error?: string; result?: unknown; duration_ms?: number },
+	extra?: { error?: string; result?: unknown; duration_ms?: number; failedAtBatch?: number },
 ): Promise<void> {
 	await ship(env, {
 		...ctx,
@@ -284,5 +284,6 @@ export async function logRun(
 		attempt_duration_ms: extra?.duration_ms,
 		result: numericOnly(extra?.result),
 		error: extra?.error,
+		batch: extra?.failedAtBatch,
 	});
 }

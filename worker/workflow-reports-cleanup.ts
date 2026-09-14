@@ -1,4 +1,5 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
+import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chQuery } from "./ch";
 import { incompleteReason, recordMatches } from "./db";
@@ -131,6 +132,21 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			}
 		};
 
+		// Declared out here so the run-level failure log can say which batch was
+		// in flight and how far the run had got. Inside the try they would be
+		// out of scope exactly when something has gone wrong.
+		let cursor: Cursor = { type: "", value: "", offset: 0 };
+		let batch = 0;
+		let keysRead = 0;
+		let keysCompared = 0;
+		let rowsSeen = 0;
+		let matchesFound = 0;
+		let matchesLinked = 0;
+		let matchesInserted = 0;
+		let matchesStatusSet = 0;
+		let matchesSkippedEmpty = 0;
+		let lastMatchLog = "";
+
 		try {
 			// ---------------------------------------------------------------
 			// ① rebuild the view, so the scan sees current data
@@ -147,28 +163,35 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				// it done, and the whole scan then runs against last year's data —
 				// silently, and looking entirely healthy. Success is this number
 				// moving, not the status.
-				const refreshedAfter = await tracedStep("refresh combined view", async () => {
-					const [before] = await chQuery<{ last_success: string }>(
-						this.env,
-						`SELECT ifNull(toUnixTimestamp(last_success_time), 0) AS last_success
-						 FROM system.view_refreshes
-						 WHERE view = 'ca_drop_combined_search_result'`,
-					);
-					// No row here is a permissions or naming problem, not a slow
-					// refresh. Caught now it names itself; left to the poll below it
-					// spends 15 minutes retrying before saying anything.
-					if (!before) {
-						throw new Error(
-							"system.view_refreshes has no row for ca_drop_combined_search_result — " +
-								"check SELECT on system.view_refreshes and that the view exists",
+				const refreshedAfter = await tracedStep(
+					"refresh combined view",
+					// A few attempts, so a dropped connection to ClickHouse does
+					// not end the run before it starts. A missing privilege still
+					// surfaces inside half a minute.
+					{ retries: { limit: 2, delay: "10 seconds", backoff: "constant" } },
+					async () => {
+						const [before] = await chQuery<{ last_success: string }>(
+							this.env,
+							`SELECT ifNull(toUnixTimestamp(last_success_time), 0) AS last_success
+							 FROM system.view_refreshes
+							 WHERE view = 'ca_drop_combined_search_result'`,
 						);
-					}
-					await chQuery(
-						this.env,
-						"SYSTEM REFRESH VIEW default.ca_drop_combined_search_result",
-					);
-					return Number(before.last_success);
-				});
+						// No row here is a permissions or naming problem, not a slow
+						// refresh. Caught now it names itself; left to the poll below it
+						// spends 15 minutes retrying before saying anything.
+						if (!before) {
+							throw new Error(
+								"system.view_refreshes has no row for ca_drop_combined_search_result — " +
+									"check SELECT on system.view_refreshes and that the view exists",
+							);
+						}
+						await chQuery(
+							this.env,
+							"SYSTEM REFRESH VIEW default.ca_drop_combined_search_result",
+						);
+						return Number(before.last_success);
+					},
+				);
 
 				await tracedStep(
 					"await refresh",
@@ -213,17 +236,6 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			// ---------------------------------------------------------------
 			await notifyStep("scan", "running");
 
-			let cursor: Cursor = { type: "", value: "", offset: 0 };
-			let batch = 0;
-			let keysRead = 0;
-			let keysCompared = 0;
-			let rowsSeen = 0;
-			let matchesFound = 0;
-			let matchesLinked = 0;
-			let matchesInserted = 0;
-			let matchesStatusSet = 0;
-			let matchesSkippedEmpty = 0;
-			let lastMatchLog = "";
 
 			for (;;) {
 				batch += 1;
@@ -236,7 +248,15 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 				const result = await tracedStep(
 					`scan · batch ${batch}`,
-					{ timeout: "30 minutes", retries: { limit: 3, delay: "30 seconds", backoff: "linear" } },
+					{
+						timeout: "30 minutes",
+						// limit is RETRIES, not attempts: `attempt` is 1-indexed and
+						// is 2 on the first retry. So 4 here is 5 attempts in all.
+						// Each one re-reads the batch from ClickHouse and re-does
+						// its KV lookups, which is what covers a transient
+						// ClickHouse 5xx, a dropped socket or a Hyperdrive blip.
+						retries: { limit: 4, delay: "30 seconds", backoff: "linear" },
+					},
 					async () => this.runBatch(ctx, batch, cursor, {
 						batchSize,
 						rowScan,
@@ -287,11 +307,24 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			});
 			return summary;
 		} catch (e) {
-			// The tracer already logged whichever step threw; this records that
-			// the run as a whole is over, which a step-level log cannot say.
+			// The tracer logged the individual attempt that threw. This says the
+			// run as a whole is over and where it stopped, which a step-level
+			// log cannot — a batch that exhausted its retries otherwise leaves
+			// five identical step failures and nothing tying them together.
 			await logRun(this.env, ctx, "failed", {
 				error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
 				duration_ms: Date.now() - runStartedAt,
+				failedAtBatch: batch,
+				result: {
+					batches: batch,
+					keysRead,
+					keysCompared,
+					matchesFound,
+					matchesLinked,
+					matchRowsInserted: matchesInserted,
+					workItemsMarkedDeleted: matchesStatusSet,
+					matchesSkippedEmpty,
+				},
 			});
 			throw e;
 		}
@@ -433,7 +466,16 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				// handled, when the database has no record of it, is worse than
 				// no file — so the run fails here instead and the batch is
 				// retried from the cursor it has not yet moved.
-				throw new Error(
+				// NonRetryableError, so this fails on the first attempt rather
+				// than the fifth. Every reason incompleteReason() gives is a
+				// consistency problem between KV and Supabase -- a work item
+				// that is not there, a status that did not take -- and none of
+				// them resolve by asking again. Retrying would re-read the
+				// batch from ClickHouse and redo its KV lookups four more
+				// times, roughly fifteen minutes, to arrive at the same
+				// answer. Transient faults still get their five attempts:
+				// those throw before ever reaching here.
+				throw new NonRetryableError(
 					`batch ${batch}: found ${matchRows.length} DROP match(es) but did not record them — ${outcome.reason}`,
 				);
 			}
