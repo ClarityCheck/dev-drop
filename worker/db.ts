@@ -59,14 +59,25 @@ export type MatchRow = {
  */
 async function closeQuietly(sql: { end: (o?: { timeout?: number }) => Promise<void> } | undefined) {
 	if (!sql) return;
-	try {
-		await Promise.race([
-			sql.end({ timeout: 1 }),
-			new Promise<void>((resolve) => setTimeout(resolve, 3000)),
-		]);
-	} catch {
-		// a connection that never opened has nothing worth reporting on close
-	}
+
+	// .catch() goes on FIRST, before the race, and that ordering is the whole
+	// point. Promise.race does not cancel the loser: when the timer below wins,
+	// this function returns and its try/catch is finished, but end() is still
+	// pending. If it then rejects — "write CONNECTION_CLOSED", because the
+	// socket to Hyperdrive went away while it was closing — nothing is left
+	// handling it, and an unhandled rejection in a Worker does not warn, it
+	// tears down the invocation. The step dies with "Network connection lost"
+	// some distance from the query that actually ran, which is exactly as
+	// confusing as it sounds.
+	//
+	// Attaching the handler at creation makes the rejection handled whenever it
+	// arrives, raced or not.
+	const ending = sql.end({ timeout: 1 }).catch(() => {
+		// A connection that never opened, or one already gone, has nothing
+		// worth reporting on close. Hyperdrive owns the real connection.
+	});
+
+	await Promise.race([ending, new Promise<void>((resolve) => setTimeout(resolve, 3000))]);
 }
 
 /** Nothing in workerd enforces postgres.js's own connect_timeout, so a socket
