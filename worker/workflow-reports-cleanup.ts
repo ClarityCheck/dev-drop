@@ -17,6 +17,7 @@ import {
 } from "./logs";
 import type { MatchAlert, MatchOutcome } from "./logs";
 import { writeMatchLog } from "./audit";
+import { isSuppressedKey } from "./drop-suppression";
 
 /**
  * Cron C — match and erase  (workflow: drop-reports-cleanup)
@@ -252,6 +253,12 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 							const rows: Record<string, string>[] = [];
 							for (const k of listed.keys) {
+								// The gate's suppressed-search keys live in this namespace
+								// too. They are not DROP hashes and must not join the set
+								// the match runs against — and they are not missing
+								// metadata either, so they are skipped before that count.
+								if (isSuppressedKey(k.name)) continue;
+
 								const meta = k.metadata;
 								// Without a list_type there is nothing to match against,
 								// so the key is counted and left alone rather than guessed.

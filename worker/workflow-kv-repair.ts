@@ -1,7 +1,8 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { countWorkItems, pageWorkItems } from "./db";
+import { countWorkItems, pageSuppressedSearches, pageWorkItems } from "./db";
 import { logRun, tracer } from "./logs";
+import { suppressedKey } from "./drop-suppression";
 
 /**
  * KV repair  (workflow: drop-kv-repair)
@@ -134,12 +135,68 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 				);
 			}
 
-			console.log("KV repair finished:", summary);
+			// The suppressed-search keys live in the same namespace and are wiped
+			// by the same clearKv, so the repair has to put them back too. Their
+			// absence is not dangerous — the gate falls back to the DROP list
+			// alone, which is what it did before they existed — but every
+			// short-circuited search starts costing a credit again.
+			let suppressionsRestored = 0;
+			let suppressionCursor = "0";
+			let suppressionPage = 0;
+
+			for (;;) {
+				suppressionPage += 1;
+				if (suppressionPage > maxPages) {
+					throw new Error(
+						`suppressions: stopped after ${maxPages} pages — raise maxPages deliberately`,
+					);
+				}
+
+				const restored: { cursor: string; written: number; done: boolean } =
+					await tracedStep(`restore suppressions · page ${suppressionPage}`, async () => {
+						const rows = await pageSuppressedSearches(
+							this.env,
+							suppressionCursor,
+							pageSize,
+						);
+						if (rows.length === 0) {
+							return { cursor: suppressionCursor, written: 0, done: true };
+						}
+
+						let put = 0;
+						if (!dryRun) {
+							for (const r of rows) {
+								await this.env.kv.put(suppressedKey(r.hash), "suppressed", {
+									metadata: {
+										kind: "suppressed-report",
+										search_type: r.search_type,
+										restored_at: new Date().toISOString(),
+									},
+								});
+								put += 1;
+							}
+						}
+
+						return {
+							cursor: rows[rows.length - 1].id,
+							written: put,
+							done: rows.length < pageSize,
+						};
+					});
+
+				suppressionsRestored += restored.written;
+				suppressionCursor = restored.cursor;
+				if (restored.done) break;
+			}
+
+			const withSuppressions = { ...summary, suppressionsRestored };
+
+			console.log("KV repair finished:", withSuppressions);
 			await logRun(this.env, ctx, "completed", {
-				result: summary,
+				result: withSuppressions,
 				duration_ms: Date.now() - startedAt,
 			});
-			return summary;
+			return withSuppressions;
 		} catch (e) {
 			await logRun(this.env, ctx, "failed", {
 				error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),

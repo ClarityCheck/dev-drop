@@ -637,3 +637,95 @@ export async function sampleWorkItems(
 		await closeQuietly(sql);
 	}
 }
+
+/**
+ * A search whose report had to be suppressed although the searched value was
+ * not itself on the DROP list.
+ *
+ * `hash` is the same Base64 SHA-256 the real-time gate computes — DROP's
+ * normalization for the type, then the digest — so the gate can answer from
+ * this table with the hash it already has, and no plaintext is stored.
+ */
+export type SuppressedSearch = {
+	search_type: string;
+	hash: string;
+	matched: string[];
+	records_suppressed: number;
+	records_total: number;
+};
+
+/**
+ * Remember, or re-confirm, a suppressed search.
+ *
+ * Upsert rather than insert: the same value gets searched again, and the row
+ * is a finding about that value rather than an event log. A repeat bumps
+ * last_seen_at and times_seen, widens `matched` instead of replacing it — a
+ * later report can match on a family the first one did not — and clears
+ * cleared_at, because the finding applies again.
+ */
+export async function recordSuppressedSearch(
+	env: Env,
+	row: SuppressedSearch,
+): Promise<{ inserted: boolean; timesSeen: number }> {
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ times_seen: number; inserted: boolean }[]>`
+				INSERT INTO public.ca_drop_suppressed_search
+					(search_type, hash, matched, records_suppressed, records_total)
+				VALUES (
+					${row.search_type}, ${row.hash}, ${row.matched},
+					${row.records_suppressed}, ${row.records_total}
+				)
+				ON CONFLICT (search_type, hash) DO UPDATE
+				SET last_seen_at       = now(),
+				    times_seen         = public.ca_drop_suppressed_search.times_seen + 1,
+				    matched            = (
+				        SELECT array_agg(DISTINCT m ORDER BY m)
+				        FROM unnest(
+				            public.ca_drop_suppressed_search.matched || excluded.matched
+				        ) AS m
+				    ),
+				    records_suppressed = excluded.records_suppressed,
+				    records_total      = excluded.records_total,
+				    cleared_at         = NULL
+				RETURNING times_seen, (times_seen = 1) AS inserted
+			`,
+			20000,
+			"upsert ca_drop_suppressed_search",
+		);
+		return { inserted: r?.inserted ?? false, timesSeen: Number(r?.times_seen ?? 0) };
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * The suppressions still in force, oldest first.
+ *
+ * Paged by id rather than OFFSET so a rebuild that runs while rows are being
+ * added cannot skip one: the cursor is a row that exists.
+ */
+export async function pageSuppressedSearches(
+	env: Env,
+	afterId: string,
+	limit: number,
+): Promise<{ id: string; search_type: string; hash: string }[]> {
+	const sql = connect(env);
+	try {
+		return await withTimeout(
+			sql<{ id: string; search_type: string; hash: string }[]>`
+				SELECT id::text AS id, search_type, hash
+				FROM public.ca_drop_suppressed_search
+				WHERE cleared_at IS NULL
+				  AND id > ${afterId}::bigint
+				ORDER BY id
+				LIMIT ${limit}
+			`,
+			30000,
+			"page ca_drop_suppressed_search",
+		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}

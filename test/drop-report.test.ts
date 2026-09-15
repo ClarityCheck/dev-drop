@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { listedRecordsIn } from "../worker/drop-incident";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
+import { isSuppressedKey, suppressedKey } from "../worker/drop-suppression";
 import {
 	NO_FIELDS,
 	buildReportKeys,
@@ -756,6 +757,76 @@ describe("POST /api/drop/erase-incident", () => {
 		expect(status).toBe(422);
 		expect(json.runId).toBeUndefined();
 		expect(json.stage).toBeUndefined();
+	});
+});
+
+describe("the real-time gate and suppressed searches", () => {
+	async function gate(
+		body: unknown,
+	): Promise<{ status: number; json: Record<string, unknown> }> {
+		const response = await SELF.fetch("https://example.com/api/drop/check", {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+		return { status: response.status, json: (await response.json()) as Record<string, unknown> };
+	}
+
+	it("answers from the DROP list, and says so", async () => {
+		await env.kv.put(await sha256Base64("on.the.list@example.com"), "work-item-gate");
+
+		const { status, json } = await gate({
+			type: "email",
+			value: "On.The.List@Example.com",
+		});
+		expect(status).toBe(200);
+		expect(json).toMatchObject({ type: "email", listed: true, source: "drop" });
+	});
+
+	it("answers from a suppressed search, and distinguishes it from the DROP list", async () => {
+		// The value itself is NOT on the DROP list. Its report was suppressed
+		// because the aggregated data carried someone who is, so searching it
+		// again would spend a credit to rebuild a report that gets suppressed.
+		const hash = await sha256Base64("clean.subject@example.com");
+		await env.kv.put(suppressedKey(hash), "ndz");
+
+		const { status, json } = await gate({
+			type: "email",
+			value: "Clean.Subject@Example.com",
+		});
+		expect(status).toBe(200);
+		expect(json).toMatchObject({
+			type: "email",
+			listed: true,
+			source: "suppressed-report",
+		});
+	});
+
+	it("reports the DROP list when a value is in both", async () => {
+		// The statutory fact wins the label: `source` is what a caller acting on
+		// DROP membership reads, and a derived suppression must not be able to
+		// masquerade as it.
+		const hash = await sha256Base64("4155559317");
+		await env.kv.put(hash, "work-item-both");
+		await env.kv.put(suppressedKey(hash), "ndz");
+
+		const { json } = await gate({ type: "phone", value: "+1 (415) 555-9317" });
+		expect(json).toMatchObject({ listed: true, source: "drop" });
+	});
+
+	it("says nothing about a source when the value is not listed at all", async () => {
+		const { json } = await gate({ type: "email", value: "nobody.here@example.com" });
+		expect(json).toMatchObject({ type: "email", listed: false });
+		expect(json.source).toBeUndefined();
+	});
+
+	it("keeps a suppression key out of the DROP set", () => {
+		// Cron C lists this namespace and copies what it finds into
+		// ca_drop_work_items to match against. A suppression is not a DROP hash
+		// and joining that set would make the cron match against our own
+		// inference.
+		expect(isSuppressedKey(suppressedKey("abc="))).toBe(true);
+		expect(isSuppressedKey("abc=")).toBe(false);
+		expect(suppressedKey("abc=")).toBe("suppressed:abc=");
 	});
 });
 

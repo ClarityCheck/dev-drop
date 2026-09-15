@@ -8,6 +8,7 @@ import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
 import { IncidentFailed, recordEraseIncident } from "./drop-incident";
 import type { IncidentStage } from "./drop-incident";
+import { lookupGate, recordSuppression } from "./drop-suppression";
 import {
 	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
@@ -55,7 +56,7 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
 		// API: Start a new workflow instance
@@ -234,8 +235,12 @@ export default {
 			}
 
 			try {
-				const hit = await env.kv.get(hash);
-				return Response.json({ type, listed: hit !== null });
+				const { listed, source } = await lookupGate(env.kv, hash);
+				// `source` says which of the two answered. "drop" is California's
+				// list; "suppressed-report" is our own finding that a report for
+				// this value had to be suppressed even though the value itself is
+				// not listed. A caller acting on the statutory fact must read it.
+				return Response.json({ type, listed, ...(listed ? { source } : {}) });
 			} catch (e) {
 				return Response.json(
 					{
@@ -322,6 +327,37 @@ export default {
 
 			const { keysChecked, matched } = checked;
 			const [subjectMatched, ...recordMatched] = matched;
+
+			// The subject is clean but its report is not: the aggregated data
+			// carries a listed person, or a listed secondary contact detail. The
+			// value will be searched again, and without a record of this the funnel
+			// spends a credit and rebuilds a report that gets suppressed again.
+			//
+			// Only for e-mail and phone, because only those are DROP keys the gate
+			// can be asked about. A people search is a name, which /api/drop/check
+			// does not accept.
+			//
+			// waitUntil: the answer is what the caller is waiting for, and a cost
+			// optimisation must not delay it or be able to fail it.
+			if (
+				type !== "people" &&
+				!subjectMatched.length &&
+				matched.some((families) => families.length > 0)
+			) {
+				const { hash } = await dropKey(type, value as string);
+				const families = DROP_KEY_FAMILIES.filter((family) =>
+					recordMatched.some((f) => f.includes(family)),
+				);
+				ctx.waitUntil(
+					recordSuppression(env, {
+						searchType: type,
+						hash,
+						matched: families,
+						recordsSuppressed: recordMatched.filter((f) => f.length > 0).length,
+						recordsTotal: reportRecords.length,
+					}),
+				);
+			}
 
 			return Response.json({
 				type,
