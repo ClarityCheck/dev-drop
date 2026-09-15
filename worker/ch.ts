@@ -111,6 +111,33 @@ export async function countEntityRows(env: Env, keys: EntityKey[]): Promise<numb
 	return Number(r?.n ?? 0);
 }
 
+export type EntityPayload = { provider: string; service: string; payload_json: string };
+
+/**
+ * The stored payloads for these identifiers.
+ *
+ * No FINAL. entity_search_results is a ReplacingMergeTree, so an older version
+ * of a row can still be on disk and still readable until a merge collapses it.
+ * A verifier that asked for FINAL would be told about the version it wants to
+ * see rather than every version that exists — and an old copy still holding a
+ * DROP-listed person is exactly what has to fail the check.
+ */
+export async function fetchEntityPayloads(
+	env: Env,
+	keys: EntityKey[],
+	limit = 100,
+): Promise<EntityPayload[]> {
+	if (keys.length === 0) return [];
+	return chQuery<EntityPayload>(
+		env,
+		`SELECT provider, service, payload_json
+		 FROM default.entity_search_results
+		 WHERE ${ENTITY_MATCH}
+		 LIMIT {limit:UInt32}`,
+		{ pairs: JSON.stringify(keys.map((k) => [k.type, k.normalized_value])), limit },
+	);
+}
+
 export async function deleteEntityRows(
 	env: Env,
 	keys: EntityKey[],

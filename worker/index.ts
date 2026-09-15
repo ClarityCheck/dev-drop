@@ -47,8 +47,9 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  *     erases nothing. The caller filters before it persists, and Cron C
  *     sweeps what was stored before this check existed.
  * - POST /api/drop/erase-incident - the caller has already erased a cached
- *     report whose subject has since joined the DROP list. Confirms the
- *     match and the deletion, then leaves the trail Cron C would have:
+ *     report that has since joined the DROP list: every row for an e-mail
+ *     or phone, the matched array elements for a people report. Confirms
+ *     the match AND the erasure, then leaves the trail Cron C would have:
  *     match rows, alert, work item status, R2 evidence.
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
@@ -345,10 +346,14 @@ export default {
 		//   { type, value, normalizedValue, report, rowsDeleted? }
 		//
 		// The lookup API owns the write path for entity_search_results, so it
-		// owns the delete too — it has already erased the rows by the time this
+		// owns the delete too — it has already erased the data by the time this
 		// is called. What it cannot do is leave the trail: the match rows in
 		// Supabase, the work item status Cron B reports to California, the Better
 		// Stack alert and the R2 evidence file. That is what this does.
+		//
+		// `report` is the report AS IT MATCHED, before the erasure. It is what
+		// identifies which DROP work items were hit, so a caller that sends the
+		// already-cleaned version gets a 422 and nothing is recorded.
 		//
 		// normalizedValue is the caller's own normalized_value, the one it just
 		// deleted by. It is not re-derived here: the lookup API's normalization

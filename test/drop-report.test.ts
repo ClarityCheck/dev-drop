@@ -1,5 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
+import { listedRecordsIn } from "../worker/drop-incident";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import {
 	NO_FIELDS,
@@ -717,6 +718,31 @@ describe("POST /api/drop/erase-incident", () => {
 		expect(json.runId).toEqual(expect.any(String));
 	});
 
+	it("accepts a people report, where only some records were removed", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-people-incident");
+
+		// The row survives a people erasure — only the matched elements go — so
+		// a zero row count would be the wrong thing to require. This gets as far
+		// as reading the stored payload back, which the test runner cannot do,
+		// and so reports unverifiable rather than "you did not delete it".
+		const { status, json } = await incident({
+			type: "people",
+			value: "Anna Smith",
+			normalizedValue: "anna smith",
+			report: [
+				{
+					names: [{ first: "Anna", last: "Smith" }],
+					dateOfBirth: { start: "1980-01-01" },
+					addresses: [{ zipCode: "90210" }],
+				},
+			],
+		});
+
+		expect(status).toBe(503);
+		expect(json).toMatchObject({ type: "people", stage: "unverifiable" });
+		expect(json.detail).toContain("could not confirm the erasure");
+	});
+
 	it("confirms the match before it looks at ClickHouse at all", async () => {
 		// The unconfirmed case returns 422 without a runId, which is how you can
 		// tell nothing was attempted: no run was started, so nothing was logged
@@ -730,6 +756,68 @@ describe("POST /api/drop/erase-incident", () => {
 		expect(status).toBe(422);
 		expect(json.runId).toBeUndefined();
 		expect(json.stage).toBeUndefined();
+	});
+});
+
+describe("listedRecordsIn", () => {
+	const anna = {
+		names: [{ first: "Anna", last: "Smith" }],
+		dateOfBirth: { start: "1980-01-01" },
+		addresses: [{ zipCode: "90210" }],
+	};
+	const unrelated = {
+		names: [{ first: "Unrelated", last: "Person" }],
+		dateOfBirth: { start: "1970-02-02" },
+		addresses: [{ zipCode: "10001" }],
+	};
+
+	const payload = (persons: unknown[]) => [
+		{ label: "ELI_Snusbase_Pipl", payload_json: JSON.stringify(persons) },
+	];
+
+	it("counts nothing when the matched record is gone", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-verify");
+
+		expect(await listedRecordsIn(env.kv, payload([unrelated]))).toBe(0);
+	});
+
+	it("catches the caller removing the wrong element", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-verify");
+
+		// The row count after removing one of two elements is identical whichever
+		// one went, so only reading the contents can tell that the listed person
+		// is the one still there.
+		expect(await listedRecordsIn(env.kv, payload([anna]))).toBe(1);
+	});
+
+	it("counts each remaining listed record", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-verify");
+
+		expect(await listedRecordsIn(env.kv, payload([anna, unrelated, anna]))).toBe(2);
+	});
+
+	it("accepts an emptied array", async () => {
+		expect(await listedRecordsIn(env.kv, payload([]))).toBe(0);
+	});
+
+	it("refuses to pass a payload it cannot parse", async () => {
+		await expect(
+			listedRecordsIn(env.kv, [{ label: "broken", payload_json: "{not json" }]),
+		).rejects.toThrow("not valid JSON");
+	});
+
+	it("refuses to pass a payload too large to verify", async () => {
+		const persons = Array.from({ length: 40 }, () => ({
+			names: Array.from({ length: 12 }, (_, i) => ({ first: `f${i}`, last: `l${i}` })),
+			dateOfBirth: { start: "1980-01-01" },
+			addresses: Array.from({ length: 60 }, (_, i) => ({
+				zipCode: `1${String(i).padStart(4, "0")}`,
+			})),
+		}));
+
+		await expect(listedRecordsIn(env.kv, payload(persons))).rejects.toThrow(
+			"the erasure cannot be verified",
+		);
 	});
 });
 

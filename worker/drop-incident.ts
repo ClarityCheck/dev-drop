@@ -1,10 +1,17 @@
 import { writeMatchLog } from "./audit";
-import { countEntityRows } from "./ch";
+import { countEntityRows, fetchEntityPayloads } from "./ch";
 import type { EntityKey } from "./ch";
 import { incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
 import { logMatches, phaseTracer, renderMatchLog } from "./logs";
 import type { MatchAlert } from "./logs";
+import {
+	MAX_REPORT_KEYS,
+	buildReportKeys,
+	countReportKeys,
+	extractReportRecords,
+	lookupDropKeys,
+} from "./drop-report";
 import type { DropHit } from "./drop-report";
 
 export const INCIDENT_WORKFLOW = "drop-erase-incident";
@@ -26,8 +33,88 @@ export type IncidentResult = {
 	workItemsLinked: number;
 	workItemsMarked: number;
 	rowsRemaining: number;
+	recordsRemaining: number;
 	auditKey: string;
 };
+
+export type Erasure = { rowsRemaining: number; recordsRemaining: number };
+
+/**
+ * Confirm that the caller's erasure actually happened.
+ *
+ * The two report shapes are erased differently, so they are verified
+ * differently:
+ *
+ *   email / phone   the whole report is about one consumer, so every
+ *                   entity_search_results row for the identifier goes. The
+ *                   check is that the count is zero.
+ *
+ *   people          the report is an array of different people and only the
+ *                   matched elements go, so the ROW SURVIVES and a count of
+ *                   zero would be wrong. The check is on the contents: read
+ *                   the stored payload back and re-run the per-record DROP
+ *                   check over it. Nothing listed may remain.
+ *
+ * The people check is the stronger of the two. It verifies the state that
+ * matters rather than a row count, and it catches the caller removing the
+ * wrong element — which a count never could.
+ */
+export async function verifyErasure(env: Env, entity: EntityKey): Promise<Erasure> {
+	const rowsRemaining = await countEntityRows(env, [entity]);
+
+	if (entity.type !== "people") return { rowsRemaining, recordsRemaining: 0 };
+	if (rowsRemaining === 0) return { rowsRemaining, recordsRemaining: 0 };
+
+	const stored = await fetchEntityPayloads(env, [entity]);
+	const recordsRemaining = await listedRecordsIn(
+		env.kv,
+		stored.map((row) => ({ label: row.provider, payload_json: row.payload_json })),
+	);
+
+	return { rowsRemaining, recordsRemaining };
+}
+
+/**
+ * How many records across these stored payloads are still on the DROP list.
+ *
+ * Separate from verifyErasure and taking the payloads as an argument, because
+ * this is the part with the judgement in it: it decides whether a caller
+ * removed the right elements. A caller that deleted the wrong index leaves a
+ * listed record behind and a row count that looks exactly right.
+ */
+export async function listedRecordsIn(
+	kv: KVNamespace,
+	payloads: { label: string; payload_json: string }[],
+): Promise<number> {
+	let remaining = 0;
+
+	for (const row of payloads) {
+		let payload: unknown;
+		try {
+			payload = JSON.parse(row.payload_json);
+		} catch {
+			// A payload that cannot be parsed cannot be cleared either, and
+			// guessing would let an unverified row through.
+			throw new Error(`payload_json for ${row.label} is not valid JSON`);
+		}
+
+		const groups = extractReportRecords(payload).map((record) => record.fields);
+		const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
+		if (candidates === 0) continue;
+		if (candidates > MAX_REPORT_KEYS) {
+			throw new Error(
+				`stored payload for ${row.label} yields ${candidates} candidate keys, over the ` +
+					`${MAX_REPORT_KEYS} limit — the erasure cannot be verified`,
+			);
+		}
+
+		const keys = await Promise.all(groups.map(buildReportKeys));
+		const { matched } = await lookupDropKeys(kv, keys);
+		remaining += matched.filter((families) => families.length > 0).length;
+	}
+
+	return remaining;
+}
 
 export class IncidentFailed extends Error {
 	readonly stage: IncidentStage;
@@ -48,11 +135,15 @@ export class IncidentFailed extends Error {
  * and for reasons set out in workflow-reports-cleanup.ts. This endpoint covers
  * the case Cron C is too slow for: a cached report, stored when its subject was
  * not on the DROP list, whose subject is on today's list. The lookup API
- * notices on the next search, deletes the rows itself — it owns the write path,
+ * notices on the next search, erases the data itself — it owns the write path,
  * so it also owns the delete — and then calls this to leave the same trail Cron
  * C would have left.
  *
- * Nothing here touches ClickHouse except to count. The erase already happened.
+ * "Erases" means the whole row set for an e-mail or phone report, and only the
+ * matched array elements for a people report, whose other records are other
+ * people and stay. verifyErasure checks whichever of those was meant to happen.
+ *
+ * ClickHouse is only read here. The erasure already happened.
  *
  * TWO THINGS ARE CHECKED RATHER THAN BELIEVED
  *
@@ -84,31 +175,40 @@ export async function recordEraseIncident(
 	}));
 
 	let stage: IncidentStage = "unverifiable";
-	let rowsRemaining = 0;
+	let erasure: Erasure = { rowsRemaining: 0, recordsRemaining: 0 };
 
 	try {
-		// Not knowing the count and knowing it is non-zero mean different things.
-		// The first says the erasure cannot be confirmed; the second says it did
-		// not happen. Reporting the first as the second would tell a caller that
-		// did delete the rows to go and delete them again.
+		// Not knowing whether the erasure happened and knowing it did not are
+		// different things. The first says it cannot be confirmed; the second says
+		// it did not happen. Reporting the first as the second would tell a caller
+		// that did erase the data to go and erase it again.
 		try {
-			rowsRemaining = await phase("clickhouse: confirm the rows are gone", () =>
-				countEntityRows(env, [entity]),
+			erasure = await phase("clickhouse: confirm the erasure", () =>
+				verifyErasure(env, entity),
 			);
 		} catch (e) {
 			throw new IncidentFailed(
 				"unverifiable",
-				`could not read the row count from ClickHouse — ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
+				`could not confirm the erasure in ClickHouse — ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
 			);
 		}
 
 		stage = "verify";
-		if (rowsRemaining > 0) {
+		if (entity.type === "people") {
+			if (erasure.recordsRemaining > 0) {
+				throw new IncidentFailed(
+					"verify",
+					`${erasure.recordsRemaining} record(s) in the stored payload still match the DROP ` +
+						"list — remove them before recording the erasure",
+					{ ...erasure },
+				);
+			}
+		} else if (erasure.rowsRemaining > 0) {
 			throw new IncidentFailed(
 				"verify",
-				`${rowsRemaining} entity_search_results row(s) still exist for this identifier — ` +
+				`${erasure.rowsRemaining} entity_search_results row(s) still exist for this identifier — ` +
 					"delete them before recording the erasure",
-				{ rowsRemaining },
+				{ ...erasure },
 			);
 		}
 
@@ -155,7 +255,8 @@ export async function recordEraseIncident(
 			matchRowsInserted: written.inserted,
 			workItemsLinked: written.workItems,
 			workItemsMarked: statusSet,
-			rowsRemaining,
+			rowsRemaining: erasure.rowsRemaining,
+			recordsRemaining: erasure.recordsRemaining,
 			auditKey,
 		};
 	} catch (e) {
