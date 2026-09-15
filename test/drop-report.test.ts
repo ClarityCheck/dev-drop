@@ -1,6 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { sha256Base64 } from "../worker/drop-normalize";
+import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import {
 	buildReportKeys,
 	countReportKeys,
@@ -137,6 +137,139 @@ const CLICKHOUSE_COMBINED_VECTORS = [
 		namevin: "AaIOsyWbDu6Kj7/x9t7mk+Pqq3B57HzTJzxN30WtJ1U=",
 	},
 ];
+
+const PUBLISHED_SPEC_VECTORS: {
+	normalize: (raw: string) => string;
+	raw: string;
+	normalized: string;
+	hash: string;
+}[] = [
+	{
+		normalize: normalizeName,
+		raw: "Juan Pablo",
+		normalized: "juanpablo",
+		hash: "91hIbrbzNeqHs3o81O5yNrXUj7wDd2shvZ6THKi9qz8=",
+	},
+	{
+		normalize: normalizeName,
+		raw: "Martinez",
+		normalized: "martinez",
+		hash: "2wRPGbwBNxhShjRczx8GfS2c4cjvs4NJskeWloUNtp8=",
+	},
+	{
+		normalize: normalizeEmail,
+		raw: "Anna.Smith@Domain.com",
+		normalized: "anna.smith@domain.com",
+		hash: "KA18MT/ph6IHYjzT9zwETySDQyvSh87YuoSBpOQtkhE=",
+	},
+	{
+		normalize: normalizeEmail,
+		raw: "danielle.johnson12@example.com",
+		normalized: "danielle.johnson12@example.com",
+		hash: "mKDnDvwF2inxrKcK1hJN2TRkxPfL6kzNNTtU12eH8Bw=",
+	},
+	{
+		normalize: normalizePhone,
+		raw: "+1(415)555-9317",
+		normalized: "4155559317",
+		hash: "vGM7y5n+hBXRSEAklhHDPCbysyNgYTmXdMcagGUOY8E=",
+	},
+	{
+		normalize: normalizePhone,
+		raw: "+84(90)123 4567",
+		normalized: "4901234567",
+		hash: "ptzVkgbv9DonwvPCHmXmJ2SEOaolSh37z3ZzY/Gmm+U=",
+	},
+	{
+		normalize: normalizePhone,
+		raw: "+354(123)4567",
+		normalized: "3541234567",
+		hash: "Btrzydf5K6ALAKKXJGFHSx7u5bDzHC9WlVYtpq1n2rY=",
+	},
+	{
+		normalize: normalizePhone,
+		raw: "5551273811",
+		normalized: "5551273811",
+		hash: "jr/RAWYVN+ODBf2vRxwBASPwiO4x27OGI1y3IDhcwLo=",
+	},
+	{
+		normalize: normalizeDob,
+		raw: "1985-07-04",
+		normalized: "19850704",
+		hash: "IWi7qxOAbBJe0fNciDj76Eg84gmj40rB7aNMK/VnFOI=",
+	},
+	{
+		normalize: normalizeZip,
+		raw: "91790-3771",
+		normalized: "91790",
+		hash: "2FPZucR4x7U8KlM+SFAX4LPGhwNz/PIZUCSUdDh0o/s=",
+	},
+	{
+		normalize: normalizeZip,
+		raw: "M1B 1A1",
+		normalized: "m1b1a",
+		hash: "n8L9q8mVeT6Xt9/EeUNiTukGDrkbPJ3DvOEx14uElxk=",
+	},
+	{
+		normalize: normalizeZip,
+		raw: "00712345",
+		normalized: "71234",
+		hash: "aeNUYKh7Xw5sqpxSbSP9eOHsj6iXewbUyavv89DIuhQ=",
+	},
+	{
+		normalize: normalizeZip,
+		raw: "00300-9999",
+		normalized: "300",
+		hash: "mDvWFLta/s5as7YCP3EUfNe2vCMU+dJ690IlQcZVg4k=",
+	},
+	{
+		normalize: normalizeVin,
+		raw: "1HGCM82633A004352",
+		normalized: "1hgcm82633a004352",
+		hash: "iNswy1m+0VSt8jAfFrvaiQ1R/0HAbgSwNGkwqo6QBss=",
+	},
+];
+
+describe("published DROP specification examples", () => {
+	for (const vector of PUBLISHED_SPEC_VECTORS) {
+		it(`${JSON.stringify(vector.raw)} -> ${JSON.stringify(vector.normalized)}`, async () => {
+			expect(vector.normalize(vector.raw)).toBe(vector.normalized);
+			expect(await sha256Base64(vector.normalized)).toBe(vector.hash);
+		});
+	}
+
+	it("builds the published NDZ key for Danielle Johnson", async () => {
+		const keys = await buildReportKeys({
+			emails: [],
+			phones: [],
+			firstNames: [normalizeName("Danielle")],
+			lastNames: [normalizeName("Johnson")],
+			dobs: [normalizeDob("1985-07-04")],
+			zips: [normalizeZip("91790")],
+			vins: [],
+		});
+		expect(keys.ndz).toEqual(["PQOfn1RffEKmqMmNAzDKKaoZCwxWbQZkQzPWmQo9REA="]);
+	});
+
+	it("builds the published NameVIN key for Eve Genesis", async () => {
+		const keys = await buildReportKeys({
+			emails: [],
+			phones: [],
+			firstNames: [normalizeName("Eve")],
+			lastNames: [normalizeName("Genesis")],
+			dobs: [],
+			zips: [],
+			vins: [normalizeVin("1HGCM82633A004352")],
+		});
+		expect(keys.namevin).toEqual(["rtnDuXIe63jXYQQXW5r07GJ7lSsrib8+46QuKFwkOmk="]);
+	});
+
+	it("drops a date of birth that is not year-first, rather than mis-keying it", () => {
+		expect(normalizeDob("07/04/1985")).toBe("");
+		expect(normalizeDob("45")).toBe("");
+		expect(normalizeDob("1776-07-04")).toBe("");
+	});
+});
 
 describe("name normalization matches ca_drop_combined_search_result", () => {
 	for (const vector of CLICKHOUSE_NAME_VECTORS) {
