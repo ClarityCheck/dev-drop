@@ -1,6 +1,5 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { waitForEntityRows } from "../worker/drop-erase";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import {
 	NO_FIELDS,
@@ -514,46 +513,26 @@ describe("POST /api/drop/report-check", () => {
 		expect(json.keysChecked).toBe(1);
 	});
 
-	it("never reports success when the erase could not be completed", async () => {
+	it("flags the whole report, not a record, when the searched e-mail is listed", async () => {
 		await env.kv.put(await sha256Base64("listed.person@example.com"), "work-item-email");
 
-		// Supabase and ClickHouse are unreachable from the test runner, so the
-		// erase cannot get past its first stage. The answer must still say the
-		// match is real, and must not come back 200.
 		const { status, json } = await check({
 			type: "email",
 			value: "Listed.Person@Example.com",
 			report: { personalInfo: { firstName: "Listed" } },
-			waitMs: 0,
 		});
 
-		expect(status).toBe(500);
+		expect(status).toBe(200);
 		expect(json).toMatchObject({
 			type: "email",
 			listed: true,
 			subjectListed: true,
 			matched: ["email"],
-			error: "match found but not fully honoured",
-			stage: "record",
-			rowsErased: 0,
+			records: [{ index: 0, listed: false, matched: [] }],
 		});
-		expect(json.hint).toContain("do not serve this report");
-		expect(json.runId).toEqual(expect.any(String));
 	});
 
-	it("does not attempt an erase when nothing matched", async () => {
-		const { status, json } = await check({
-			type: "phone",
-			value: "+1 (415) 555-0000",
-			report: { personalInfo: { firstName: "Nobody" } },
-		});
-		expect(status).toBe(200);
-		expect(json).toMatchObject({ type: "phone", listed: false, subjectListed: false });
-		expect(json.erased).toBeUndefined();
-		expect(json.error).toBeUndefined();
-	});
-
-	it("detects a people match without erasing anything", async () => {
+	it("answers without writing to or erasing anything", async () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].namevin, "work-item-namevin");
 
 		const { status, json } = await check({
@@ -566,15 +545,18 @@ describe("POST /api/drop/report-check", () => {
 			],
 		});
 
+		// Supabase, ClickHouse and R2 are all unreachable from the test runner,
+		// so a 200 here is itself the assertion: the endpoint touched none of
+		// them. The caller filters before it persists.
 		expect(status).toBe(200);
 		expect(json).toMatchObject({
 			type: "people",
 			listed: true,
 			matched: ["namevin"],
-			erased: null,
 			records: [{ index: 0, listed: true, matched: ["namevin"] }],
 		});
-		expect(json.reason).toContain("not erased here");
+		expect(json.erased).toBeUndefined();
+		expect(json.error).toBeUndefined();
 	});
 
 	it("names only the matching record of a people report", async () => {
@@ -659,78 +641,6 @@ describe("POST /api/drop/report-check", () => {
 		});
 	});
 
-});
-
-describe("waitForEntityRows", () => {
-	it("returns as soon as the report lands", async () => {
-		let calls = 0;
-		const appeared = await waitForEntityRows(
-			async () => (++calls >= 3 ? 7 : 0),
-			5_000,
-			10,
-		);
-		expect(appeared).toMatchObject({ rows: 7, polls: 3 });
-	});
-
-	it("does not poll again once the row is there", async () => {
-		let calls = 0;
-		const appeared = await waitForEntityRows(
-			async () => {
-				calls += 1;
-				return 4;
-			},
-			5_000,
-			10,
-		);
-		expect(calls).toBe(1);
-		expect(appeared.rows).toBe(4);
-	});
-
-	it("gives up with zero rows once the deadline passes", async () => {
-		const appeared = await waitForEntityRows(async () => 0, 60, 20);
-		expect(appeared.rows).toBe(0);
-		expect(appeared.polls).toBeGreaterThan(1);
-		expect(appeared.waitedMs).toBeLessThan(1_000);
-	});
-
-	it("polls at least once even with no time to wait", async () => {
-		let calls = 0;
-		const appeared = await waitForEntityRows(
-			async () => {
-				calls += 1;
-				return 0;
-			},
-			0,
-			10,
-		);
-		expect(calls).toBe(1);
-		expect(appeared.rows).toBe(0);
-	});
-
-	it("tolerates a blip and still sees the row", async () => {
-		let calls = 0;
-		const appeared = await waitForEntityRows(
-			async () => {
-				calls += 1;
-				if (calls === 1) throw new Error("ClickHouse 502");
-				return 2;
-			},
-			5_000,
-			10,
-		);
-		expect(appeared.rows).toBe(2);
-		expect(appeared.polls).toBe(2);
-	});
-
-	it("throws when it never got a clean answer, rather than reporting no rows", async () => {
-		// An unreachable ClickHouse must not look like an absent row: one would
-		// leave the erase unconfirmed, the other would be read as nothing to do.
-		await expect(
-			waitForEntityRows(async () => {
-				throw new Error("ClickHouse unreachable");
-			}, 60, 20),
-		).rejects.toThrow("ClickHouse unreachable");
-	});
 });
 
 describe("lookupDropKeys", () => {

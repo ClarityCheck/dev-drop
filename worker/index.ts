@@ -7,17 +7,10 @@ export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
 import {
-	DEFAULT_WAIT_MS,
-	EraseFailed,
-	MAX_WAIT_MS,
-	eraseMatchedReport,
-} from "./drop-erase";
-import {
 	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
 	buildReportKeys,
 	countReportKeys,
-	entityNormalizedValue,
 	extractReportRecords,
 	isReportType,
 	lookupDropKeys,
@@ -36,12 +29,10 @@ import {
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
  * - POST /api/drop/check - is this e-mail or phone on the DROP list?
- * - POST /api/drop/report-check - does a whole report touch any DROP key?
- *     An e-mail or phone report that matches is erased BEFORE the answer
- *     returns — match rows, alert, wait for the row to land, ClickHouse
- *     delete, status, R2 evidence — so listed:true means the data is
- *     already gone and a history endpoint reading ClickHouse cannot still
- *     serve it. A people report is detected only; Cron C erases those.
+ * - POST /api/drop/report-check - does a whole report touch any DROP key,
+ *     and which of its records do? Answers only; it writes nothing and
+ *     erases nothing. The caller filters before it persists, and Cron C
+ *     sweeps what was stored before this check existed.
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -240,7 +231,7 @@ export default {
 		}
 
 		if (url.pathname === "/api/drop/report-check" && request.method === "POST") {
-			let body: { type?: unknown; value?: unknown; report?: unknown; waitMs?: unknown };
+			let body: { type?: unknown; value?: unknown; report?: unknown };
 			try {
 				body = (await request.json()) as typeof body;
 			} catch {
@@ -248,10 +239,6 @@ export default {
 			}
 
 			const { type, value, report } = body;
-			const waitMs =
-				typeof body.waitMs === "number" && Number.isFinite(body.waitMs)
-					? Math.min(MAX_WAIT_MS, Math.max(0, body.waitMs))
-					: DEFAULT_WAIT_MS;
 			if (!isReportType(type)) {
 				return Response.json(
 					{ error: 'type must be "email", "phone" or "people"' },
@@ -315,9 +302,10 @@ export default {
 				);
 			}
 
-			const { keysChecked, matched, hits } = checked;
+			const { keysChecked, matched } = checked;
 			const [subjectMatched, ...recordMatched] = matched;
-			const answer = {
+
+			return Response.json({
 				type,
 				listed: matched.some((families) => families.length > 0),
 				subjectListed: subjectMatched.length > 0,
@@ -331,47 +319,7 @@ export default {
 					listed: recordMatched[i].length > 0,
 					matched: recordMatched[i],
 				})),
-			};
-
-			if (!answer.listed) return Response.json(answer);
-
-			if (type === "people") {
-				return Response.json({
-					...answer,
-					erased: null,
-					reason:
-						"people reports are detected but not erased here — Cron C handles them, " +
-						"and partial removal of matched array elements is not implemented yet",
-				});
-			}
-
-			const runId = crypto.randomUUID();
-			const entity = {
-				type,
-				normalized_value: entityNormalizedValue(type, value as string),
-			};
-
-			try {
-				const erased = await eraseMatchedReport(env, runId, entity, hits, waitMs);
-				return Response.json({ ...answer, runId, erased });
-			} catch (e) {
-				const stage = e instanceof EraseFailed ? e.stage : "unknown";
-				const rowsErased = e instanceof EraseFailed ? e.rowsErased : 0;
-				return Response.json(
-					{
-						...answer,
-						runId,
-						error: "match found but not fully honoured",
-						stage,
-						rowsErased,
-						detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-						hint:
-							"the match is real — do not serve this report. Re-POST to retry, or let " +
-							"Cron C finish it",
-					},
-					{ status: 500 },
-				);
-			}
+			});
 		}
 
 		// Is the DROP set in KV still complete?

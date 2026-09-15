@@ -94,17 +94,6 @@ const ENTITY_MATCH = `(type, normalized_value) IN (
  * this returns only once the data is actually gone — and the caller can check
  * `after` rather than take the ALTER's word for it.
  */
-/** How many entity_search_results rows these identifiers still have. */
-export async function countEntityRows(env: Env, keys: EntityKey[]): Promise<number> {
-	if (keys.length === 0) return 0;
-	const [r] = await chQuery<{ n: string }>(
-		env,
-		`SELECT count() AS n FROM default.entity_search_results WHERE ${ENTITY_MATCH}`,
-		{ pairs: JSON.stringify(keys.map((k) => [k.type, k.normalized_value])) },
-	);
-	return Number(r?.n ?? 0);
-}
-
 export async function deleteEntityRows(
 	env: Env,
 	keys: EntityKey[],
@@ -112,7 +101,14 @@ export async function deleteEntityRows(
 	if (keys.length === 0) return { before: 0, after: 0 };
 
 	const pairs = JSON.stringify(keys.map((k) => [k.type, k.normalized_value]));
-	const count = () => countEntityRows(env, keys);
+	const count = async () => {
+		const [r] = await chQuery<{ n: string }>(
+			env,
+			`SELECT count() AS n FROM default.entity_search_results WHERE ${ENTITY_MATCH}`,
+			{ pairs },
+		);
+		return Number(r?.n ?? 0);
+	};
 
 	const before = await count();
 	if (before === 0) return { before: 0, after: 0 };
