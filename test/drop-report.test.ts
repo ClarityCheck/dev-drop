@@ -4,9 +4,12 @@ import { listedRecordsIn } from "../worker/drop-incident";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import { isSuppressedKey, suppressedKey } from "../worker/drop-suppression";
 import {
+	FIELD_CAPS,
 	NO_FIELDS,
+	boundReportFields,
 	buildReportKeys,
 	countReportKeys,
+	exactFieldsOnly,
 	extractReportRecords,
 	lookupDropKeys,
 	normalizeDob,
@@ -480,22 +483,70 @@ describe("POST /api/drop/report-check", () => {
 		expect(json.reason).toBe("no DROP key could be derived from the report");
 	});
 
-	it("refuses to answer when the report yields too many combinations", async () => {
-		const zips = Array.from({ length: 60 }, (_, i) => ({
-			zipCode: `1${String(i).padStart(4, "0")}`,
-		}));
-		const person = {
-			names: Array.from({ length: 12 }, (_, i) => ({ first: `first${i}`, last: `last${i}` })),
+	it("answers a pathological report by capping it, not by refusing", async () => {
+		// Measured on DEV, one aggregated email row reaches 33,202,400 candidate
+		// keys: 82 first names, 71 last names, 230 birthDates, 140 ZIPs, all
+		// multiplied together. Refusing meant that subject's lookup failed with a
+		// 503 every time, permanently. The factors are capped instead.
+		const many = (n: number, prefix: string) =>
+			Array.from({ length: n }, (_, i) => `${prefix}${i}`);
+
+		const { status, json } = await check({
+			type: "email",
+			value: "noisy.aggregate@example.com",
+			report: {
+				personalInfo: {
+					firstNames: many(82, "first"),
+					lastNames: many(71, "last"),
+					birthDates: many(230, "1980010").map((_, i) => `19800${String(i % 900).padStart(3, "0")}`),
+				},
+				contactInfo: {
+					fullAddresses: many(140, "").map((_, i) => ({
+						zip: `1${String(i).padStart(4, "0")}`,
+					})),
+				},
+			},
+		});
+
+		expect(status).toBe(200);
+		expect(json).toMatchObject({ type: "email", listed: false, partial: true });
+		expect(json.capped).toEqual(
+			expect.arrayContaining(["dobs", "firstNames", "lastNames", "zips"]),
+		);
+		// Capped, so bounded — and the cap is the product of FIELD_CAPS.
+		expect(json.keysChecked as number).toBeLessThanOrEqual(10 * 10 * 5 * 24 + 1);
+	});
+
+	it("still checks every exact key when the product has to be dropped", async () => {
+		// Many records, each within its own caps, still over the total. The
+		// composite inference goes; the e-mail and phone keys cost one each and
+		// are the half worth keeping, so they are checked in full.
+		const listed = await sha256Base64("buried.listed@example.com");
+		await env.kv.put(listed, "work-item-buried");
+
+		const person = (i: number) => ({
+			names: Array.from({ length: 10 }, (_, n) => ({ first: `f${n}`, last: `l${n}` })),
 			dateOfBirth: { start: "1980-01-01" },
-			addresses: zips,
-		};
+			addresses: Array.from({ length: 24 }, (_, z) => ({
+				zipCode: `1${String(z).padStart(4, "0")}`,
+			})),
+			emails: [{ address: i === 40 ? "Buried.Listed@Example.com" : `p${i}@example.com` }],
+		});
+
 		const { status, json } = await check({
 			type: "people",
-			report: Array.from({ length: 4 }, () => person),
+			report: Array.from({ length: 60 }, (_, i) => person(i)),
 		});
-		expect(status).toBe(503);
-		expect(json.error).toBe("check did not run");
-		expect(json.hint).toBe("treat as unknown, not as not-listed");
+
+		expect(status).toBe(200);
+		expect(json).toMatchObject({
+			type: "people",
+			listed: true,
+			matched: ["email"],
+			partial: true,
+			exactKeysOnly: true,
+		});
+		expect((json.records as { index: number; listed: boolean }[])[40].listed).toBe(true);
 	});
 
 	it("answers false for a report that touches no DROP key", async () => {
@@ -922,6 +973,70 @@ describe("the real-time gate and suppressed searches", () => {
 		expect(isSuppressedKey(suppressedKey("abc="))).toBe(true);
 		expect(isSuppressedKey("abc=")).toBe(false);
 		expect(suppressedKey("abc=")).toBe("suppressed:abc=");
+	});
+});
+
+describe("boundReportFields", () => {
+	const fields = (over: Partial<Record<string, string[]>>) => ({
+		emails: [],
+		phones: [],
+		firstNames: [],
+		lastNames: [],
+		dobs: [],
+		zips: [],
+		vins: [],
+		...over,
+	});
+
+	const many = (n: number, prefix: string) =>
+		Array.from({ length: n }, (_, i) => `${prefix}${String(i).padStart(4, "0")}`);
+
+	it("leaves a normal report untouched", () => {
+		const input = fields({ firstNames: ["anna"], lastNames: ["smith"], zips: ["90210"] });
+		const { fields: out, capped } = boundReportFields(input);
+		expect(capped).toEqual([]);
+		expect(out).toEqual(input);
+	});
+
+	it("reduces deterministically, so the same report yields the same keys", () => {
+		const input = fields({ firstNames: many(50, "n") });
+		const first = boundReportFields(input).fields.firstNames;
+		const shuffled = fields({ firstNames: [...many(50, "n")].reverse() });
+		expect(boundReportFields(shuffled).fields.firstNames).toEqual(first);
+		expect(first).toHaveLength(FIELD_CAPS.firstNames);
+	});
+
+	it("never caps the exact keys, however many there are", () => {
+		const input = fields({ emails: many(500, "e"), phones: many(500, "p") });
+		const { fields: out, capped } = boundReportFields(input);
+		expect(out.emails).toHaveLength(500);
+		expect(out.phones).toHaveLength(500);
+		expect(capped).toEqual([]);
+	});
+
+	it("bounds the cross product to something a Worker can run", () => {
+		const { fields: out } = boundReportFields(
+			fields({
+				firstNames: many(82, "f"),
+				lastNames: many(71, "l"),
+				dobs: many(230, "19800101").map((_, i) => `1980${String(i % 900).padStart(4, "0")}`),
+				zips: many(140, "z"),
+				vins: many(40, "v"),
+			}),
+		);
+		expect(countReportKeys(out)).toBeLessThanOrEqual(
+			FIELD_CAPS.firstNames * FIELD_CAPS.lastNames * FIELD_CAPS.dobs * FIELD_CAPS.zips +
+				FIELD_CAPS.firstNames * FIELD_CAPS.lastNames * FIELD_CAPS.vins,
+		);
+	});
+
+	it("keeps only the exact keys when asked", () => {
+		const out = exactFieldsOnly(
+			fields({ emails: ["a@b.com"], phones: ["4155559317"], firstNames: ["anna"], zips: ["90210"] }),
+		);
+		expect(out).toMatchObject({ emails: ["a@b.com"], phones: ["4155559317"] });
+		expect(out.firstNames).toEqual([]);
+		expect(out.zips).toEqual([]);
 	});
 });
 

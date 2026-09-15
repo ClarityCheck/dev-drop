@@ -8,12 +8,14 @@ import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
 import { IncidentFailed, recordEraseIncident, recordMatchFound } from "./drop-incident";
 import type { IncidentStage } from "./drop-incident";
-import { lookupGate, recordSuppression } from "./drop-suppression";
+import { clearSuppression, lookupGate, recordSuppression } from "./drop-suppression";
 import {
 	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
+	boundReportFields,
 	buildReportKeys,
 	countReportKeys,
+	exactFieldsOnly,
 	extractReportRecords,
 	isReportType,
 	lookupDropKeys,
@@ -70,20 +72,18 @@ async function confirmIncidentMatch(
 	}
 
 	const subject = subjectFields(type, typeof value === "string" ? value : undefined);
-	const groups = [
+	const bounded = [
 		subject,
 		...extractReportRecords(report).map((record) => record.fields),
-	];
+	].map(boundReportFields);
 
-	const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
-	if (candidates > MAX_REPORT_KEYS) {
-		return bad(
-			{
-				error: "match could not be confirmed",
-				detail: `report yields ${candidates} candidate keys, over the ${MAX_REPORT_KEYS} limit`,
-			},
-			503,
-		);
+	// Bounded the same way report-check bounds it, and for a sharper reason
+	// here: refusing a pathological report would mean an erasure that ALREADY
+	// HAPPENED could never be recorded. A subset of the hits is worth having;
+	// nothing is not. The exact e-mail and phone keys are never capped.
+	let groups = bounded.map((b) => b.fields);
+	if (groups.reduce((total, g) => total + countReportKeys(g), 0) > MAX_REPORT_KEYS) {
+		groups = groups.map(exactFieldsOnly);
 	}
 
 	let hits: Awaited<ReturnType<typeof lookupDropKeys>>["hits"];
@@ -382,8 +382,28 @@ export default {
 
 			const subject = subjectFields(type, typeof value === "string" ? value : undefined);
 			const reportRecords = extractReportRecords(report);
-			const groups = [subject, ...reportRecords.map((record) => record.fields)];
 
+			// Bound the cross product before counting it. An aggregated email
+			// payload can reach tens of millions of combinations, and refusing it
+			// meant that subject's lookup failed forever — so the factors are
+			// capped and the report says which ones were.
+			const bounded = [subject, ...reportRecords.map((record) => record.fields)].map(
+				boundReportFields,
+			);
+			const capped = [...new Set(bounded.flatMap((b) => b.capped))].sort();
+			let groups = bounded.map((b) => b.fields);
+
+			// Still too big — many records, each individually within its caps. Drop
+			// the inferred keys and check the exact ones, which cost one key each
+			// and are the half worth keeping. Never answer "not listed" on the
+			// strength of a check that did not run.
+			let exactOnly = false;
+			if (groups.reduce((total, g) => total + countReportKeys(g), 0) > MAX_REPORT_KEYS) {
+				groups = groups.map(exactFieldsOnly);
+				exactOnly = true;
+			}
+
+			const partial = capped.length > 0 || exactOnly;
 			const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
 			if (candidates === 0) {
 				return Response.json({
@@ -443,11 +463,17 @@ export default {
 			// caller is waiting for, and a cost optimisation must not delay it, or
 			// be able to fail it. Hashing and both writes happen after the response
 			// has gone out.
-			if (
-				type !== "people" &&
-				!subjectMatched.length &&
-				matched.some((families) => families.length > 0)
-			) {
+			const reportListed = matched.some((families) => families.length > 0);
+
+			// The mirror of recording it. A value whose report used to carry a
+			// listed person and no longer does must stop being short-circuited, or
+			// a consumer DROP has released stays suppressed until the key expires.
+			// A partial check is not evidence of clean, so it never clears.
+			if (type !== "people" && !reportListed && !partial) {
+				ctx.waitUntil(clearSuppression(env, type, value as string));
+			}
+
+			if (type !== "people" && !subjectMatched.length && reportListed) {
 				ctx.waitUntil(
 					recordSuppression(env, {
 						searchType: type,
@@ -475,6 +501,17 @@ export default {
 					listed: recordMatched[i].length > 0,
 					matched: recordMatched[i],
 				})),
+				// The inferred half of the check was reduced to keep it runnable.
+				// The exact e-mail and phone keys were still checked in full, so a
+				// match here is as trustworthy as any; a MISS is weaker evidence
+				// than usual and `partial` is how a caller knows.
+				...(partial
+					? {
+							partial: true,
+							...(capped.length > 0 ? { capped } : {}),
+							...(exactOnly ? { exactKeysOnly: true } : {}),
+						}
+					: {}),
 			});
 		}
 

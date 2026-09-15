@@ -2,7 +2,7 @@ import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { countWorkItems, pageSuppressedSearches, pageWorkItems } from "./db";
 import { logRun, tracer } from "./logs";
-import { suppressedKey } from "./drop-suppression";
+import { SUPPRESSION_TTL_SECONDS, suppressedKey } from "./drop-suppression";
 
 /**
  * KV repair  (workflow: drop-kv-repair)
@@ -167,6 +167,10 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 						if (!dryRun) {
 							for (const r of rows) {
 								await this.env.kv.put(suppressedKey(r.hash), "suppressed", {
+									// Restored with the same expiry it had, so a repair cannot
+									// turn a finding that was due to be re-checked into one
+									// that lives forever.
+									expirationTtl: SUPPRESSION_TTL_SECONDS,
 									metadata: {
 										kind: "suppressed-report",
 										search_type: r.search_type,

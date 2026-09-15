@@ -1,4 +1,4 @@
-import { recordSuppressedSearch } from "./db";
+import { clearSuppressedSearch, recordSuppressedSearch } from "./db";
 import { dropKey } from "./drop-normalize";
 import type { DropListType } from "./drop-normalize";
 import { logRun } from "./logs";
@@ -33,6 +33,22 @@ import type { DropKeyFamily } from "./drop-report";
  * answered from.
  */
 export const SUPPRESSED_PREFIX = "suppressed:";
+
+/**
+ * How long a suppression stays on the fast path before it has to be re-earned.
+ *
+ * A finding about a report is not permanent the way DROP membership is. The
+ * report can change, and DROP can revoke the work item that caused it — its
+ * removal list does exactly that. Without an expiry the gate would answer
+ * listed: true for that value forever, on evidence nobody ever re-checks,
+ * because a short-circuited search never reaches the check that would notice.
+ *
+ * So the key expires. On the next search after that, the funnel runs once, the
+ * report is checked properly, and the finding is either re-recorded or cleared.
+ * Thirty days is the cost of one wasted lookup per value per month against a
+ * suppression that can never be wrong for longer than that.
+ */
+export const SUPPRESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 export function suppressedKey(hash: string): string {
 	return `${SUPPRESSED_PREFIX}${hash}`;
@@ -129,6 +145,7 @@ export async function recordSuppression(env: Env, s: Suppression): Promise<boole
 		// No list_type in the metadata, and a prefixed name, so Cron C's pass over
 		// the namespace cannot read this as a DROP hash.
 		await env.kv.put(suppressedKey(hash), s.matched.join(",") || "suppressed", {
+			expirationTtl: SUPPRESSION_TTL_SECONDS,
 			metadata: {
 				kind: "suppressed-report",
 				search_type: s.searchType,
@@ -144,4 +161,38 @@ export async function recordSuppression(env: Env, s: Suppression): Promise<boole
 	}
 
 	return true;
+}
+
+/**
+ * A later report for this value came back clean, so the suppression no longer
+ * applies: stamp the row and take the key off the fast path.
+ *
+ * This is the other half of the expiry. The TTL guarantees a suppression is
+ * re-checked eventually; this acts on the re-check when it happens, so a
+ * consumer DROP has released stops being suppressed at the first search rather
+ * than at the end of the window.
+ *
+ * Best effort, for the same reason as recording: it can only ever cost one
+ * wasted lookup.
+ */
+export async function clearSuppression(
+	env: Env,
+	searchType: DropListType,
+	value: string,
+): Promise<boolean> {
+	const ctx = { workflow: "drop-suppressed-search", run_id: searchType };
+
+	try {
+		const { hash } = await dropKey(searchType, value);
+
+		// KV first. It is what the gate reads, so clearing it is what actually
+		// stops the short-circuit; the row is bookkeeping.
+		await env.kv.delete(suppressedKey(hash));
+		return await clearSuppressedSearch(env, searchType, hash);
+	} catch (e) {
+		await logRun(env, ctx, "failed", {
+			error: `clear: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
+		});
+		return false;
+	}
 }

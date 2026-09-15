@@ -1,7 +1,7 @@
 import { writeMatchLog } from "./audit";
 import { countEntityRows, fetchEntityPayloads } from "./ch";
 import type { EntityKey } from "./ch";
-import { incompleteReason, markMatchesDeleted, recordMatches } from "./db";
+import { incompleteReason, recordMatches } from "./db";
 import type { MatchRow } from "./db";
 import { logMatches, phaseTracer, renderMatchLog } from "./logs";
 import type { MatchAlert } from "./logs";
@@ -18,12 +18,14 @@ export const INCIDENT_WORKFLOW = "drop-erase-incident";
 
 const BATCH = 1;
 
+/** Rows whose payload verifyErasure will read back. Beyond this it refuses. */
+const PAYLOAD_LIMIT = 100;
+
 export const INCIDENT_STAGES = [
 	"unverifiable",
 	"verify",
 	"record",
 	"alert",
-	"status",
 	"audit",
 ] as const;
 export type IncidentStage = (typeof INCIDENT_STAGES)[number];
@@ -31,9 +33,10 @@ export type IncidentStage = (typeof INCIDENT_STAGES)[number];
 export type IncidentResult = {
 	matchRowsInserted: number;
 	workItemsLinked: number;
-	workItemsMarked: number;
 	rowsRemaining: number;
 	recordsRemaining: number;
+	/** work items whose status only a full Cron C sweep can truthfully set */
+	statusLeftToCronC: number;
 	auditKey: string;
 };
 
@@ -65,7 +68,19 @@ export async function verifyErasure(env: Env, entity: EntityKey): Promise<Erasur
 	if (entity.type !== "people") return { rowsRemaining, recordsRemaining: 0 };
 	if (rowsRemaining === 0) return { rowsRemaining, recordsRemaining: 0 };
 
-	const stored = await fetchEntityPayloads(env, [entity]);
+	// A people identifier has one provider row today, so the fetch limit is
+	// never reached in practice. But "never in practice" is not a verification:
+	// reading the first PAYLOAD_LIMIT rows and reporting recordsRemaining: 0
+	// would be a measurement of a subset presented as a measurement of the
+	// whole. Anything past the limit is unverifiable, and says so.
+	if (rowsRemaining > PAYLOAD_LIMIT) {
+		throw new Error(
+			`${rowsRemaining} rows hold this identifier, over the ${PAYLOAD_LIMIT} this can read — ` +
+				"the erasure cannot be verified by reading the payloads back",
+		);
+	}
+
+	const stored = await fetchEntityPayloads(env, [entity], PAYLOAD_LIMIT);
 	const recordsRemaining = await listedRecordsIn(
 		env.kv,
 		stored.map((row) => ({ label: row.provider, payload_json: row.payload_json })),
@@ -147,17 +162,18 @@ export type MatchFoundResult = {
  *
  *   recordMatchFound     the match row, and the alert   -- BEFORE the erase
  *   (the caller erases)
- *   recordEraseIncident  verify, then status, then R2   -- AFTER the erase
+ *   recordEraseIncident  verify it happened, then the R2 evidence -- AFTER
  *
  * The two writes are different claims and that is why they sit on opposite
  * sides of the erase. A match row says "this consumer was in our data", which
- * is true the moment the match is found and stays true afterwards. The status
- * says "their data is gone", which Cron B reports to California as code 3
- * Deleted, and which is a false statement until the erase has happened.
+ * is true the moment the match is found and stays true afterwards. The evidence
+ * file says the erasure is durable, which is a false statement until it is.
+ *
+ * Neither half sets the work item status -- see recordEraseIncident for why a
+ * single report is not enough to make that claim.
  *
  * Calling this and then failing to erase is recoverable: the match row is
- * there, the status is not set, and Cron C finds the rows on its next pass
- * because they still exist. Erasing without calling this is NOT recoverable --
+ * there and Cron C finds the rows on its next pass because they still exist. Erasing without calling this is NOT recoverable --
  * the rows are gone, so the view has nothing to match, and the only record
  * that the consumer was ever in the data is the one that was never written.
  */
@@ -313,18 +329,27 @@ export async function recordEraseIncident(
 			logMatches(env, ctx, BATCH, alerts, { ok: true }),
 		);
 
-		stage = "status";
-		const statusSet = await phase("supabase: set status deleted", () =>
-			markMatchesDeleted(env, written.workItemIds),
-		);
-		if (statusSet < written.workItems) {
-			const why =
-				`${written.workItems - statusSet} of ${written.workItems} work item(s) did not end up ` +
-				"with status = 'deleted'";
-			await logMatches(env, ctx, BATCH, alerts, { ok: false, reason: why });
-			throw new IncidentFailed("status", why);
-		}
-
+		// NO STATUS IS SET HERE, deliberately.
+		//
+		// status = 'deleted' is on the WORK ITEM, and Cron B reports it to
+		// California as code 3 Deleted — a statement about the consumer, not
+		// about one report. This path erased the rows for exactly one
+		// normalized_value. An ndz work item stands for a person, and the same
+		// person can appear under dozens of other cached e-mail addresses and
+		// phone numbers that this call did not touch. Marking the item deleted
+		// would tell a regulator the consumer is gone while most of their data
+		// is still there.
+		//
+		// Cron C can mark it because it sweeps every match in one run, so by the
+		// time it writes the status there is nothing left for that work item.
+		// This path cannot make that claim and does not try. It writes the match
+		// row, which is true and is the thing that must not be lost, and leaves
+		// the status to the sweep.
+		//
+		// The cost is that Cron B under-reports until the next Cron C run —
+		// code 5 Not found for a consumer whose data is partly gone. That is
+		// wrong in the recoverable direction, and the match row is what makes it
+		// recoverable.
 		stage = "audit";
 		const auditKey = await phase("r2: evidence file", () =>
 			writeMatchLog(env, {
@@ -337,9 +362,9 @@ export async function recordEraseIncident(
 		return {
 			matchRowsInserted: written.inserted,
 			workItemsLinked: written.workItems,
-			workItemsMarked: statusSet,
 			rowsRemaining: erasure.rowsRemaining,
 			recordsRemaining: erasure.recordsRemaining,
+			statusLeftToCronC: written.workItems,
 			auditKey,
 		};
 	} catch (e) {

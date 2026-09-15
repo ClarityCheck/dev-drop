@@ -729,3 +729,36 @@ export async function pageSuppressedSearches(
 		await closeQuietly(sql);
 	}
 }
+
+/**
+ * Mark a suppression as no longer applying.
+ *
+ * Called when a later report for the same value comes back clean: the consumer
+ * came off the DROP list, or the provider data that carried them has changed.
+ * The row is kept and stamped rather than deleted, so the history of a
+ * suppression survives and kv-repair stops restoring it.
+ */
+export async function clearSuppressedSearch(
+	env: Env,
+	searchType: string,
+	hash: string,
+): Promise<boolean> {
+	const sql = connect(env);
+	try {
+		const rows = await withTimeout(
+			sql<{ id: string }[]>`
+				UPDATE public.ca_drop_suppressed_search
+				SET cleared_at = now()
+				WHERE search_type = ${searchType}
+				  AND hash = ${hash}
+				  AND cleared_at IS NULL
+				RETURNING id::text AS id
+			`,
+			20000,
+			"clear ca_drop_suppressed_search",
+		);
+		return rows.length > 0;
+	} finally {
+		await closeQuietly(sql);
+	}
+}
