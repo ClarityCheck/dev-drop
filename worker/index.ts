@@ -6,6 +6,8 @@ export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
+import { IncidentFailed, recordEraseIncident } from "./drop-incident";
+import type { IncidentStage } from "./drop-incident";
 import {
 	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
@@ -16,6 +18,17 @@ import {
 	lookupDropKeys,
 	subjectFields,
 } from "./drop-report";
+
+const INCIDENT_STATUS: Partial<Record<IncidentStage | "unknown", number>> = {
+	unverifiable: 503,
+	verify: 409,
+};
+
+const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { default: string } = {
+	unverifiable: "nothing was recorded — retry once ClickHouse answers",
+	verify: "delete the rows first, then call again",
+	default: "the rows are gone but the trail is incomplete — retry, or let Cron C record it",
+};
 
 /**
  * Main Worker fetch handler
@@ -33,6 +46,10 @@ import {
  *     and which of its records do? Answers only; it writes nothing and
  *     erases nothing. The caller filters before it persists, and Cron C
  *     sweeps what was stored before this check existed.
+ * - POST /api/drop/erase-incident - the caller has already erased a cached
+ *     report whose subject has since joined the DROP list. Confirms the
+ *     match and the deletion, then leaves the trail Cron C would have:
+ *     match rows, alert, work item status, R2 evidence.
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -320,6 +337,120 @@ export default {
 					matched: recordMatched[i],
 				})),
 			});
+		}
+
+		// A cached report whose subject has since joined the DROP list.
+		//
+		//   POST /api/drop/erase-incident
+		//   { type, value, normalizedValue, report, rowsDeleted? }
+		//
+		// The lookup API owns the write path for entity_search_results, so it
+		// owns the delete too — it has already erased the rows by the time this
+		// is called. What it cannot do is leave the trail: the match rows in
+		// Supabase, the work item status Cron B reports to California, the Better
+		// Stack alert and the R2 evidence file. That is what this does.
+		//
+		// normalizedValue is the caller's own normalized_value, the one it just
+		// deleted by. It is not re-derived here: the lookup API's normalization
+		// and DROP's are different (normalize-value.ts keeps every digit of a
+		// phone, DROP keeps the last ten), and the value that addresses the rows
+		// has to be the one that addressed them for the delete.
+		if (url.pathname === "/api/drop/erase-incident" && request.method === "POST") {
+			let body: {
+				type?: unknown;
+				value?: unknown;
+				normalizedValue?: unknown;
+				report?: unknown;
+				rowsDeleted?: unknown;
+			};
+			try {
+				body = (await request.json()) as typeof body;
+			} catch {
+				return Response.json({ error: "body must be JSON" }, { status: 400 });
+			}
+
+			const { type, value, normalizedValue, report } = body;
+			if (!isReportType(type)) {
+				return Response.json(
+					{ error: 'type must be "email", "phone" or "people"' },
+					{ status: 400 },
+				);
+			}
+			if (typeof normalizedValue !== "string" || normalizedValue.trim() === "") {
+				return Response.json(
+					{ error: "normalizedValue must be a non-empty string" },
+					{ status: 400 },
+				);
+			}
+			if (report === null || report === undefined) {
+				return Response.json({ error: "report is required" }, { status: 400 });
+			}
+
+			const subject = subjectFields(type, typeof value === "string" ? value : undefined);
+			const reportRecords = extractReportRecords(report);
+			const groups = [subject, ...reportRecords.map((record) => record.fields)];
+
+			const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
+			if (candidates > MAX_REPORT_KEYS) {
+				return Response.json(
+					{
+						error: "match could not be confirmed",
+						detail: `report yields ${candidates} candidate keys, over the ${MAX_REPORT_KEYS} limit`,
+					},
+					{ status: 503 },
+				);
+			}
+
+			let hits: Awaited<ReturnType<typeof lookupDropKeys>>["hits"];
+			try {
+				const keys = await Promise.all(groups.map(buildReportKeys));
+				hits = (await lookupDropKeys(env.kv, keys)).hits;
+			} catch (e) {
+				return Response.json(
+					{
+						error: "match could not be confirmed",
+						detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+						hint: "KV did not answer — nothing was recorded, retry",
+					},
+					{ status: 503 },
+				);
+			}
+
+			// The caller says this report matched. If KV disagrees, the erasure
+			// was not a DROP erasure, and recording it would put a match into
+			// ca_drop_work_item_match that DROP never asked for and mark a work
+			// item deleted on the strength of it.
+			if (hits.length === 0) {
+				return Response.json(
+					{
+						error: "no DROP match could be confirmed for this report",
+						hint: "nothing was recorded. The rows may have been deleted for another reason",
+					},
+					{ status: 422 },
+				);
+			}
+
+			const runId = crypto.randomUUID();
+			const entity = { type, normalized_value: normalizedValue };
+
+			try {
+				const recorded = await recordEraseIncident(env, runId, entity, hits);
+				return Response.json({ type, runId, recorded });
+			} catch (e) {
+				const stage = e instanceof IncidentFailed ? e.stage : "unknown";
+				return Response.json(
+					{
+						type,
+						runId,
+						error: "the erasure was not fully recorded",
+						stage,
+						...(e instanceof IncidentFailed ? e.detail : {}),
+						detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+						hint: INCIDENT_HINT[stage] ?? INCIDENT_HINT.default,
+					},
+					{ status: INCIDENT_STATUS[stage] ?? 500 },
+				);
+			}
 		}
 
 		// Is the DROP set in KV still complete?

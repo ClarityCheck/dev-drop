@@ -94,6 +94,23 @@ const ENTITY_MATCH = `(type, normalized_value) IN (
  * this returns only once the data is actually gone — and the caller can check
  * `after` rather than take the ALTER's word for it.
  */
+/**
+ * How many entity_search_results rows these identifiers still have.
+ *
+ * Exported because /api/drop/erase-incident has to verify a deletion it did
+ * not perform: the caller says it erased the rows, and "deleted" is a
+ * statement to a regulator, so it is checked rather than believed.
+ */
+export async function countEntityRows(env: Env, keys: EntityKey[]): Promise<number> {
+	if (keys.length === 0) return 0;
+	const [r] = await chQuery<{ n: string }>(
+		env,
+		`SELECT count() AS n FROM default.entity_search_results WHERE ${ENTITY_MATCH}`,
+		{ pairs: JSON.stringify(keys.map((k) => [k.type, k.normalized_value])) },
+	);
+	return Number(r?.n ?? 0);
+}
+
 export async function deleteEntityRows(
 	env: Env,
 	keys: EntityKey[],
@@ -101,14 +118,7 @@ export async function deleteEntityRows(
 	if (keys.length === 0) return { before: 0, after: 0 };
 
 	const pairs = JSON.stringify(keys.map((k) => [k.type, k.normalized_value]));
-	const count = async () => {
-		const [r] = await chQuery<{ n: string }>(
-			env,
-			`SELECT count() AS n FROM default.entity_search_results WHERE ${ENTITY_MATCH}`,
-			{ pairs },
-		);
-		return Number(r?.n ?? 0);
-	};
+	const count = () => countEntityRows(env, keys);
 
 	const before = await count();
 	if (before === 0) return { before: 0, after: 0 };

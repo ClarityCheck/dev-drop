@@ -643,6 +643,96 @@ describe("POST /api/drop/report-check", () => {
 
 });
 
+describe("POST /api/drop/erase-incident", () => {
+	async function incident(
+		body: unknown,
+	): Promise<{ status: number; json: Record<string, unknown> }> {
+		const response = await SELF.fetch("https://example.com/api/drop/erase-incident", {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+		return { status: response.status, json: (await response.json()) as Record<string, unknown> };
+	}
+
+	const listedReport = {
+		type: "email",
+		value: "Incident.Person@Example.com",
+		normalizedValue: "incident.person@example.com",
+		report: { personalInfo: { firstName: "Incident" } },
+	};
+
+	it("rejects a body with no normalizedValue", async () => {
+		const { status, json } = await incident({
+			type: "email",
+			value: "a@b.com",
+			report: {},
+		});
+		expect(status).toBe(400);
+		expect(json.error).toContain("normalizedValue");
+	});
+
+	it("rejects an unknown type and a missing report", async () => {
+		expect((await incident({ type: "vin", normalizedValue: "x", report: {} })).status).toBe(400);
+		expect(
+			(await incident({ type: "email", normalizedValue: "x" })).status,
+		).toBe(400);
+	});
+
+	it("refuses to record an erasure it cannot confirm was a DROP match", async () => {
+		// Nothing for this report is in KV. Recording it would put a match into
+		// ca_drop_work_item_match that DROP never asked for, and mark a work item
+		// deleted on the strength of it.
+		const { status, json } = await incident({
+			type: "email",
+			value: "not.listed@example.com",
+			normalizedValue: "not.listed@example.com",
+			report: { personalInfo: { firstName: "Nobody" } },
+		});
+
+		expect(status).toBe(422);
+		expect(json.error).toContain("no DROP match could be confirmed");
+		expect(json.hint).toContain("nothing was recorded");
+	});
+
+	it("refuses when it cannot confirm the rows are gone, and says so distinctly", async () => {
+		await env.kv.put(
+			await sha256Base64("incident.person@example.com"),
+			"work-item-incident",
+		);
+
+		// ClickHouse is unreachable from the test runner, so the count cannot be
+		// read at all. That is not the same as reading a non-zero count: telling
+		// a caller that did delete the rows to "delete the rows first" sends it
+		// chasing work it already did. 503, not 409.
+		const { status, json } = await incident(listedReport);
+
+		expect(status).toBe(503);
+		expect(json).toMatchObject({
+			type: "email",
+			error: "the erasure was not fully recorded",
+			stage: "unverifiable",
+		});
+		expect(json.hint).toContain("nothing was recorded");
+		expect(json.rowsRemaining).toBeUndefined();
+		expect(json.runId).toEqual(expect.any(String));
+	});
+
+	it("confirms the match before it looks at ClickHouse at all", async () => {
+		// The unconfirmed case returns 422 without a runId, which is how you can
+		// tell nothing was attempted: no run was started, so nothing was logged
+		// and no evidence file exists.
+		const { status, json } = await incident({
+			type: "phone",
+			value: "+1 (415) 555-0000",
+			normalizedValue: "14155550000",
+			report: {},
+		});
+		expect(status).toBe(422);
+		expect(json.runId).toBeUndefined();
+		expect(json.stage).toBeUndefined();
+	});
+});
+
 describe("lookupDropKeys", () => {
 	it("checks more keys than one bulk read holds", async () => {
 		const keys = await Promise.all(
