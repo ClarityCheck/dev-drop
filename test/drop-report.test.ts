@@ -1,5 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
+import { waitForEntityRows } from "../worker/drop-erase";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import {
 	NO_FIELDS,
@@ -523,6 +524,7 @@ describe("POST /api/drop/report-check", () => {
 			type: "email",
 			value: "Listed.Person@Example.com",
 			report: { personalInfo: { firstName: "Listed" } },
+			waitMs: 0,
 		});
 
 		expect(status).toBe(500);
@@ -657,6 +659,78 @@ describe("POST /api/drop/report-check", () => {
 		});
 	});
 
+});
+
+describe("waitForEntityRows", () => {
+	it("returns as soon as the report lands", async () => {
+		let calls = 0;
+		const appeared = await waitForEntityRows(
+			async () => (++calls >= 3 ? 7 : 0),
+			5_000,
+			10,
+		);
+		expect(appeared).toMatchObject({ rows: 7, polls: 3 });
+	});
+
+	it("does not poll again once the row is there", async () => {
+		let calls = 0;
+		const appeared = await waitForEntityRows(
+			async () => {
+				calls += 1;
+				return 4;
+			},
+			5_000,
+			10,
+		);
+		expect(calls).toBe(1);
+		expect(appeared.rows).toBe(4);
+	});
+
+	it("gives up with zero rows once the deadline passes", async () => {
+		const appeared = await waitForEntityRows(async () => 0, 60, 20);
+		expect(appeared.rows).toBe(0);
+		expect(appeared.polls).toBeGreaterThan(1);
+		expect(appeared.waitedMs).toBeLessThan(1_000);
+	});
+
+	it("polls at least once even with no time to wait", async () => {
+		let calls = 0;
+		const appeared = await waitForEntityRows(
+			async () => {
+				calls += 1;
+				return 0;
+			},
+			0,
+			10,
+		);
+		expect(calls).toBe(1);
+		expect(appeared.rows).toBe(0);
+	});
+
+	it("tolerates a blip and still sees the row", async () => {
+		let calls = 0;
+		const appeared = await waitForEntityRows(
+			async () => {
+				calls += 1;
+				if (calls === 1) throw new Error("ClickHouse 502");
+				return 2;
+			},
+			5_000,
+			10,
+		);
+		expect(appeared.rows).toBe(2);
+		expect(appeared.polls).toBe(2);
+	});
+
+	it("throws when it never got a clean answer, rather than reporting no rows", async () => {
+		// An unreachable ClickHouse must not look like an absent row: one would
+		// leave the erase unconfirmed, the other would be read as nothing to do.
+		await expect(
+			waitForEntityRows(async () => {
+				throw new Error("ClickHouse unreachable");
+			}, 60, 20),
+		).rejects.toThrow("ClickHouse unreachable");
+	});
 });
 
 describe("lookupDropKeys", () => {

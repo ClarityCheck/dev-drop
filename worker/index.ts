@@ -6,7 +6,12 @@ export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
-import { EraseFailed, eraseMatchedReport } from "./drop-erase";
+import {
+	DEFAULT_WAIT_MS,
+	EraseFailed,
+	MAX_WAIT_MS,
+	eraseMatchedReport,
+} from "./drop-erase";
 import {
 	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
@@ -32,9 +37,11 @@ import {
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
  * - POST /api/drop/check - is this e-mail or phone on the DROP list?
  * - POST /api/drop/report-check - does a whole report touch any DROP key?
- *     An e-mail or phone report that matches is erased before the answer
- *     returns: match rows, alert, ClickHouse delete, status, R2 evidence.
- *     A people report is detected only — Cron C still erases those.
+ *     An e-mail or phone report that matches is erased BEFORE the answer
+ *     returns — match rows, alert, wait for the row to land, ClickHouse
+ *     delete, status, R2 evidence — so listed:true means the data is
+ *     already gone and a history endpoint reading ClickHouse cannot still
+ *     serve it. A people report is detected only; Cron C erases those.
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -233,7 +240,7 @@ export default {
 		}
 
 		if (url.pathname === "/api/drop/report-check" && request.method === "POST") {
-			let body: { type?: unknown; value?: unknown; report?: unknown };
+			let body: { type?: unknown; value?: unknown; report?: unknown; waitMs?: unknown };
 			try {
 				body = (await request.json()) as typeof body;
 			} catch {
@@ -241,6 +248,10 @@ export default {
 			}
 
 			const { type, value, report } = body;
+			const waitMs =
+				typeof body.waitMs === "number" && Number.isFinite(body.waitMs)
+					? Math.min(MAX_WAIT_MS, Math.max(0, body.waitMs))
+					: DEFAULT_WAIT_MS;
 			if (!isReportType(type)) {
 				return Response.json(
 					{ error: 'type must be "email", "phone" or "people"' },
@@ -341,7 +352,7 @@ export default {
 			};
 
 			try {
-				const erased = await eraseMatchedReport(env, runId, entity, hits);
+				const erased = await eraseMatchedReport(env, runId, entity, hits, waitMs);
 				return Response.json({ ...answer, runId, erased });
 			} catch (e) {
 				const stage = e instanceof EraseFailed ? e.stage : "unknown";
