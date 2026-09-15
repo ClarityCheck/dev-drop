@@ -690,6 +690,74 @@ describe("POST /api/drop/erase-incident", () => {
 		report: { personalInfo: { firstName: "Incident" } },
 	};
 
+	async function matchFound(
+		body: unknown,
+	): Promise<{ status: number; json: Record<string, unknown> }> {
+		const response = await SELF.fetch("https://example.com/api/drop/match-found", {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+		return { status: response.status, json: (await response.json()) as Record<string, unknown> };
+	}
+
+	describe("match-found, which has to come before the erase", () => {
+		it("does not ask whether the data is gone", async () => {
+			await env.kv.put(
+				await sha256Base64("incident.person@example.com"),
+				"work-item-incident",
+			);
+
+			// The whole point of this call is that it runs BEFORE the erase, so
+			// requiring the rows to be gone would make it impossible to use. It
+			// gets as far as Supabase, which the test runner cannot reach — the
+			// stage proves it never went looking for a row count.
+			const { status, json } = await matchFound(listedReport);
+
+			expect(status).toBe(500);
+			expect(json.stage).toBe("record");
+			expect(json.stage).not.toBe("verify");
+			expect(json.stage).not.toBe("unverifiable");
+		});
+
+		it("tells the caller not to erase when the match could not be recorded", async () => {
+			await env.kv.put(
+				await sha256Base64("incident.person@example.com"),
+				"work-item-incident",
+			);
+
+			// This is the sentence that prevents the unrecoverable case. If the
+			// caller erases anyway, the rows are gone, the view has nothing to
+			// match, and no record that the consumer was ever in the data exists.
+			const { json } = await matchFound(listedReport);
+
+			expect(json.error).toBe("the match was not recorded");
+			expect(json.hint).toContain("DO NOT ERASE");
+		});
+
+		it("refuses a match it cannot confirm, before writing anything", async () => {
+			const { status, json } = await matchFound({
+				type: "email",
+				value: "not.listed@example.com",
+				normalizedValue: "not.listed@example.com",
+				report: { personalInfo: { firstName: "Nobody" } },
+			});
+
+			expect(status).toBe(422);
+			expect(json.runId).toBeUndefined();
+		});
+
+		it("carries the caller's runId so both halves correlate", async () => {
+			await env.kv.put(
+				await sha256Base64("incident.person@example.com"),
+				"work-item-incident",
+			);
+
+			const { json } = await matchFound({ ...listedReport, runId: "run-abc-123" });
+
+			expect(json.runId).toBe("run-abc-123");
+		});
+	});
+
 	it("rejects a body with no normalizedValue", async () => {
 		const { status, json } = await incident({
 			type: "email",

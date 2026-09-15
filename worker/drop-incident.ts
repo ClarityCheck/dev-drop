@@ -128,6 +128,89 @@ export class IncidentFailed extends Error {
 	}
 }
 
+export type MatchFoundResult = {
+	matchRowsInserted: number;
+	workItemsLinked: number;
+};
+
+/**
+ * Record that a DROP match was found, BEFORE the caller erases anything.
+ *
+ * This is the half of Cron C's sequence that has to come first, and the reason
+ * is in workflow-reports-cleanup.ts: "The match row is written first because
+ * the erase destroys the only other evidence the consumer was ever in the
+ * data."
+ *
+ * Cron C can do the whole sequence in one function because it performs the
+ * erase itself. When the caller performs it, the sequence has to split at the
+ * same seam Cron C splits at:
+ *
+ *   recordMatchFound     the match row, and the alert   -- BEFORE the erase
+ *   (the caller erases)
+ *   recordEraseIncident  verify, then status, then R2   -- AFTER the erase
+ *
+ * The two writes are different claims and that is why they sit on opposite
+ * sides of the erase. A match row says "this consumer was in our data", which
+ * is true the moment the match is found and stays true afterwards. The status
+ * says "their data is gone", which Cron B reports to California as code 3
+ * Deleted, and which is a false statement until the erase has happened.
+ *
+ * Calling this and then failing to erase is recoverable: the match row is
+ * there, the status is not set, and Cron C finds the rows on its next pass
+ * because they still exist. Erasing without calling this is NOT recoverable --
+ * the rows are gone, so the view has nothing to match, and the only record
+ * that the consumer was ever in the data is the one that was never written.
+ */
+export async function recordMatchFound(
+	env: Env,
+	runId: string,
+	entity: EntityKey,
+	hits: DropHit[],
+): Promise<MatchFoundResult> {
+	const ctx = { workflow: INCIDENT_WORKFLOW, run_id: runId };
+	const phase = phaseTracer(env, ctx, "record match found");
+
+	const alerts: MatchAlert[] = hits.map((hit) => ({
+		list_type: hit.list_type,
+		work_item_id: hit.work_item_id,
+		hash: hit.hash,
+	}));
+	const matchRows: MatchRow[] = hits.map((hit) => ({
+		list_type: hit.list_type,
+		work_item_id: hit.work_item_id,
+		matched_normalized_value: entity.normalized_value,
+	}));
+
+	try {
+		const written = await phase("supabase: insert match rows", () =>
+			recordMatches(env, matchRows),
+		);
+		const unrecorded = incompleteReason(written);
+		if (unrecorded) {
+			await logMatches(env, ctx, BATCH, alerts, { ok: false, reason: unrecorded });
+			throw new IncidentFailed(
+				"record",
+				`could not record ${matchRows.length} DROP match(es) — ${unrecorded}`,
+			);
+		}
+
+		await phase("betterstack: match alert", () =>
+			logMatches(env, ctx, BATCH, alerts, { ok: true }),
+		);
+
+		return {
+			matchRowsInserted: written.inserted,
+			workItemsLinked: written.workItems,
+		};
+	} catch (e) {
+		if (e instanceof IncidentFailed) throw e;
+		throw new IncidentFailed(
+			"record",
+			e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+		);
+	}
+}
+
 /**
  * Record a DROP erasure that somebody else performed.
  *

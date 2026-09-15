@@ -6,7 +6,7 @@ export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
-import { IncidentFailed, recordEraseIncident } from "./drop-incident";
+import { IncidentFailed, recordEraseIncident, recordMatchFound } from "./drop-incident";
 import type { IncidentStage } from "./drop-incident";
 import { lookupGate, recordSuppression } from "./drop-suppression";
 import {
@@ -19,6 +19,105 @@ import {
 	lookupDropKeys,
 	subjectFields,
 } from "./drop-report";
+import type { ReportType } from "./drop-report";
+
+/**
+ * The step both incident endpoints share: read the body, re-derive the DROP
+ * keys from the report, and confirm against KV that a match really happened.
+ *
+ * The caller's word is not enough for either call. One writes a row into
+ * ca_drop_work_item_match and the other sets the status Cron B reports to
+ * California, so a match KV cannot confirm is refused and nothing is written.
+ */
+async function confirmIncidentMatch(
+	env: Env,
+	request: Request,
+): Promise<
+	| { response: Response }
+	| {
+			type: ReportType;
+			entity: { type: string; normalized_value: string };
+			hits: Awaited<ReturnType<typeof lookupDropKeys>>["hits"];
+			runId?: unknown;
+	  }
+> {
+	const bad = (body: Record<string, unknown>, status: number) => ({
+		response: Response.json(body, { status }),
+	});
+
+	let body: {
+		type?: unknown;
+		value?: unknown;
+		normalizedValue?: unknown;
+		report?: unknown;
+		runId?: unknown;
+	};
+	try {
+		body = (await request.json()) as typeof body;
+	} catch {
+		return bad({ error: "body must be JSON" }, 400);
+	}
+
+	const { type, value, normalizedValue, report } = body;
+	if (!isReportType(type)) {
+		return bad({ error: 'type must be "email", "phone" or "people"' }, 400);
+	}
+	if (typeof normalizedValue !== "string" || normalizedValue.trim() === "") {
+		return bad({ error: "normalizedValue must be a non-empty string" }, 400);
+	}
+	if (report === null || report === undefined) {
+		return bad({ error: "report is required" }, 400);
+	}
+
+	const subject = subjectFields(type, typeof value === "string" ? value : undefined);
+	const groups = [
+		subject,
+		...extractReportRecords(report).map((record) => record.fields),
+	];
+
+	const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
+	if (candidates > MAX_REPORT_KEYS) {
+		return bad(
+			{
+				error: "match could not be confirmed",
+				detail: `report yields ${candidates} candidate keys, over the ${MAX_REPORT_KEYS} limit`,
+			},
+			503,
+		);
+	}
+
+	let hits: Awaited<ReturnType<typeof lookupDropKeys>>["hits"];
+	try {
+		const keys = await Promise.all(groups.map(buildReportKeys));
+		hits = (await lookupDropKeys(env.kv, keys)).hits;
+	} catch (e) {
+		return bad(
+			{
+				error: "match could not be confirmed",
+				detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+				hint: "KV did not answer — nothing was recorded, retry",
+			},
+			503,
+		);
+	}
+
+	if (hits.length === 0) {
+		return bad(
+			{
+				error: "no DROP match could be confirmed for this report",
+				hint: "nothing was recorded. The data may have been erased for another reason",
+			},
+			422,
+		);
+	}
+
+	return {
+		type,
+		entity: { type, normalized_value: normalizedValue },
+		hits,
+		runId: body.runId,
+	};
+}
 
 const INCIDENT_STATUS: Partial<Record<IncidentStage | "unknown", number>> = {
 	unverifiable: 503,
@@ -47,11 +146,14 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  *     and which of its records do? Answers only; it writes nothing and
  *     erases nothing. The caller filters before it persists, and Cron C
  *     sweeps what was stored before this check existed.
- * - POST /api/drop/erase-incident - the caller has already erased a cached
- *     report that has since joined the DROP list: every row for an e-mail
- *     or phone, the matched array elements for a people report. Confirms
- *     the match AND the erasure, then leaves the trail Cron C would have:
- *     match rows, alert, work item status, R2 evidence.
+ * - POST /api/drop/match-found - a cached report has joined the DROP list
+ *     and the caller is ABOUT to erase it. Records the match row and the
+ *     alert. Call this FIRST: the erase destroys the only other evidence
+ *     the consumer was ever in the data.
+ * - POST /api/drop/erase-incident - the caller has now erased it: every
+ *     row for an e-mail or phone, the matched array elements for a people
+ *     report. Verifies the match AND the erasure, then sets the work item
+ *     status and writes the R2 evidence.
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -396,83 +498,43 @@ export default {
 		// and DROP's are different (normalize-value.ts keeps every digit of a
 		// phone, DROP keeps the last ten), and the value that addresses the rows
 		// has to be the one that addressed them for the delete.
-		if (url.pathname === "/api/drop/erase-incident" && request.method === "POST") {
-			let body: {
-				type?: unknown;
-				value?: unknown;
-				normalizedValue?: unknown;
-				report?: unknown;
-				rowsDeleted?: unknown;
-			};
-			try {
-				body = (await request.json()) as typeof body;
-			} catch {
-				return Response.json({ error: "body must be JSON" }, { status: 400 });
-			}
+		if (
+			(url.pathname === "/api/drop/match-found" ||
+				url.pathname === "/api/drop/erase-incident") &&
+			request.method === "POST"
+		) {
+			const confirmed = await confirmIncidentMatch(env, request);
+			if ("response" in confirmed) return confirmed.response;
 
-			const { type, value, normalizedValue, report } = body;
-			if (!isReportType(type)) {
-				return Response.json(
-					{ error: 'type must be "email", "phone" or "people"' },
-					{ status: 400 },
-				);
-			}
-			if (typeof normalizedValue !== "string" || normalizedValue.trim() === "") {
-				return Response.json(
-					{ error: "normalizedValue must be a non-empty string" },
-					{ status: 400 },
-				);
-			}
-			if (report === null || report === undefined) {
-				return Response.json({ error: "report is required" }, { status: 400 });
-			}
+			const { type, entity, hits } = confirmed;
+			const runId =
+				typeof confirmed.runId === "string" ? confirmed.runId : crypto.randomUUID();
 
-			const subject = subjectFields(type, typeof value === "string" ? value : undefined);
-			const reportRecords = extractReportRecords(report);
-			const groups = [subject, ...reportRecords.map((record) => record.fields)];
-
-			const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
-			if (candidates > MAX_REPORT_KEYS) {
-				return Response.json(
-					{
-						error: "match could not be confirmed",
-						detail: `report yields ${candidates} candidate keys, over the ${MAX_REPORT_KEYS} limit`,
-					},
-					{ status: 503 },
-				);
+			// Before the erase: the match row and the alert only. Nothing here
+			// claims the data is gone, because it is not yet.
+			if (url.pathname === "/api/drop/match-found") {
+				try {
+					const recorded = await recordMatchFound(env, runId, entity, hits);
+					return Response.json({
+						type,
+						runId,
+						recorded,
+						next: "erase the data, then POST /api/drop/erase-incident with this runId",
+					});
+				} catch (e) {
+					return Response.json(
+						{
+							type,
+							runId,
+							error: "the match was not recorded",
+							stage: e instanceof IncidentFailed ? e.stage : "unknown",
+							detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+							hint: "DO NOT ERASE. Nothing records that this consumer was in the data yet",
+						},
+						{ status: 500 },
+					);
+				}
 			}
-
-			let hits: Awaited<ReturnType<typeof lookupDropKeys>>["hits"];
-			try {
-				const keys = await Promise.all(groups.map(buildReportKeys));
-				hits = (await lookupDropKeys(env.kv, keys)).hits;
-			} catch (e) {
-				return Response.json(
-					{
-						error: "match could not be confirmed",
-						detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-						hint: "KV did not answer — nothing was recorded, retry",
-					},
-					{ status: 503 },
-				);
-			}
-
-			// The caller says this report matched. If KV disagrees, the erasure
-			// was not a DROP erasure, and recording it would put a match into
-			// ca_drop_work_item_match that DROP never asked for and mark a work
-			// item deleted on the strength of it.
-			if (hits.length === 0) {
-				return Response.json(
-					{
-						error: "no DROP match could be confirmed for this report",
-						hint: "nothing was recorded. The rows may have been deleted for another reason",
-					},
-					{ status: 422 },
-				);
-			}
-
-			const runId = crypto.randomUUID();
-			const entity = { type, normalized_value: normalizedValue };
 
 			try {
 				const recorded = await recordEraseIncident(env, runId, entity, hits);
