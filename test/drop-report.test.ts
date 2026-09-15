@@ -2,15 +2,16 @@ import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import {
+	NO_FIELDS,
 	buildReportKeys,
 	countReportKeys,
-	extractReportFields,
+	extractReportRecords,
 	lookupDropKeys,
 	normalizeDob,
 	normalizeName,
 	normalizeVin,
 	normalizeZip,
-	withSearchedValue,
+	subjectFields,
 } from "../worker/drop-report";
 
 const CLICKHOUSE_NAME_VECTORS: { raw: string; normalized: string; hash: string }[] = [
@@ -320,9 +321,9 @@ describe("combined keys match ca_drop_combined_search_result", () => {
 	}
 });
 
-describe("extractReportFields", () => {
-	it("reads the aggregated-data shape", () => {
-		const fields = extractReportFields({
+describe("extractReportRecords", () => {
+	it("reads the aggregated-data shape as one record", () => {
+		const extracted = extractReportRecords({
 			personalInfo: {
 				firstName: "Anna",
 				firstNames: ["Anna", "Ann"],
@@ -338,17 +339,21 @@ describe("extractReportFields", () => {
 			vehicles: [{ vin: "1HGCM82633A004352" }],
 		});
 
-		expect(fields.firstNames).toEqual(["anna", "ann"]);
-		expect(fields.lastNames).toEqual(["smith"]);
-		expect(fields.dobs).toEqual(["19800101"]);
-		expect(fields.zips).toEqual(["90210", "2134"]);
-		expect(fields.vins).toEqual(["1hgcm82633a004352"]);
-		expect(fields.emails).toEqual(["anna.smith@domain.com"]);
-		expect(fields.phones).toEqual(["4155559317"]);
+		expect(extracted).toHaveLength(1);
+		expect(extracted[0].index).toBe(0);
+		expect(extracted[0].fields).toEqual({
+			firstNames: ["anna", "ann"],
+			lastNames: ["smith"],
+			dobs: ["19800101"],
+			zips: ["90210", "2134"],
+			vins: ["1hgcm82633a004352"],
+			emails: ["anna.smith@domain.com"],
+			phones: ["4155559317"],
+		});
 	});
 
-	it("reads every person of the people-record shape, not just the first", () => {
-		const fields = extractReportFields([
+	it("keeps each person of a people report in its own record", () => {
+		const extracted = extractReportRecords([
 			{
 				names: [{ first: "Anna", last: "Smith" }],
 				dateOfBirth: { start: "1980-01-01" },
@@ -356,28 +361,46 @@ describe("extractReportFields", () => {
 				emails: [{ address: "anna@example.com" }],
 				phones: [{ number: "+14155559317" }],
 				vehicles: [{ vin: "1HGCM82633A004352" }],
+				pipl_id: "pipl-1",
 			},
 			{
 				names: [{ first: "José", last: "Müller" }],
+				dateOfBirth: { start: "1999-12-31" },
 				addresses: [{ zipCode: "02134" }],
 			},
 		]);
 
-		expect(fields.firstNames).toEqual(["anna", "jose"]);
-		expect(fields.lastNames).toEqual(["smith", "muller"]);
-		expect(fields.zips).toEqual(["90210", "2134"]);
-		expect(fields.emails).toEqual(["anna@example.com"]);
+		expect(extracted).toHaveLength(2);
+		expect(extracted[0]).toMatchObject({ index: 0, id: "pipl-1" });
+		expect(extracted[0].fields.firstNames).toEqual(["anna"]);
+		expect(extracted[0].fields.zips).toEqual(["90210"]);
+		expect(extracted[1]).toMatchObject({ index: 1 });
+		expect(extracted[1].id).toBeUndefined();
+		expect(extracted[1].fields.firstNames).toEqual(["jose"]);
+		expect(extracted[1].fields.zips).toEqual(["2134"]);
+	});
+
+	it("never combines one person's name with another person's dob and zip", async () => {
+		const extracted = extractReportRecords([
+			{ names: [{ first: "Anna", last: "Smith" }], dateOfBirth: { start: "1980-01-01" } },
+			{ names: [{ first: "José", last: "Müller" }], addresses: [{ zipCode: "90210" }] },
+		]);
+
+		for (const record of extracted) {
+			expect(countReportKeys(record.fields)).toBe(0);
+			expect((await buildReportKeys(record.fields)).ndz).toEqual([]);
+		}
 	});
 
 	it("keeps nothing from a report with no identifiers", () => {
-		const fields = extractReportFields({ socialProfiles: { twitter: "@nobody" } });
-		expect(countReportKeys(fields)).toBe(0);
+		const extracted = extractReportRecords({ socialProfiles: { twitter: "@nobody" } });
+		expect(countReportKeys(extracted[0].fields)).toBe(0);
 	});
 
 	it("survives a payload that is not an object", () => {
-		expect(countReportKeys(extractReportFields("not a report"))).toBe(0);
-		expect(countReportKeys(extractReportFields(null))).toBe(0);
-		expect(countReportKeys(extractReportFields([1, 2, 3]))).toBe(0);
+		expect(extractReportRecords("not a report")).toEqual([]);
+		expect(extractReportRecords(null)).toEqual([]);
+		expect(extractReportRecords([1, 2, 3])).toEqual([]);
 	});
 });
 
@@ -410,28 +433,17 @@ describe("countReportKeys", () => {
 	});
 });
 
-describe("withSearchedValue", () => {
-	const empty = {
-		emails: [],
-		phones: [],
-		firstNames: [],
-		lastNames: [],
-		dobs: [],
-		zips: [],
-		vins: [],
-	};
-
-	it("adds the searched e-mail and phone", () => {
-		expect(withSearchedValue(empty, "email", "Anna.Smith@Domain.com").emails).toEqual([
+describe("subjectFields", () => {
+	it("keys the searched e-mail and phone", () => {
+		expect(subjectFields("email", "Anna.Smith@Domain.com").emails).toEqual([
 			"anna.smith@domain.com",
 		]);
-		expect(withSearchedValue(empty, "phone", "+1 (415) 555-9317").phones).toEqual([
-			"4155559317",
-		]);
+		expect(subjectFields("phone", "+1 (415) 555-9317").phones).toEqual(["4155559317"]);
 	});
 
 	it("does not turn a searched name into a single-value key", () => {
-		expect(withSearchedValue(empty, "people", "Anna Smith")).toEqual(empty);
+		expect(subjectFields("people", "Anna Smith")).toEqual(NO_FIELDS);
+		expect(subjectFields("email", undefined)).toEqual(NO_FIELDS);
 	});
 });
 
@@ -467,20 +479,17 @@ describe("POST /api/drop/report-check", () => {
 	});
 
 	it("refuses to answer when the report yields too many combinations", async () => {
-		const many = (prefix: string, count: number) =>
-			Array.from({ length: count }, (_, i) => `${prefix}${i}`);
+		const zips = Array.from({ length: 60 }, (_, i) => ({
+			zipCode: `1${String(i).padStart(4, "0")}`,
+		}));
+		const person = {
+			names: Array.from({ length: 12 }, (_, i) => ({ first: `first${i}`, last: `last${i}` })),
+			dateOfBirth: { start: "1980-01-01" },
+			addresses: zips,
+		};
 		const { status, json } = await check({
 			type: "people",
-			report: [
-				{
-					names: many("first", 30).map((first, i) => ({
-						first,
-						last: many("last", 30)[i],
-					})),
-					dateOfBirth: { start: "1980-01-01" },
-					addresses: many("", 40).map((_, i) => ({ zipCode: `1${String(i).padStart(4, "0")}` })),
-				},
-			],
+			report: Array.from({ length: 4 }, () => person),
 		});
 		expect(status).toBe(503);
 		expect(json.error).toBe("check did not run");
@@ -494,13 +503,18 @@ describe("POST /api/drop/report-check", () => {
 			report: { personalInfo: { firstName: "Nobody", lastName: "Here" } },
 		});
 		expect(status).toBe(200);
-		expect(json).toMatchObject({ type: "email", listed: false, matched: [] });
+		expect(json).toMatchObject({
+			type: "email",
+			listed: false,
+			subjectListed: false,
+			matched: [],
+			records: [{ index: 0, listed: false, matched: [] }],
+		});
 		expect(json.keysChecked).toBe(1);
 	});
 
-	it("answers true and names the family when the searched e-mail is listed", async () => {
-		const listed = await sha256Base64("listed.person@example.com");
-		await env.kv.put(listed, "work-item-email");
+	it("flags the whole report, not a record, when the searched e-mail is listed", async () => {
+		await env.kv.put(await sha256Base64("listed.person@example.com"), "work-item-email");
 
 		const { status, json } = await check({
 			type: "email",
@@ -508,10 +522,16 @@ describe("POST /api/drop/report-check", () => {
 			report: { personalInfo: { firstName: "Listed" } },
 		});
 		expect(status).toBe(200);
-		expect(json).toMatchObject({ type: "email", listed: true, matched: ["email"] });
+		expect(json).toMatchObject({
+			type: "email",
+			listed: true,
+			subjectListed: true,
+			matched: ["email"],
+			records: [{ index: 0, listed: false, matched: [] }],
+		});
 	});
 
-	it("matches a people report on a name, dob and zip combination", async () => {
+	it("names only the matching record of a people report", async () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-ndz");
 
 		const { json } = await check({
@@ -519,16 +539,81 @@ describe("POST /api/drop/report-check", () => {
 			value: "Anna Smith",
 			report: [
 				{
+					names: [{ first: "Unrelated", last: "Person" }],
+					dateOfBirth: { start: "1970-02-02" },
+					addresses: [{ zipCode: "10001" }],
+					pipl_id: "pipl-clean",
+				},
+				{
 					names: [{ first: "Anna", last: "Smith" }],
+					dateOfBirth: { start: "1980-01-01" },
+					addresses: [{ zipCode: "90210" }],
+					pipl_id: "pipl-listed",
+				},
+			],
+		});
+
+		expect(json).toMatchObject({
+			type: "people",
+			listed: true,
+			subjectListed: false,
+			matched: ["ndz"],
+			records: [
+				{ index: 0, id: "pipl-clean", listed: false, matched: [] },
+				{ index: 1, id: "pipl-listed", listed: true, matched: ["ndz"] },
+			],
+		});
+	});
+
+	it("does not flag a record built from another record's dob and zip", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-ndz");
+
+		const { json } = await check({
+			type: "people",
+			report: [
+				{ names: [{ first: "Anna", last: "Smith" }], addresses: [{ zipCode: "10001" }] },
+				{
+					names: [{ first: "Unrelated", last: "Person" }],
 					dateOfBirth: { start: "1980-01-01" },
 					addresses: [{ zipCode: "90210" }],
 				},
 			],
 		});
-		expect(json).toMatchObject({ type: "people", listed: true, matched: ["ndz"] });
+
+		expect(json).toMatchObject({
+			type: "people",
+			listed: false,
+			records: [
+				{ index: 0, listed: false },
+				{ index: 1, listed: false },
+			],
+		});
 	});
 
-	it("matches a people report on a name and vin combination", async () => {
+	it("flags the record whose own e-mail is listed", async () => {
+		await env.kv.put(await sha256Base64("second@example.com"), "work-item-record-email");
+
+		const { json } = await check({
+			type: "people",
+			report: [
+				{ names: [{ first: "Anna", last: "Smith" }], emails: [{ address: "first@example.com" }] },
+				{ names: [{ first: "José", last: "Müller" }], emails: [{ address: "Second@Example.com" }] },
+			],
+		});
+
+		expect(json).toMatchObject({
+			type: "people",
+			listed: true,
+			subjectListed: false,
+			matched: ["email"],
+			records: [
+				{ index: 0, listed: false, matched: [] },
+				{ index: 1, listed: true, matched: ["email"] },
+			],
+		});
+	});
+
+	it("matches a record on a name and vin combination", async () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].namevin, "work-item-namevin");
 
 		const { json } = await check({
@@ -540,7 +625,12 @@ describe("POST /api/drop/report-check", () => {
 				},
 			],
 		});
-		expect(json).toMatchObject({ type: "people", listed: true, matched: ["namevin"] });
+		expect(json).toMatchObject({
+			type: "people",
+			listed: true,
+			matched: ["namevin"],
+			records: [{ index: 0, listed: true, matched: ["namevin"] }],
+		});
 	});
 });
 
@@ -551,27 +641,35 @@ describe("lookupDropKeys", () => {
 		);
 		await env.kv.put(keys[249], "work-item-last");
 
-		const result = await lookupDropKeys(env.kv, {
-			email: keys,
-			phone: [],
-			ndz: [],
-			namevin: [],
-		});
+		const result = await lookupDropKeys(env.kv, [
+			{ email: keys, phone: [], ndz: [], namevin: [] },
+		]);
 		expect(result.keysChecked).toBe(250);
-		expect(result.matched).toEqual(["email"]);
+		expect(result.matched).toEqual([["email"]]);
 	});
 
 	it("counts a key shared by two families once and reports both", async () => {
 		const shared = await sha256Base64("shared-key");
 		await env.kv.put(shared, "work-item-shared");
 
-		const result = await lookupDropKeys(env.kv, {
-			email: [shared],
-			phone: [shared],
-			ndz: [],
-			namevin: [],
-		});
+		const result = await lookupDropKeys(env.kv, [
+			{ email: [shared], phone: [shared], ndz: [], namevin: [] },
+		]);
 		expect(result.keysChecked).toBe(1);
-		expect(result.matched).toEqual(["email", "phone"]);
+		expect(result.matched).toEqual([["email", "phone"]]);
+	});
+
+	it("reads a key shared by two groups once and reports it against both", async () => {
+		const shared = await sha256Base64("shared-between-records");
+		await env.kv.put(shared, "work-item-shared-group");
+		const missing = await sha256Base64("absent-from-kv");
+
+		const result = await lookupDropKeys(env.kv, [
+			{ email: [], phone: [], ndz: [shared], namevin: [] },
+			{ email: [], phone: [], ndz: [missing], namevin: [] },
+			{ email: [], phone: [], ndz: [shared], namevin: [] },
+		]);
+		expect(result.keysChecked).toBe(2);
+		expect(result.matched).toEqual([["ndz"], [], ["ndz"]]);
 	});
 });

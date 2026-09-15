@@ -10,7 +10,7 @@ export function isReportType(x: unknown): x is ReportType {
 export const DROP_KEY_FAMILIES = ["email", "phone", "ndz", "namevin"] as const;
 export type DropKeyFamily = (typeof DROP_KEY_FAMILIES)[number];
 
-export const MAX_REPORT_KEYS = 5000;
+export const MAX_REPORT_KEYS = 20000;
 const KV_BULK_LIMIT = 100;
 const KV_BULK_CONCURRENCY = 10;
 
@@ -132,68 +132,69 @@ function distinct(values: string[], normalize: (value: string) => string): strin
 	return [...out];
 }
 
-export function extractReportFields(report: unknown): ReportFields {
-	const emails: string[] = [];
-	const phones: string[] = [];
-	const firstNames: string[] = [];
-	const lastNames: string[] = [];
-	const dobs: string[] = [];
-	const zips: string[] = [];
-	const vins: string[] = [];
+export const NO_FIELDS: ReportFields = {
+	emails: [],
+	phones: [],
+	firstNames: [],
+	lastNames: [],
+	dobs: [],
+	zips: [],
+	vins: [],
+};
 
-	for (const person of records(report)) {
-		const personalInfo = records(person.personalInfo);
-		const contactInfo = records(person.contactInfo);
-		const names = records(person.names);
-		const addresses = [...nested(contactInfo, "fullAddresses"), ...records(person.addresses)];
+export type ReportRecord = { index: number; id?: string; fields: ReportFields };
 
-		firstNames.push(
-			...fields(personalInfo, "firstName", "firstNames"),
-			...fields(names, "first"),
-		);
-		lastNames.push(
-			...fields(personalInfo, "lastName", "lastNames"),
-			...fields(names, "last"),
-		);
-		dobs.push(
-			...fields(personalInfo, "birthDate", "birthDates"),
-			...fields(records(person.dateOfBirth), "start"),
-		);
-		zips.push(...fields(addresses, "zip", "zipCode"), ...fields(contactInfo, "zip"));
-		vins.push(...fields(records(person.vehicles), "vin"));
-		emails.push(
-			...fields(contactInfo, "email", "emails"),
-			...fields(records(person.emails), "address"),
-		);
-		phones.push(
-			...fields(contactInfo, "phone", "phones"),
-			...fields(records(person.phones), "number"),
-		);
-	}
+function personFields(person: JsonRecord): ReportFields {
+	const personalInfo = records(person.personalInfo);
+	const contactInfo = records(person.contactInfo);
+	const names = records(person.names);
+	const addresses = [...nested(contactInfo, "fullAddresses"), ...records(person.addresses)];
 
 	return {
-		emails: distinct(emails, normalizeEmail),
-		phones: distinct(phones, normalizePhone),
-		firstNames: distinct(firstNames, normalizeName),
-		lastNames: distinct(lastNames, normalizeName),
-		dobs: distinct(dobs, normalizeDob),
-		zips: distinct(zips, normalizeZip),
-		vins: distinct(vins, normalizeVin),
+		emails: distinct(
+			[...fields(contactInfo, "email", "emails"), ...fields(records(person.emails), "address")],
+			normalizeEmail,
+		),
+		phones: distinct(
+			[...fields(contactInfo, "phone", "phones"), ...fields(records(person.phones), "number")],
+			normalizePhone,
+		),
+		firstNames: distinct(
+			[...fields(personalInfo, "firstName", "firstNames"), ...fields(names, "first")],
+			normalizeName,
+		),
+		lastNames: distinct(
+			[...fields(personalInfo, "lastName", "lastNames"), ...fields(names, "last")],
+			normalizeName,
+		),
+		dobs: distinct(
+			[
+				...fields(personalInfo, "birthDate", "birthDates"),
+				...fields(records(person.dateOfBirth), "start"),
+			],
+			normalizeDob,
+		),
+		zips: distinct(
+			[...fields(addresses, "zip", "zipCode"), ...fields(contactInfo, "zip")],
+			normalizeZip,
+		),
+		vins: distinct(fields(records(person.vehicles), "vin"), normalizeVin),
 	};
 }
 
-export function withSearchedValue(
-	report: ReportFields,
-	type: ReportType,
-	value: string,
-): ReportFields {
-	if (type === "email") {
-		return { ...report, emails: distinct([value, ...report.emails], normalizeEmail) };
-	}
-	if (type === "phone") {
-		return { ...report, phones: distinct([value, ...report.phones], normalizePhone) };
-	}
-	return report;
+export function extractReportRecords(report: unknown): ReportRecord[] {
+	return records(report).map((person, index) => {
+		const id = scalars(person.pipl_id)[0] ?? scalars(person.pdl_id)[0];
+		const fields = personFields(person);
+		return id === undefined ? { index, fields } : { index, id, fields };
+	});
+}
+
+export function subjectFields(type: ReportType, value: string | undefined): ReportFields {
+	if (typeof value !== "string") return NO_FIELDS;
+	if (type === "email") return { ...NO_FIELDS, emails: distinct([value], normalizeEmail) };
+	if (type === "phone") return { ...NO_FIELDS, phones: distinct([value], normalizePhone) };
+	return NO_FIELDS;
 }
 
 export function countReportKeys(report: ReportFields): number {
@@ -249,37 +250,39 @@ export async function buildReportKeys(
 
 export async function lookupDropKeys(
 	kv: KVNamespace,
-	keys: Record<DropKeyFamily, string[]>,
-): Promise<{ keysChecked: number; matched: DropKeyFamily[] }> {
-	const families = new Map<string, DropKeyFamily[]>();
-	for (const family of DROP_KEY_FAMILIES) {
-		for (const key of keys[family]) {
-			const existing = families.get(key);
-			if (existing) existing.push(family);
-			else families.set(key, [family]);
+	groups: Record<DropKeyFamily, string[]>[],
+): Promise<{ keysChecked: number; matched: DropKeyFamily[][] }> {
+	const owners = new Map<string, { group: number; family: DropKeyFamily }[]>();
+	for (let group = 0; group < groups.length; group++) {
+		for (const family of DROP_KEY_FAMILIES) {
+			for (const key of groups[group][family]) {
+				const existing = owners.get(key);
+				if (existing) existing.push({ group, family });
+				else owners.set(key, [{ group, family }]);
+			}
 		}
 	}
 
 	const chunks: string[][] = [];
-	const all = [...families.keys()];
+	const all = [...owners.keys()];
 	for (let i = 0; i < all.length; i += KV_BULK_LIMIT) {
 		chunks.push(all.slice(i, i + KV_BULK_LIMIT));
 	}
 
-	const matched = new Set<DropKeyFamily>();
+	const hits = groups.map(() => new Set<DropKeyFamily>());
 	for (let i = 0; i < chunks.length; i += KV_BULK_CONCURRENCY) {
 		const batch = chunks.slice(i, i + KV_BULK_CONCURRENCY);
 		const results = await Promise.all(batch.map((chunk) => kv.get(chunk)));
 		for (const result of results) {
 			for (const [key, value] of result) {
 				if (value === null) continue;
-				for (const family of families.get(key) ?? []) matched.add(family);
+				for (const owner of owners.get(key) ?? []) hits[owner.group].add(owner.family);
 			}
 		}
 	}
 
 	return {
-		keysChecked: families.size,
-		matched: DROP_KEY_FAMILIES.filter((family) => matched.has(family)),
+		keysChecked: owners.size,
+		matched: hits.map((found) => DROP_KEY_FAMILIES.filter((family) => found.has(family))),
 	};
 }

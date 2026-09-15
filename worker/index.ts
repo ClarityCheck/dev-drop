@@ -7,13 +7,14 @@ export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
 import {
+	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
 	buildReportKeys,
 	countReportKeys,
-	extractReportFields,
+	extractReportRecords,
 	isReportType,
 	lookupDropKeys,
-	withSearchedValue,
+	subjectFields,
 } from "./drop-report";
 
 /**
@@ -251,17 +252,24 @@ export default {
 				return Response.json({ error: "report is required" }, { status: 400 });
 			}
 
-			const extracted = extractReportFields(report);
-			const fields =
-				typeof value === "string" ? withSearchedValue(extracted, type, value) : extracted;
+			const subject = subjectFields(type, typeof value === "string" ? value : undefined);
+			const reportRecords = extractReportRecords(report);
+			const groups = [subject, ...reportRecords.map((record) => record.fields)];
 
-			const candidates = countReportKeys(fields);
+			const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
 			if (candidates === 0) {
 				return Response.json({
 					type,
 					listed: false,
-					keysChecked: 0,
+					subjectListed: false,
 					matched: [],
+					keysChecked: 0,
+					records: reportRecords.map((record) => ({
+						index: record.index,
+						...(record.id === undefined ? {} : { id: record.id }),
+						listed: false,
+						matched: [],
+					})),
 					reason: "no DROP key could be derived from the report",
 				});
 			}
@@ -277,9 +285,25 @@ export default {
 			}
 
 			try {
-				const keys = await buildReportKeys(fields);
+				const keys = await Promise.all(groups.map(buildReportKeys));
 				const { keysChecked, matched } = await lookupDropKeys(env.kv, keys);
-				return Response.json({ type, listed: matched.length > 0, keysChecked, matched });
+				const [subjectMatched, ...recordMatched] = matched;
+
+				return Response.json({
+					type,
+					listed: matched.some((families) => families.length > 0),
+					subjectListed: subjectMatched.length > 0,
+					matched: DROP_KEY_FAMILIES.filter((family) =>
+						matched.some((families) => families.includes(family)),
+					),
+					keysChecked,
+					records: reportRecords.map((record, i) => ({
+						index: record.index,
+						...(record.id === undefined ? {} : { id: record.id }),
+						listed: recordMatched[i].length > 0,
+						matched: recordMatched[i],
+					})),
+				});
 			} catch (e) {
 				return Response.json(
 					{
