@@ -248,10 +248,12 @@ export async function buildReportKeys(
 	return { email, phone, ndz, namevin };
 }
 
+export type DropHit = { list_type: DropKeyFamily; work_item_id: string; hash: string };
+
 export async function lookupDropKeys(
 	kv: KVNamespace,
 	groups: Record<DropKeyFamily, string[]>[],
-): Promise<{ keysChecked: number; matched: DropKeyFamily[][] }> {
+): Promise<{ keysChecked: number; matched: DropKeyFamily[][]; hits: DropHit[] }> {
 	const owners = new Map<string, { group: number; family: DropKeyFamily }[]>();
 	for (let group = 0; group < groups.length; group++) {
 		for (const family of DROP_KEY_FAMILIES) {
@@ -269,20 +271,33 @@ export async function lookupDropKeys(
 		chunks.push(all.slice(i, i + KV_BULK_LIMIT));
 	}
 
-	const hits = groups.map(() => new Set<DropKeyFamily>());
+	const found = groups.map(() => new Set<DropKeyFamily>());
+	const hits = new Map<string, DropHit>();
 	for (let i = 0; i < chunks.length; i += KV_BULK_CONCURRENCY) {
 		const batch = chunks.slice(i, i + KV_BULK_CONCURRENCY);
 		const results = await Promise.all(batch.map((chunk) => kv.get(chunk)));
 		for (const result of results) {
-			for (const [key, value] of result) {
-				if (value === null) continue;
-				for (const owner of owners.get(key) ?? []) hits[owner.group].add(owner.family);
+			for (const [key, workItemId] of result) {
+				if (workItemId === null) continue;
+				for (const owner of owners.get(key) ?? []) {
+					found[owner.group].add(owner.family);
+					hits.set(`${owner.family}::${key}`, {
+						list_type: owner.family,
+						work_item_id: workItemId,
+						hash: key,
+					});
+				}
 			}
 		}
 	}
 
 	return {
 		keysChecked: owners.size,
-		matched: hits.map((found) => DROP_KEY_FAMILIES.filter((family) => found.has(family))),
+		matched: found.map((families) => DROP_KEY_FAMILIES.filter((f) => families.has(f))),
+		hits: [...hits.values()],
 	};
+}
+
+export function entityNormalizedValue(type: ReportType, value: string): string {
+	return type === "phone" ? value.replace(/\D/g, "") : value.toLowerCase().trim();
 }

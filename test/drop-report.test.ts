@@ -513,22 +513,66 @@ describe("POST /api/drop/report-check", () => {
 		expect(json.keysChecked).toBe(1);
 	});
 
-	it("flags the whole report, not a record, when the searched e-mail is listed", async () => {
+	it("never reports success when the erase could not be completed", async () => {
 		await env.kv.put(await sha256Base64("listed.person@example.com"), "work-item-email");
 
+		// Supabase and ClickHouse are unreachable from the test runner, so the
+		// erase cannot get past its first stage. The answer must still say the
+		// match is real, and must not come back 200.
 		const { status, json } = await check({
 			type: "email",
 			value: "Listed.Person@Example.com",
 			report: { personalInfo: { firstName: "Listed" } },
 		});
-		expect(status).toBe(200);
+
+		expect(status).toBe(500);
 		expect(json).toMatchObject({
 			type: "email",
 			listed: true,
 			subjectListed: true,
 			matched: ["email"],
-			records: [{ index: 0, listed: false, matched: [] }],
+			error: "match found but not fully honoured",
+			stage: "record",
+			rowsErased: 0,
 		});
+		expect(json.hint).toContain("do not serve this report");
+		expect(json.runId).toEqual(expect.any(String));
+	});
+
+	it("does not attempt an erase when nothing matched", async () => {
+		const { status, json } = await check({
+			type: "phone",
+			value: "+1 (415) 555-0000",
+			report: { personalInfo: { firstName: "Nobody" } },
+		});
+		expect(status).toBe(200);
+		expect(json).toMatchObject({ type: "phone", listed: false, subjectListed: false });
+		expect(json.erased).toBeUndefined();
+		expect(json.error).toBeUndefined();
+	});
+
+	it("detects a people match without erasing anything", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].namevin, "work-item-namevin");
+
+		const { status, json } = await check({
+			type: "people",
+			report: [
+				{
+					names: [{ first: "Anna", last: "Smith" }],
+					vehicles: [{ vin: "1HGCM82633A004352" }],
+				},
+			],
+		});
+
+		expect(status).toBe(200);
+		expect(json).toMatchObject({
+			type: "people",
+			listed: true,
+			matched: ["namevin"],
+			erased: null,
+			records: [{ index: 0, listed: true, matched: ["namevin"] }],
+		});
+		expect(json.reason).toContain("not erased here");
 	});
 
 	it("names only the matching record of a people report", async () => {
@@ -613,25 +657,6 @@ describe("POST /api/drop/report-check", () => {
 		});
 	});
 
-	it("matches a record on a name and vin combination", async () => {
-		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].namevin, "work-item-namevin");
-
-		const { json } = await check({
-			type: "people",
-			report: [
-				{
-					names: [{ first: "Anna", last: "Smith" }],
-					vehicles: [{ vin: "1HGCM82633A004352" }],
-				},
-			],
-		});
-		expect(json).toMatchObject({
-			type: "people",
-			listed: true,
-			matched: ["namevin"],
-			records: [{ index: 0, listed: true, matched: ["namevin"] }],
-		});
-	});
 });
 
 describe("lookupDropKeys", () => {
