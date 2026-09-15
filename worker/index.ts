@@ -6,6 +6,15 @@ export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
+import {
+	MAX_REPORT_KEYS,
+	buildReportKeys,
+	countReportKeys,
+	extractReportFields,
+	isReportType,
+	lookupDropKeys,
+	withSearchedValue,
+} from "./drop-report";
 
 /**
  * Main Worker fetch handler
@@ -19,6 +28,7 @@ import { dropKey, isDropListType } from "./drop-normalize";
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
  * - POST /api/drop/check - is this e-mail or phone on the DROP list?
+ * - POST /api/drop/report-check - does a whole report touch any DROP key?
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -204,6 +214,72 @@ export default {
 			try {
 				const hit = await env.kv.get(hash);
 				return Response.json({ type, listed: hit !== null });
+			} catch (e) {
+				return Response.json(
+					{
+						error: "check did not run",
+						detail: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+						hint: "treat as unknown, not as not-listed",
+					},
+					{ status: 503 },
+				);
+			}
+		}
+
+		if (url.pathname === "/api/drop/report-check" && request.method === "POST") {
+			let body: { type?: unknown; value?: unknown; report?: unknown };
+			try {
+				body = (await request.json()) as typeof body;
+			} catch {
+				return Response.json({ error: "body must be JSON" }, { status: 400 });
+			}
+
+			const { type, value, report } = body;
+			if (!isReportType(type)) {
+				return Response.json(
+					{ error: 'type must be "email", "phone" or "people"' },
+					{ status: 400 },
+				);
+			}
+			if (type !== "people" && (typeof value !== "string" || value.trim() === "")) {
+				return Response.json(
+					{ error: `value must be a non-empty string for type "${type}"` },
+					{ status: 400 },
+				);
+			}
+			if (report === null || report === undefined) {
+				return Response.json({ error: "report is required" }, { status: 400 });
+			}
+
+			const extracted = extractReportFields(report);
+			const fields =
+				typeof value === "string" ? withSearchedValue(extracted, type, value) : extracted;
+
+			const candidates = countReportKeys(fields);
+			if (candidates === 0) {
+				return Response.json({
+					type,
+					listed: false,
+					keysChecked: 0,
+					matched: [],
+					reason: "no DROP key could be derived from the report",
+				});
+			}
+			if (candidates > MAX_REPORT_KEYS) {
+				return Response.json(
+					{
+						error: "check did not run",
+						detail: `report yields ${candidates} candidate keys, over the ${MAX_REPORT_KEYS} limit`,
+						hint: "treat as unknown, not as not-listed",
+					},
+					{ status: 503 },
+				);
+			}
+
+			try {
+				const keys = await buildReportKeys(fields);
+				const { keysChecked, matched } = await lookupDropKeys(env.kv, keys);
+				return Response.json({ type, listed: matched.length > 0, keysChecked, matched });
 			} catch (e) {
 				return Response.json(
 					{
