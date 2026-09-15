@@ -534,6 +534,33 @@ describe("POST /api/drop/report-check", () => {
 		});
 	});
 
+	it("answers a clean subject with a listed report, and the recording cannot fail it", async () => {
+		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-suppress");
+
+		// The subject is not on the DROP list; its report carries someone who
+		// is. That finding gets recorded so the next search short-circuits — in
+		// waitUntil, after the response, and Supabase is unreachable from the
+		// test runner, so a 200 here is the assertion that the write is off the
+		// answer's path entirely.
+		const { status, json } = await check({
+			type: "email",
+			value: "clean.subject@example.com",
+			report: {
+				personalInfo: { firstName: "Anna", lastName: "Smith", birthDate: "1980-01-01" },
+				contactInfo: { fullAddresses: [{ zip: "90210" }] },
+			},
+		});
+
+		expect(status).toBe(200);
+		expect(json).toMatchObject({
+			type: "email",
+			listed: true,
+			subjectListed: false,
+			matched: ["ndz"],
+			records: [{ index: 0, listed: true, matched: ["ndz"] }],
+		});
+	});
+
 	it("answers without writing to or erasing anything", async () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].namevin, "work-item-namevin");
 

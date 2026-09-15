@@ -1,4 +1,6 @@
 import { recordSuppressedSearch } from "./db";
+import { dropKey } from "./drop-normalize";
+import type { DropListType } from "./drop-normalize";
 import { logRun } from "./logs";
 import type { DropKeyFamily } from "./drop-report";
 
@@ -69,8 +71,9 @@ export async function lookupGate(
 }
 
 export type Suppression = {
-	searchType: string;
-	hash: string;
+	searchType: DropListType;
+	/** the raw searched value; the hash is derived here, not by the caller */
+	value: string;
 	matched: DropKeyFamily[];
 	recordsSuppressed: number;
 	recordsTotal: number;
@@ -89,14 +92,27 @@ export type Suppression = {
  * before this existed. It is not a compliance record — that is
  * ca_drop_work_item_match — so it must never fail a request or change an
  * answer. Failures are logged and swallowed.
+ *
+ * Everything it does, the hashing included, is meant to run after the response
+ * has been sent. Nothing here is on the answer's path.
  */
 export async function recordSuppression(env: Env, s: Suppression): Promise<boolean> {
-	const ctx = { workflow: "drop-suppressed-search", run_id: s.hash.slice(0, 12) };
+	let hash: string;
+	const ctx = { workflow: "drop-suppressed-search", run_id: s.searchType };
+
+	try {
+		hash = (await dropKey(s.searchType, s.value)).hash;
+	} catch (e) {
+		await logRun(env, ctx, "failed", {
+			error: `hash: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
+		});
+		return false;
+	}
 
 	try {
 		await recordSuppressedSearch(env, {
 			search_type: s.searchType,
-			hash: s.hash,
+			hash,
 			matched: s.matched,
 			records_suppressed: s.recordsSuppressed,
 			records_total: s.recordsTotal,
@@ -112,7 +128,7 @@ export async function recordSuppression(env: Env, s: Suppression): Promise<boole
 	try {
 		// No list_type in the metadata, and a prefixed name, so Cron C's pass over
 		// the namespace cannot read this as a DROP hash.
-		await env.kv.put(suppressedKey(s.hash), s.matched.join(",") || "suppressed", {
+		await env.kv.put(suppressedKey(hash), s.matched.join(",") || "suppressed", {
 			metadata: {
 				kind: "suppressed-report",
 				search_type: s.searchType,

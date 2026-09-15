@@ -337,22 +337,22 @@ export default {
 			// can be asked about. A people search is a name, which /api/drop/check
 			// does not accept.
 			//
-			// waitUntil: the answer is what the caller is waiting for, and a cost
-			// optimisation must not delay it or be able to fail it.
+			// waitUntil, and nothing awaited before it: the answer is what the
+			// caller is waiting for, and a cost optimisation must not delay it, or
+			// be able to fail it. Hashing and both writes happen after the response
+			// has gone out.
 			if (
 				type !== "people" &&
 				!subjectMatched.length &&
 				matched.some((families) => families.length > 0)
 			) {
-				const { hash } = await dropKey(type, value as string);
-				const families = DROP_KEY_FAMILIES.filter((family) =>
-					recordMatched.some((f) => f.includes(family)),
-				);
 				ctx.waitUntil(
 					recordSuppression(env, {
 						searchType: type,
-						hash,
-						matched: families,
+						value: value as string,
+						matched: DROP_KEY_FAMILIES.filter((family) =>
+							recordMatched.some((f) => f.includes(family)),
+						),
 						recordsSuppressed: recordMatched.filter((f) => f.length > 0).length,
 						recordsTotal: reportRecords.length,
 					}),
