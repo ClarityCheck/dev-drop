@@ -303,7 +303,10 @@ export async function buildReportKeys(
  * own published identifiers and carry no plaintext, which is why they are the
  * only things allowed into a log or an evidence file.
  */
-export type DropHit = { list_type: DropKeyFamily; work_item_id: string; hash: string };
+/** The metadata Cron A writes beside each DROP hash. */
+type KvMeta = { work_item_id?: string; list_type?: string; request_date?: string };
+
+export type DropHit = { list_type: string; work_item_id: string; hash: string };
 
 export async function lookupDropKeys(
 	kv: KVNamespace,
@@ -330,15 +333,35 @@ export async function lookupDropKeys(
 	const hits = new Map<string, DropHit>();
 	for (let i = 0; i < chunks.length; i += KV_BULK_CONCURRENCY) {
 		const batch = chunks.slice(i, i + KV_BULK_CONCURRENCY);
-		const results = await Promise.all(batch.map((chunk) => kv.get(chunk)));
+		// getWithMetadata, not get, and the bulk form of it — same one
+		// subrequest per 100 keys. The metadata is what Cron A wrote next to
+		// the hash, and it carries DROP's own list_type.
+		const results = await Promise.all(
+			batch.map((chunk) => kv.getWithMetadata<KvMeta>(chunk)),
+		);
 		for (const result of results) {
-			for (const [key, workItemId] of result) {
-				if (workItemId === null) continue;
+			for (const [key, entry] of result) {
+				// A key that is not there maps to null, not to an entry whose value
+				// is null — the type says otherwise, so the truthiness check is
+				// load-bearing rather than defensive.
+				if (!entry || entry.value === null) continue;
 				for (const owner of owners.get(key) ?? []) {
+					// Two different things, deliberately kept apart.
+					//
+					// The FAMILY is ours: which shape of key we derived and matched
+					// on, which is what `matched` reports and what tells a caller
+					// whether a person or a contact detail was hit.
 					found[owner.group].add(owner.family);
+
+					// The LIST TYPE is DROP's, read from the metadata rather than
+					// assumed from the family. They agree in every sane case — the
+					// hash spaces are disjoint by construction — but this value is
+					// half the key recordMatches joins ca_drop_work_item on, so
+					// inferring it would turn a misfiled DROP CSV into
+					// "KV and Supabase have drifted" and point at the wrong thing.
 					hits.set(`${owner.family}::${key}`, {
-						list_type: owner.family,
-						work_item_id: workItemId,
+						list_type: entry.metadata?.list_type ?? owner.family,
+						work_item_id: entry.metadata?.work_item_id ?? entry.value,
 						hash: key,
 					});
 				}

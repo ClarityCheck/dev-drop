@@ -64,26 +64,40 @@ export type GateSource = "drop" | "suppressed-report";
  * The real-time gate's read: is this hash on the DROP list, or has a report for
  * it been suppressed before?
  *
- * One bulk get for both keys, so adding the second source costs no latency and
- * no extra subrequest. DROP membership wins the `source` when both are present,
- * because it is the statutory fact and the other is an inference from it.
+ * One bulk get for both keys, so the second source costs no latency and no
+ * extra subrequest.
+ *
+ * TWO ANSWERS, AND THE DEFAULT READ IS THE SAFE ONE
+ *
+ * `listed` is the operational answer: do not search this, do not serve it. It
+ * is true for both sources, because both mean the same thing to a funnel, and
+ * a caller that reads nothing else gets the cautious behaviour.
+ *
+ * `onDropList` is the statutory fact, and it is its own field precisely so
+ * nobody arrives at it by accident. Conflating the two is the mistake worth
+ * designing against: a suppressed-report value read as DROP membership would
+ * put a match into a compliance record California never asked for. Anything
+ * reporting to a regulator reads onDropList; anything deciding whether to
+ * spend a credit reads listed.
+ *
+ * `source` names which key answered, for logs and triage.
  */
 export async function lookupGate(
 	kv: KVNamespace,
 	hash: string,
-): Promise<{ listed: boolean; source?: GateSource }> {
+): Promise<{ listed: boolean; onDropList: boolean; source?: GateSource }> {
 	const found = await kv.get([hash, suppressedKey(hash)]);
 
 	if (found.get(hash) !== null && found.get(hash) !== undefined) {
-		return { listed: true, source: "drop" };
+		return { listed: true, onDropList: true, source: "drop" };
 	}
 
 	const suppressed = found.get(suppressedKey(hash));
 	if (suppressed !== null && suppressed !== undefined) {
-		return { listed: true, source: "suppressed-report" };
+		return { listed: true, onDropList: false, source: "suppressed-report" };
 	}
 
-	return { listed: false };
+	return { listed: false, onDropList: false };
 }
 
 export type Suppression = {
@@ -114,7 +128,9 @@ export type Suppression = {
  */
 export async function recordSuppression(env: Env, s: Suppression): Promise<boolean> {
 	let hash: string;
-	const ctx = { workflow: "drop-suppressed-search", run_id: s.searchType };
+	// A real id per recording. "email" grouped every suppression in the
+	// namespace into one bucket, which is the opposite of what a run id is for.
+	const ctx = { workflow: "drop-suppressed-search", run_id: crypto.randomUUID() };
 
 	try {
 		hash = (await dropKey(s.searchType, s.value)).hash;
@@ -180,7 +196,7 @@ export async function clearSuppression(
 	searchType: DropListType,
 	value: string,
 ): Promise<boolean> {
-	const ctx = { workflow: "drop-suppressed-search", run_id: searchType };
+	const ctx = { workflow: "drop-suppressed-search", run_id: crypto.randomUUID() };
 
 	try {
 		const { hash } = await dropKey(searchType, value);

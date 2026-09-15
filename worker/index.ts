@@ -337,12 +337,20 @@ export default {
 			}
 
 			try {
-				const { listed, source } = await lookupGate(env.kv, hash);
-				// `source` says which of the two answered. "drop" is California's
-				// list; "suppressed-report" is our own finding that a report for
-				// this value had to be suppressed even though the value itself is
-				// not listed. A caller acting on the statutory fact must read it.
-				return Response.json({ type, listed, ...(listed ? { source } : {}) });
+				const { listed, onDropList, source } = await lookupGate(env.kv, hash);
+				// listed      do not search, do not serve -- true for both sources
+				// onDropList  California's statutory fact, and ONLY that
+				// source      which key answered
+				//
+				// Both are always present. Reading only `listed` gives the
+				// cautious behaviour; the statutory fact has to be asked for by
+				// name, so it cannot be inherited from an inference of ours.
+				return Response.json({
+					type,
+					listed,
+					onDropList,
+					...(listed ? { source } : {}),
+				});
 			} catch (e) {
 				return Response.json(
 					{

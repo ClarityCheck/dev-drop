@@ -947,6 +947,25 @@ describe("the real-time gate and suppressed searches", () => {
 		});
 	});
 
+	it("separates the statutory fact from the operational one", async () => {
+		const onList = await sha256Base64("statutory@example.com");
+		await env.kv.put(onList, "work-item-statutory");
+		const inferred = await sha256Base64("inferred@example.com");
+		await env.kv.put(suppressedKey(inferred), "ndz");
+
+		const drop = await gate({ type: "email", value: "statutory@example.com" });
+		const ours = await gate({ type: "email", value: "inferred@example.com" });
+		const neither = await gate({ type: "email", value: "unrelated@example.com" });
+
+		// listed is the same for both, because both mean "do not search" to a
+		// funnel. onDropList is what a caller reporting to California reads, and
+		// it is false for our own inference — reading only `listed` can never
+		// turn a suppression into a claim about DROP membership.
+		expect(drop.json).toMatchObject({ listed: true, onDropList: true });
+		expect(ours.json).toMatchObject({ listed: true, onDropList: false });
+		expect(neither.json).toMatchObject({ listed: false, onDropList: false });
+	});
+
 	it("reports the DROP list when a value is in both", async () => {
 		// The statutory fact wins the label: `source` is what a caller acting on
 		// DROP membership reads, and a derived suppression must not be able to
@@ -1125,6 +1144,42 @@ describe("lookupDropKeys", () => {
 		]);
 		expect(result.keysChecked).toBe(1);
 		expect(result.matched).toEqual([["email", "phone"]]);
+	});
+
+	it("takes list_type from DROP's own metadata, not from the family it derived", async () => {
+		// The hash spaces are disjoint, so these agree in every sane case. But
+		// list_type is half the key recordMatches joins ca_drop_work_item on, so
+		// inferring it would turn a misfiled DROP CSV into "KV and Supabase have
+		// drifted" and point the operator at the wrong thing.
+		const key = await sha256Base64("derived-as-ndz");
+		await env.kv.put(key, "value-is-ignored", {
+			metadata: { list_type: "email", work_item_id: "wi-from-metadata" },
+		});
+
+		const result = await lookupDropKeys(env.kv, [
+			{ email: [], phone: [], ndz: [key], namevin: [] },
+		]);
+
+		// The family we matched on is still ndz — that is ours, and it is what
+		// `matched` reports.
+		expect(result.matched).toEqual([["ndz"]]);
+		// The list_type and work item are DROP's, read from the metadata.
+		expect(result.hits).toEqual([
+			{ list_type: "email", work_item_id: "wi-from-metadata", hash: key },
+		]);
+	});
+
+	it("falls back to the derived family when a key has no metadata", async () => {
+		const key = await sha256Base64("no-metadata-at-all");
+		await env.kv.put(key, "wi-from-value");
+
+		const result = await lookupDropKeys(env.kv, [
+			{ email: [], phone: [], ndz: [key], namevin: [] },
+		]);
+
+		expect(result.hits).toEqual([
+			{ list_type: "ndz", work_item_id: "wi-from-value", hash: key },
+		]);
 	});
 
 	it("reads a key shared by two groups once and reports it against both", async () => {
