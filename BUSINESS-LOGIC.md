@@ -157,22 +157,46 @@ its own group in both cases, so `subjectListed` still distinguishes the
 statutory fact — *this identifier is on a DROP list* — from the wider finding
 that the report is about someone who is.
 
-### Cron C does not group this way, and that is a live divergence
+### Cron C groups the same way, since v3 of the view
 
-The ClickHouse view derives keys **per source row**, then unions them. For a
-people report a source row is one array element, so it agrees with the Worker.
-For a phone or email report a source row is **one provider**, so the view never
-combines a name from Veriphone with a date of birth and ZIP from Pipl.
+It did not until recently, and it was the pipeline's largest correctness gap.
+`spec_version` v2 derived keys **per source row** and unioned them — right for
+people, where a source row is one array element, and wrong for phone and email,
+where a source row is one provider. It never combined a name from Veriphone with
+a date of birth and ZIP from Pipl, so it derived *no* `ndz` key whenever the four
+factors arrived from different providers, which is the ordinary case. Cron C
+under-matched precisely the NDZ registrations it exists to catch, silently.
 
-The Worker does combine them. It is the Worker that is right — that is the whole
-argument above — which means Cron C under-matches precisely the NDZ
-registrations it exists to catch, and does so without erroring.
+`sql/clickhouse-view-rebuild.sql` (v3) merges the providers for phone and email
+and keeps per-element grouping for people, matching `reportGroups()`.
 
-Measured on DEV after the view was rebuilt: 1,973 rows carrying 224,121
-candidate keys. The Worker, asked about the same reports, derives keys the view
-has no row for. Until the view merges providers for phone and email, the request
-path is the only thing catching that class of match, and the sweep behind it is
-not a safety net for it.
+**The caps came with it, and had to.** Merging multiplies the factors, so v2's
+rule — drop the composites when the width passes 20,000 — would have fired on
+most email values and derived nothing, which is worse than the bug. The view now
+caps exactly as `FIELD_CAPS` does: 10 first names, 10 last names, 5 dates of
+birth, 24 ZIPs, 12 VINs, **sorted then sliced on the normalized values and
+before hashing**, because the Worker sorts values and sorting hashes instead
+would pick a different subset.
+
+Order matters twice over:
+
+| | |
+|---|---|
+| people | cap per element → keys per element → union |
+| phone / email | union the raw fields across providers → **then** cap → **then** one cross product |
+
+Capping before merging would take each provider's first ten names and merge
+those, which is not the ten the Worker picks.
+
+One group is then bounded at `10·10·5·24 + 10·10·12` = 13,200 keys, so for phone
+and email the 20,000 cut is unreachable and the two sides agree exactly. A people
+report sums its groups and can still cross it, and the composites are dropped —
+as they are in the Worker.
+
+The fix was verified against DEV with the two cases that distinguish the
+behaviours: fields for one person split across two *providers* now produce one
+`ndz` key, byte-identical to the Anna / Smith / 19800101 / 90210 conformance
+vector; the same fields split across two *array elements* still produce none.
 
 ## 2a. What is checked, and what is not
 
@@ -402,16 +426,20 @@ gap, ordered by consequence rather than by effort.
 
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.
-- **The Worker and the view group phone and email reports differently** (§2).
-  The Worker merges the providers and derives NDZ keys across them; the view
-  derives per provider and never does. Cron C therefore misses the NDZ matches
-  the request path finds, with no error anywhere. This is the single largest
-  correctness gap in the pipeline right now.
-- **They also disagree about an oversized cross product.** The Worker caps the
-  factors and falls back to the exact keys, flagging `partial`. The view drops
-  that record's composite keys entirely (`if(ndz_width > 20000, [], …)`), so
-  Cron C never matches it. A record too wide is checked weakly on the request
-  path and not at all by the sweep.
+- **The view is not deployed until it is rebuilt.** v3 fixes the grouping, and
+  nothing takes effect until `sql/clickhouse-view-rebuild.sql` is run and the
+  view refreshed. Until then Cron C is still matching on v2's per-provider keys.
+- **An oversized report is still handled differently on the two sides.** Both
+  cap the factors identically. Past the 20,000 total the Worker falls back to
+  the exact keys and flags `partial`; the view drops the composites. With the
+  caps in place this is now reachable only for a very wide people report, and
+  the direction is that the view checks *more* than the Worker rather than
+  less.
+- **`arraySort` orders by UTF-8 bytes; JavaScript `sort()` by UTF-16 code
+  units.** They agree for everything in the Basic Multilingual Plane, which is
+  all of `[a-z0-9]` and almost all CJK. A name containing a character above
+  U+FFFF could be capped to a different subset on the two sides. Vanishingly
+  rare, and it only matters for a report already over a cap.
 - **Nothing gates Cron B on Cron C.** Absence of a status reads as `5 Not
   found`, so a Cron B that fires first reports a clean sheet for a cycle whose
   matches were never looked for.
