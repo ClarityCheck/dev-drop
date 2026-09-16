@@ -946,7 +946,7 @@ describe("the real-time gate and suppressed searches", () => {
 		return { status: response.status, json: (await response.json()) as Record<string, unknown> };
 	}
 
-	it("answers from the DROP list, and says so", async () => {
+	it("answers from the DROP list", async () => {
 		await env.kv.put(await sha256Base64("on.the.list@example.com"), "work-item-gate");
 
 		const { status, json } = await gate({
@@ -954,13 +954,14 @@ describe("the real-time gate and suppressed searches", () => {
 			value: "On.The.List@Example.com",
 		});
 		expect(status).toBe(200);
-		expect(json).toMatchObject({ type: "email", listed: true, source: "drop" });
+		expect(json).toEqual({ type: "email", listed: true });
 	});
 
-	it("answers from a suppressed search, and distinguishes it from the DROP list", async () => {
+	it("answers from a suppressed search the same way", async () => {
 		// The value itself is NOT on the DROP list. Its report was suppressed
 		// because the aggregated data carried someone who is, so searching it
 		// again would spend a credit to rebuild a report that gets suppressed.
+		// Both sources mean "do not search this", and the answer says only that.
 		const hash = await sha256Base64("clean.subject@example.com");
 		await env.kv.put(suppressedKey(hash), "ndz");
 
@@ -969,14 +970,10 @@ describe("the real-time gate and suppressed searches", () => {
 			value: "Clean.Subject@Example.com",
 		});
 		expect(status).toBe(200);
-		expect(json).toMatchObject({
-			type: "email",
-			listed: true,
-			source: "suppressed-report",
-		});
+		expect(json).toEqual({ type: "email", listed: true });
 	});
 
-	it("separates the statutory fact from the operational one", async () => {
+	it("says nothing about which key answered", async () => {
 		const onList = await sha256Base64("statutory@example.com");
 		await env.kv.put(onList, "work-item-statutory");
 		const inferred = await sha256Base64("inferred@example.com");
@@ -986,31 +983,26 @@ describe("the real-time gate and suppressed searches", () => {
 		const ours = await gate({ type: "email", value: "inferred@example.com" });
 		const neither = await gate({ type: "email", value: "unrelated@example.com" });
 
-		// listed is the same for both, because both mean "do not search" to a
-		// funnel. onDropList is what a caller reporting to California reads, and
-		// it is false for our own inference — reading only `listed` can never
-		// turn a suppression into a claim about DROP membership.
-		expect(drop.json).toMatchObject({ listed: true, onDropList: true });
-		expect(ours.json).toMatchObject({ listed: true, onDropList: false });
-		expect(neither.json).toMatchObject({ listed: false, onDropList: false });
+		// A compliance record is written from ca_drop_work_item_match, never
+		// from a gate read, so the distinction between the DROP list and our own
+		// inference stays inside the Worker.
+		expect(drop.json).toEqual({ type: "email", listed: true });
+		expect(ours.json).toEqual({ type: "email", listed: true });
+		expect(neither.json).toEqual({ type: "email", listed: false });
 	});
 
-	it("reports the DROP list when a value is in both", async () => {
-		// The statutory fact wins the label: `source` is what a caller acting on
-		// DROP membership reads, and a derived suppression must not be able to
-		// masquerade as it.
+	it("answers listed when a value is in both", async () => {
 		const hash = await sha256Base64("4155559317");
 		await env.kv.put(hash, "work-item-both");
 		await env.kv.put(suppressedKey(hash), "ndz");
 
 		const { json } = await gate({ type: "phone", value: "+1 (415) 555-9317" });
-		expect(json).toMatchObject({ listed: true, source: "drop" });
+		expect(json).toEqual({ type: "phone", listed: true });
 	});
 
-	it("says nothing about a source when the value is not listed at all", async () => {
-		const { json } = await gate({ type: "email", value: "nobody.here@example.com" });
-		expect(json).toMatchObject({ type: "email", listed: false });
-		expect(json.source).toBeUndefined();
+	it("answers two fields for a value that normalizes to nothing", async () => {
+		const { json } = await gate({ type: "phone", value: "+()- " });
+		expect(json).toEqual({ type: "phone", listed: false });
 	});
 
 	it("keeps a suppression key out of the DROP set", () => {

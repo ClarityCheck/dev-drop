@@ -41,8 +41,6 @@ export function isSuppressedKey(key: string): boolean {
 	return key.startsWith(SUPPRESSED_PREFIX);
 }
 
-export type GateSource = "drop" | "suppressed-report";
-
 /**
  * The real-time gate's read: is this hash on the DROP list, or has a report for
  * it been suppressed before?
@@ -50,37 +48,19 @@ export type GateSource = "drop" | "suppressed-report";
  * One bulk get for both keys, so the second source costs no latency and no
  * extra subrequest.
  *
- * TWO ANSWERS, AND THE DEFAULT READ IS THE SAFE ONE
- *
- * `listed` is the operational answer: do not search this, do not serve it. It
- * is true for both sources, because both mean the same thing to a funnel, and
- * a caller that reads nothing else gets the cautious behaviour.
- *
- * `onDropList` is the statutory fact, and it is its own field precisely so
- * nobody arrives at it by accident. Conflating the two is the mistake worth
- * designing against: a suppressed-report value read as DROP membership would
- * put a match into a compliance record California never asked for. Anything
- * reporting to a regulator reads onDropList; anything deciding whether to
- * spend a credit reads listed.
- *
- * `source` names which key answered, for logs and triage.
+ * One answer, and it is the operational one: do not search this, do not serve
+ * it. Both sources mean that to a funnel, and which key answered is not the
+ * caller's business — a compliance record is written from
+ * ca_drop_work_item_match, never from a gate read.
  */
-export async function lookupGate(
-	kv: KVNamespace,
-	hash: string,
-): Promise<{ listed: boolean; onDropList: boolean; source?: GateSource }> {
+export async function lookupGate(kv: KVNamespace, hash: string): Promise<boolean> {
 	const found = await kv.get([hash, suppressedKey(hash)]);
 
-	if (found.get(hash) !== null && found.get(hash) !== undefined) {
-		return { listed: true, onDropList: true, source: "drop" };
-	}
+	return [hash, suppressedKey(hash)].some((key) => {
+		const value = found.get(key);
 
-	const suppressed = found.get(suppressedKey(hash));
-	if (suppressed !== null && suppressed !== undefined) {
-		return { listed: true, onDropList: false, source: "suppressed-report" };
-	}
-
-	return { listed: false, onDropList: false };
+		return value !== null && value !== undefined;
+	});
 }
 
 export type Suppression = {

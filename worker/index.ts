@@ -142,7 +142,8 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  * - POST /api/downloader/start - Start the drop-downloader workflow
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
- * - POST /api/drop/check - is this e-mail or phone on the DROP list?
+ * - POST /api/drop/check - is this e-mail or phone on the DROP list, or has
+ *     a report for it been suppressed before? Answers `{ type, listed }`.
  * - POST /api/drop/report-check - does a whole report touch any DROP key?
  *     Answers `{ type, listed }`, plus per-element `records` for a people
  *     report, whose elements are different people. It writes nothing and
@@ -336,24 +337,14 @@ export default {
 				// Nothing left after normalization — a phone with no digits, or
 				// an e-mail that was only whitespace. Not listed, and not an
 				// error, but it never reaches KV.
-				return Response.json({ type, listed: false, reason: "empty after normalization" });
+				return Response.json({ type, listed: false });
 			}
 
 			try {
-				const { listed, onDropList, source } = await lookupGate(env.kv, hash);
-				// listed      do not search, do not serve -- true for both sources
-				// onDropList  California's statutory fact, and ONLY that
-				// source      which key answered
-				//
-				// Both are always present. Reading only `listed` gives the
-				// cautious behaviour; the statutory fact has to be asked for by
-				// name, so it cannot be inherited from an inference of ours.
-				return Response.json({
-					type,
-					listed,
-					onDropList,
-					...(listed ? { source } : {}),
-				});
+				// One field to act on: do not search this, do not serve it. Which
+				// key answered — the DROP list itself, or a report we suppressed
+				// earlier — is the Worker's business and stays here.
+				return Response.json({ type, listed: await lookupGate(env.kv, hash) });
 			} catch (e) {
 				return Response.json(
 					{

@@ -319,20 +319,17 @@ subset of the hits is worth having because the erasure already happened.
 `report-check` writes nothing and erases nothing. It answers, and the caller
 decides.
 
-### The gate answers two different questions at once
+### The gate answers one question
 
-`/api/drop/check` is asked about one identifier and returns both:
+`/api/drop/check` is asked about one identifier and returns `{ type, listed }`.
+`listed` means: do not search this, do not serve it.
 
-| Field        | Meaning                                 | Who reads it                    |
-| ------------ | --------------------------------------- | ------------------------------- |
-| `listed`     | do not search this, do not serve it     | the funnel                      |
-| `onDropList` | this identifier is on California's list | anything reporting to the state |
-| `source`     | `drop` or `suppressed-report`           | logs and triage                 |
-
-`listed` is true for either source, so a caller that reads nothing else gets the
-cautious behaviour. `onDropList` is the statutory fact and has to be asked for
-**by name**, because a suppressed-report value read as DROP membership would put
-a match into a compliance record California never asked for.
+It reads two KV keys — the DROP hash itself and a `suppressed:` key from a
+report we had to suppress earlier — and both produce the same `true`. Which one
+answered stays inside the Worker. The statutory fact, _this identifier belongs
+to a consumer who asked to be deleted_, is not something a caller should infer
+from a gate read at all: it lives in `ca_drop_work_item`, and Cron B reports
+from there.
 
 The intended caller is the **website, before the lookup funnel starts**: one
 question, and a listed subject costs no provider call at all. Nothing calls it
@@ -416,8 +413,9 @@ Two things this is **not**:
 - **Not a compliance record.** "Searching this yields data we must suppress" is
   ours and derived. "This identifier belongs to a consumer who asked to be
   deleted" is California's, and lives in `ca_drop_work_item`. Cron B reports from
-  the second and must never report from the first, which is why the gate says
-  which of the two it answered from (`source`).
+  the second and must never report from the first, which is why the gate answers
+  `listed` alone and names neither source: there is nothing in its answer a
+  caller could mistake for DROP membership.
 - **Not on the answer's path.** It is a cost optimisation. Losing it costs one
   provider fan-out. It runs in `waitUntil`, after the response, and can never
   delay a request or change an answer.
