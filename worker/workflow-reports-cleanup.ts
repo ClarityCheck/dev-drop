@@ -1,8 +1,8 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { chInsert, chQuery, deleteEntityRows } from "./ch";
-import type { EntityKey } from "./ch";
+import { chInsert, chQuery, deleteEntityRows, erasePeopleElements } from "./ch";
+import type { ElementKey, EntityKey } from "./ch";
 import { countWorkItems, incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
 import {
@@ -29,7 +29,9 @@ import { isSuppressedKey } from "./drop-suppression";
  *   ⑤ per chunk of matches:
  *        the rows in public.ca_drop_work_item_match
  *        the Better Stack alert
- *        erase the matched records from default.entity_search_results
+ *        erase the matched records from default.entity_search_results —
+ *          every row for a phone or e-mail identifier, only the matched
+ *          array elements for a people one
  *        status 'deleted' on the work item — only once the erase is verified
  *        the R2 evidence file
  *   ⑥ clear ca_drop_work_items again
@@ -98,13 +100,74 @@ type Params = {
 type KvMeta = { work_item_id?: string; list_type?: string; request_date?: string };
 
 /** One row of the match result. */
-type MatchResult = {
+export type MatchResult = {
 	list_type: string;
 	work_item_id: string;
 	type: string;
 	normalized_value: string;
 	hash: string;
+	/** the stored row the match came from — people only, '' otherwise */
+	provider: string;
+	service: string;
+	created_at: string;
+	/** which element of a people report matched — '' for phone and e-mail */
+	element_digest: string;
 };
+
+/** What a chunk of matches has to erase, split by what a match MEANS. */
+export type ErasurePlan = { rows: EntityKey[]; elements: ElementKey[] };
+
+/**
+ * Which erase each match earns. This is Rule 2, and it is the only place the
+ * two shapes are told apart.
+ *
+ *   phone / email   every provider row for the identifier goes. All of them
+ *                   describe the consumer who is listed.
+ *
+ *   people          only the matched elements go and the row survives. The
+ *                   other elements are other people — search "John Smith",
+ *                   get forty, and thirty-nine of them never registered.
+ *
+ * Deduped on both sides: one identifier can match several work items, and one
+ * element can match on its e-mail and its NDZ key at once. It is one erase
+ * either way.
+ *
+ * A people match with no element_digest is refused rather than widened into a
+ * whole-row delete. It can only mean the view and this code disagree about the
+ * people path — a v3 view, or a people row whose payload is not an array — and
+ * under Rule 3 something that cannot be done correctly must not be reported as
+ * done. The alternative is the bug this function exists to prevent.
+ */
+export function planErasures(matches: MatchResult[]): ErasurePlan {
+	const rows = new Map<string, EntityKey>();
+	const elements = new Map<string, ElementKey>();
+
+	for (const m of matches) {
+		if (m.type !== "people") {
+			rows.set(`${m.type}::${m.normalized_value}`, {
+				type: m.type,
+				normalized_value: m.normalized_value,
+			});
+			continue;
+		}
+		if (!m.element_digest) {
+			// work_item_id and list_type are DROP's own identifiers and carry no
+			// plaintext, so they are the only things this may name.
+			throw new NonRetryableError(
+				`people match on ${m.list_type} work item ${m.work_item_id} carries no ` +
+					"element_digest — the view cannot say which element matched, and erasing " +
+					"the whole row would delete people who are not on the DROP list. Rebuild " +
+					"the view as v4",
+			);
+		}
+		elements.set(`${m.normalized_value}::${m.element_digest}`, {
+			normalized_value: m.normalized_value,
+			element_digest: m.element_digest,
+		});
+	}
+
+	return { rows: [...rows.values()], elements: [...elements.values()] };
+}
 
 export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
@@ -132,6 +195,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let matchRowsInserted = 0;
 		let workItemsMarked = 0;
 		let entityRowsExpired = 0;
+		let peopleRecordsErased = 0;
 		let lastMatchLog = "";
 
 		const notifyStep = async (
@@ -341,6 +405,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					matchRowsInserted += result.inserted;
 					workItemsMarked += result.statusSet;
 					entityRowsExpired += result.rowsExpired;
+					peopleRecordsErased += result.recordsErased;
 					if (result.matchLog) lastMatchLog = result.matchLog;
 				}
 
@@ -423,7 +488,11 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				matchesUnlinked: totalMatches - matchesLinked,
 				matchRowsInserted,
 				workItemsMarkedDeleted: workItemsMarked,
+				// Rows deleted whole, for phone and e-mail identifiers, and
+				// records cut out of a surviving people payload. Two numbers
+				// because they are two different claims about the data.
 				entityRowsExpired,
+				peopleRecordsErased,
 				chunks: chunk,
 				dryRun: dryRun ? 1 : 0,
 			};
@@ -450,6 +519,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					matchRowsInserted,
 					workItemsMarkedDeleted: workItemsMarked,
 					entityRowsExpired,
+					peopleRecordsErased,
 				},
 			});
 			throw e;
@@ -476,18 +546,31 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		// why the start entries matter as much as the ends.
 		const phase = phaseTracer(this.env, ctx, `record and erase · chunk ${chunk}`);
 
+		// Every projected column is in the ORDER BY, which makes it a total
+		// order. LIMIT/OFFSET over a partial order lets ties come back in a
+		// different arrangement per page, so a row can be served twice and
+		// another never — and the one never served is a deletion that was
+		// counted and not performed.
 		const matches = await phase("clickhouse: select matches", () =>
 			chQuery<MatchResult>(
 				this.env,
 				`${MATCH_SQL}
-				 ORDER BY list_type, work_item_id, type, normalized_value
+				 ORDER BY list_type, work_item_id, type, normalized_value,
+				          provider, service, created_at, element_digest, hash
 				 LIMIT {limit:UInt64} OFFSET {offset:UInt64}`,
 				{ limit, offset },
 			),
 		);
 
 		if (matches.length === 0) {
-			return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: "" };
+			return {
+				linked: 0,
+				inserted: 0,
+				statusSet: 0,
+				rowsExpired: 0,
+				recordsErased: 0,
+				matchLog: "",
+			};
 		}
 
 		const alerts: MatchAlert[] = matches.map((m) => ({
@@ -501,23 +584,22 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			matched_normalized_value: m.normalized_value,
 		}));
 
-		// The identifiers whose records have to go. Deduped: one identifier can
-		// match more than one work item, and it is one row's worth of records
-		// either way.
-		const toExpire = new Map<string, EntityKey>();
-		for (const m of matches) {
-			toExpire.set(`${m.type}::${m.normalized_value}`, {
-				type: m.type,
-				normalized_value: m.normalized_value,
-			});
-		}
+		// What has to go, and what a match means decides which.
+		const plan = planErasures(matches);
 
 		if (dryRun) {
 			const outcome: MatchOutcome = { ok: false, reason: "dryRun — nothing written or erased" };
 			const text = await phase("betterstack: dry-run alert", () =>
 				logMatches(this.env, ctx, chunk, alerts, outcome),
 			);
-			return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: text };
+			return {
+				linked: 0,
+				inserted: 0,
+				statusSet: 0,
+				rowsExpired: 0,
+				recordsErased: 0,
+				matchLog: text,
+			};
 		}
 
 		// the match rows first — the erase destroys the only other evidence
@@ -537,12 +619,25 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			logMatches(this.env, ctx, chunk, alerts, { ok: true }),
 		);
 
-		// erase, and verify rather than assume
-		const expired = await phase("clickhouse: erase matched records", () =>
-			deleteEntityRows(this.env, [...toExpire.values()]),
+		// erase, and verify rather than assume — one call per shape, because a
+		// people row is supposed to survive its erasure and a row count would
+		// call that a failure
+		const expired = await phase("clickhouse: erase matched rows", () =>
+			deleteEntityRows(this.env, plan.rows),
 		);
 		if (expired.after > 0) {
 			const why = `${expired.after} of ${expired.before} entity_search_results row(s) survived the delete`;
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+			throw new Error(`chunk ${chunk}: ${why}`);
+		}
+
+		const erased = await phase("clickhouse: erase matched people records", () =>
+			erasePeopleElements(this.env, plan.elements),
+		);
+		if (erased.after > 0) {
+			const why =
+				`${erased.after} of ${erased.before} DROP-listed record(s) are still in the stored ` +
+				"people payloads after the update";
 			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
 			throw new Error(`chunk ${chunk}: ${why}`);
 		}
@@ -572,6 +667,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			inserted: written.inserted,
 			statusSet,
 			rowsExpired: expired.before - expired.after,
+			recordsErased: erased.before - erased.after,
 			matchLog,
 		};
 	}
@@ -593,6 +689,12 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
  * Joining on (list_type, hash) rather than hash alone keeps a key matched
  * against the list it was derived for. A collision across lists is not a real
  * risk with SHA-256 — this is about saying what is meant.
+ *
+ * WHAT THE MATCH NAMES is the view's grain, and it decides what may be erased.
+ * A phone or e-mail row is one identifier with every provider merged into it,
+ * so the match names the identifier. A people row is ONE ARRAY ELEMENT of one
+ * stored row version, so the match names that element by its digest and the
+ * erase can take it without touching the thirty-nine strangers beside it.
  */
 const MATCH_SQL = `
 SELECT
@@ -600,11 +702,17 @@ SELECT
     d.work_item_id     AS work_item_id,
     c.type             AS type,
     c.normalized_value AS normalized_value,
+    c.provider         AS provider,
+    c.service          AS service,
+    c.created_at       AS created_at,
+    c.element_digest   AS element_digest,
     c.hash             AS hash
 FROM
 (
 ${LISTS.map(
-	(l) => `    SELECT '${l}' AS list_type, type, normalized_value, arrayJoin(${KEY_COLUMN[l]}) AS hash
+	(l) => `    SELECT '${l}' AS list_type, type, normalized_value,
+           provider, service, created_at, element_digest,
+           arrayJoin(${KEY_COLUMN[l]}) AS hash
     FROM default.ca_drop_combined_search_result
     WHERE notEmpty(${KEY_COLUMN[l]})`,
 ).join("\n    UNION ALL\n")}

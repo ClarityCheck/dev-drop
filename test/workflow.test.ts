@@ -1,6 +1,8 @@
 import { env, introspectWorkflowInstance } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { incompleteReason } from "../worker/db";
+import { planErasures } from "../worker/workflow-reports-cleanup";
+import type { MatchResult } from "../worker/workflow-reports-cleanup";
 
 /**
  * Cron C's control flow, tested without ClickHouse, KV or Supabase.
@@ -13,7 +15,15 @@ import { incompleteReason } from "../worker/db";
 
 /** A mocked return from handleChunk — the same shape the real one produces. */
 function chunkResult(over: Record<string, unknown> = {}) {
-	return { linked: 0, inserted: 0, statusSet: 0, rowsExpired: 0, matchLog: "", ...over };
+	return {
+		linked: 0,
+		inserted: 0,
+		statusSet: 0,
+		rowsExpired: 0,
+		recordsErased: 0,
+		matchLog: "",
+		...over,
+	};
 }
 
 describe("DropReportsCleanupWorkflow", () => {
@@ -31,11 +41,23 @@ describe("DropReportsCleanupWorkflow", () => {
 			await m.mockStepResult({ name: "match" }, 25);
 			await m.mockStepResult(
 				{ name: "record and erase · chunk 1" },
-				chunkResult({ linked: 10, inserted: 10, statusSet: 4, rowsExpired: 31 }),
+				chunkResult({
+					linked: 10,
+					inserted: 10,
+					statusSet: 4,
+					rowsExpired: 31,
+					recordsErased: 2,
+				}),
 			);
 			await m.mockStepResult(
 				{ name: "record and erase · chunk 2" },
-				chunkResult({ linked: 10, inserted: 10, statusSet: 3, rowsExpired: 12 }),
+				chunkResult({
+					linked: 10,
+					inserted: 10,
+					statusSet: 3,
+					rowsExpired: 12,
+					recordsErased: 5,
+				}),
 			);
 			await m.mockStepResult(
 				{ name: "record and erase · chunk 3" },
@@ -59,6 +81,9 @@ describe("DropReportsCleanupWorkflow", () => {
 		expect(output.matchRowsInserted).toBe(20);
 		expect(output.workItemsMarkedDeleted).toBe(9);
 		expect(output.entityRowsExpired).toBe(50);
+		// The two erasures are summed apart: rows deleted whole for a phone or
+		// e-mail identifier, records cut out of a people payload the row keeps.
+		expect(output.peopleRecordsErased).toBe(7);
 		expect(output.matchesUnlinked).toBe(0);
 	});
 
@@ -106,6 +131,85 @@ describe("DropReportsCleanupWorkflow", () => {
 		const src = await import("../worker/workflow-reports-cleanup");
 		expect(src.DropReportsCleanupWorkflow).toBeDefined();
 		expect(String(src.DropReportsCleanupWorkflow)).not.toContain("waitForEvent");
+	});
+});
+
+/**
+ * Which erase a match earns — Rule 2 in one function.
+ *
+ * The sweep is the primary defence and it is the destructive one, so getting
+ * this wrong is not "a report is served for one more cycle": it is thirty-nine
+ * strangers irreversibly deleted by ALTER TABLE ... DELETE because a fortieth
+ * John Smith registered with DROP.
+ */
+describe("planErasures", () => {
+	const match = (over: Partial<MatchResult> = {}): MatchResult => ({
+		list_type: "ndz",
+		work_item_id: "wi-1",
+		type: "people",
+		normalized_value: "john smith",
+		hash: "aGFzaA==",
+		provider: "combined_people",
+		service: "people",
+		created_at: "2026-09-16 10:00:00.000",
+		element_digest: "ZGlnZXN0LTE=",
+		...over,
+	});
+
+	it("takes only the matched element of a people report", () => {
+		const plan = planErasures([match()]);
+
+		expect(plan.rows).toEqual([]);
+		expect(plan.elements).toEqual([
+			{ normalized_value: "john smith", element_digest: "ZGlnZXN0LTE=" },
+		]);
+	});
+
+	it("leaves the other people of the same report alone", () => {
+		// Two elements of one report, one listed. Only one digest may travel:
+		// the erase is keyed on the digest set, so a second entry here is a
+		// second person deleted.
+		const plan = planErasures([
+			match({ element_digest: "bGlzdGVk" }),
+			match({ list_type: "email", work_item_id: "wi-2", element_digest: "bGlzdGVk" }),
+		]);
+
+		expect(plan.elements).toHaveLength(1);
+		expect(plan.elements[0].element_digest).toBe("bGlzdGVk");
+	});
+
+	it("takes every row of a matched phone or e-mail report", () => {
+		// The opposite rule, and the one that must not leak into people:
+		// every provider row describes the listed consumer.
+		const plan = planErasures([
+			match({ type: "phone", normalized_value: "4155559317", element_digest: "" }),
+			match({
+				type: "phone",
+				normalized_value: "4155559317",
+				work_item_id: "wi-2",
+				element_digest: "",
+			}),
+		]);
+
+		expect(plan.elements).toEqual([]);
+		expect(plan.rows).toEqual([{ type: "phone", normalized_value: "4155559317" }]);
+	});
+
+	it("keeps the two shapes apart in one chunk", () => {
+		const plan = planErasures([
+			match(),
+			match({ type: "email", normalized_value: "a@example.com", element_digest: "" }),
+		]);
+
+		expect(plan.rows).toEqual([{ type: "email", normalized_value: "a@example.com" }]);
+		expect(plan.elements).toHaveLength(1);
+	});
+
+	it("refuses a people match it cannot place, instead of erasing the row", () => {
+		// A v3 view has no element_digest. Failing the chunk leaves the records
+		// in place for one more cycle, which is recoverable; widening the erase
+		// to the whole row is not.
+		expect(() => planErasures([match({ element_digest: "" })])).toThrow(/element_digest/);
 	});
 });
 

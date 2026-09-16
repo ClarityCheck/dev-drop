@@ -24,7 +24,7 @@ Periodic, and Cron B's job. A work item nobody has looked at is still reported �
 as `5 Not found` — so silence is an answer, and one we may be wrong about.
 
 The list must be downloaded **at least every 45 days**. The cycle is the unit of
-work: download, match, erase, report. Cron B has to run *after* Cron C for its
+work: download, match, erase, report. Cron B has to run _after_ Cron C for its
 answers to be true, and nothing enforces that ordering.
 
 ### The download is a delta
@@ -61,10 +61,10 @@ to differ from "given and then withdrawn".
 
 **Supabase is stamped before KV is deleted from**, and the order is load-bearing:
 
-| Failure | Result |
-|---|---|
-| stamped, KV delete fails | we keep suppressing someone who withdrew — over-suppression, and the next run retries |
-| KV deleted, stamp fails | we release them *and* still report them as ours, and the KV repair puts the hash straight back |
+| Failure                  | Result                                                                                         |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| stamped, KV delete fails | we keep suppressing someone who withdrew — over-suppression, and the next run retries          |
+| KV deleted, stamp fails  | we release them _and_ still report them as ours, and the KV repair puts the hash straight back |
 
 Everything that reads work items reads **live ones only** — the KV rebuild, the
 KV health sample, and the expected-count comparison Cron C makes. A revoked item
@@ -77,12 +77,12 @@ does not know which of its identifiers we were given.
 
 ### The four status codes
 
-| Code | Meaning | When we say it |
-|---|---|---|
-| `2` | Exempted | by policy — a legal basis to keep the data |
-| `3` | Deleted | we held data about them and erased it |
-| `4` | Opted out | they are suppressed but the data is retained |
-| `5` | Not found | we hold nothing about them |
+| Code | Meaning   | When we say it                               |
+| ---- | --------- | -------------------------------------------- |
+| `2`  | Exempted  | by policy — a legal basis to keep the data   |
+| `3`  | Deleted   | we held data about them and erased it        |
+| `4`  | Opted out | they are suppressed but the data is retained |
+| `5`  | Not found | we hold nothing about them                   |
 
 Codes `0` and `1` are unused by the specification. `5` is the default for
 anything untouched, which is why a Cron B that runs before Cron C reports a
@@ -98,12 +98,12 @@ of an exception.
 
 Four lists. Each entry is a work item ID and a Base64 SHA-256 hash.
 
-| List | Hashed input |
-|---|---|
-| `email` | the address, whitespace removed, lowercased |
-| `phone` | digits only, last ten |
-| `ndz` | `sha256(first) + sha256(last) + sha256(dob) + sha256(zip)`, hashed again |
-| `namevin` | `sha256(first) + sha256(last) + sha256(vin)`, hashed again |
+| List      | Hashed input                                                             |
+| --------- | ------------------------------------------------------------------------ |
+| `email`   | the address, whitespace removed, lowercased                              |
+| `phone`   | digits only, last ten                                                    |
+| `ndz`     | `sha256(first) + sha256(last) + sha256(dob) + sha256(zip)`, hashed again |
+| `namevin` | `sha256(first) + sha256(last) + sha256(vin)`, hashed again               |
 
 `ndz` and `namevin` are composites: every first name, last name, date of birth
 and ZIP held for a person is hashed in every combination, so one consumer can
@@ -117,7 +117,7 @@ guard that seam. `test/drop-report.test.ts` asserts the specification's own
 published hashes, and both it and `test/drop-normalize.test.ts` carry vectors
 generated from the view's SQL.
 
-## 2. The rule that governs everything else: what an array element *is*
+## 2. The rule that governs everything else: what an array element _is_
 
 Every report we check is an array. What its elements represent decides how a
 match propagates, and getting it wrong is the difference between suppressing a
@@ -128,7 +128,7 @@ back forty John Smiths. One registered with DROP; the other thirty-nine did
 not, and their records are not his.
 
 **A phone or email report's elements are providers.** Search a phone number, get
-one payload per provider — Veriphone, Pipl, PDL — each describing the *same*
+one payload per provider — Veriphone, Pipl, PDL — each describing the _same_
 person, the subject of the search. They are views, not people.
 
 Two consequences, running in opposite directions:
@@ -136,7 +136,7 @@ Two consequences, running in opposite directions:
 - **Keys may be combined across providers, and must not be combined across
   people.** If Veriphone returns the name and Pipl the date of birth and ZIP,
   those four factors belong to one person and form one `ndz` key. Deriving them
-  per provider produces *no* `ndz` key at all — each provider is missing a
+  per provider produces _no_ `ndz` key at all — each provider is missing a
   factor — and an NDZ-registered consumer is never matched. Combining across two
   people in a people report invents a key for someone who does not exist.
 - **A match condemns the whole phone/email report, and only one element of a
@@ -146,15 +146,39 @@ Two consequences, running in opposite directions:
 
 `reportGroups()` in `worker/drop-report.ts` decides this: one group per element
 for people, one merged group for phone and email. The subject is its own group
-in both cases, so `subjectListed` distinguishes the statutory fact — *this
-identifier is on a DROP list* — from the wider finding that the report is about
+in both cases, so `subjectListed` distinguishes the statutory fact — _this
+identifier is on a DROP list_ — from the wider finding that the report is about
 someone who is.
 
 ### Cron C groups the same way
 
 `sql/clickhouse.sql` builds view `ca_drop_combined_search_result`, `spec_version`
-v3, which merges providers for phone and email and keeps per-element grouping
-for people, matching `reportGroups()`. It is live on DEV.
+v4, whose **grain is the grouping rule**:
+
+| Report shape  | One view row is                                                  |
+| ------------- | ---------------------------------------------------------------- |
+| people        | one array element of one stored row version, named by its digest |
+| phone / email | one `(type, normalized_value)`, every provider merged into it    |
+
+It is one `GROUP BY` whose key carries the element locator for people and a
+constant for the other two, so both halves of the rule come out of one
+derivation rather than two that can drift apart. `reportGroups()` makes the same
+split in the Worker.
+
+The grain is not only about deriving keys correctly. It is what makes the matched
+**element** nameable, and without that Rule 2 cannot be kept at all: a match
+that can name only the identifier leaves the whole row as the one thing there is
+to erase.
+
+A match carries `element_digest`, the SHA-256 of the element's raw JSON, and
+**not** its array position. `entity_search_results` is a `ReplacingMergeTree`,
+so several versions of one key coexist with different array lengths and
+different people at the same index, and the view is refreshed long before the
+erase runs. A position is meaningful only against the array it was read from; a
+digest is meaningful against every stored copy of that element.
+
+DEV still carries v3, which had no element identity at all. §7 has what that
+costs until the view is rebuilt.
 
 The view caps the factors exactly as `FIELD_CAPS` does — 10 first names, 10 last
 names, 5 dates of birth, 24 ZIPs, 12 VINs — **sorted and sliced on the
@@ -165,30 +189,33 @@ the 20,000 cut and derive no composites at all.
 
 Order matters twice over:
 
-| | |
-|---|---|
-| people | cap per element → keys per element → union |
+|               |                                                                                   |
+| ------------- | --------------------------------------------------------------------------------- |
+| people        | cap per element → keys per element, and never a union across elements             |
 | phone / email | union the raw fields across providers → **then** cap → **then** one cross product |
 
-Capping before merging would take each provider's first ten names and merge
-those, which is not the ten the Worker picks.
+Both fall out of capping _after_ the grouping and never before it. Capping first
+would take each provider's own first ten names and merge those, which is not the
+ten the Worker picks.
 
 One group is bounded at `10·10·5·24 + 10·10·12` = 13,200 keys, so for phone and
 email the 20,000 cut is unreachable and the two sides agree exactly. A people
-report sums its groups and can still cross it; its composites are then dropped,
-as they are in the Worker. On DEV no row has crossed it — `oversized_records` is
-0 across all 2,033 values.
+report sums its elements and can still cross it; its composites are then
+dropped, as they are in the Worker. The cut stays a decision about the whole
+report even though a people report is now many rows — the view sums the report
+with a window — because the Worker adds up its groups the same way.
+On DEV no row has crossed it — `oversized_records` is 0 across all 2,033 values.
 
 ## 2a. What is checked, and what is not
 
-| Lookup | Screened | Why |
-|---|---|---|
-| phone | yes | the subject is itself a DROP key |
-| email | yes | the subject is itself a DROP key |
-| people | yes | no subject key, but the records carry NDZ and NameVIN keys |
-| VIN | **no** | — |
-| username | **no** | — |
-| entity | **no** | — |
+| Lookup   | Screened | Why                                                        |
+| -------- | -------- | ---------------------------------------------------------- |
+| phone    | yes      | the subject is itself a DROP key                           |
+| email    | yes      | the subject is itself a DROP key                           |
+| people   | yes      | no subject key, but the records carry NDZ and NameVIN keys |
+| VIN      | **no**   | —                                                          |
+| username | **no**   | —                                                          |
+| entity   | **no**   | —                                                          |
 
 The three unscreened types have weaker keys, not no keys: a VIN report can carry
 a name and a VIN, which is a `namevin` key exactly. "Weaker" is not a reason, it
@@ -212,13 +239,25 @@ Nothing from it is served, and nothing from it is stored.
 
 ### Rule 2 — a matched people report loses only the matched elements
 
-The report is still served and still stored, without those people.
+The report is still served and still stored, without those people. This holds on
+every path that can erase, including — especially — the sweep, which is the
+destructive one and reaches everything.
 
 - **Fresh report.** The filtered array is written.
-- **Cached report.** The stored payload is edited in place: the matched array
-  positions are removed and the row survives. The edit is pinned to the exact
-  row version that was read, because positions belong to one array and applying
-  them to another deletes the wrong people.
+- **Cached report, on the request path.** The stored payload is edited in place:
+  the matched array positions are removed and the row survives. The edit is
+  pinned to the exact row version that was read, because positions belong to one
+  array and applying them to another deletes the wrong people.
+- **Cached report, in the sweep.** The same array surgery, keyed on the
+  element's digest instead of its position, so it needs no pinning and clears
+  every stored version of that element in one mutation. A whole-row delete here
+  would take the other thirty-nine John Smiths, irreversibly, and it is the
+  path most likely to find the match first.
+
+`ALTER TABLE … UPDATE`, not a rewrite sent from the Worker: the payload runs to
+megabytes, and ClickHouse edits its own stored value. It is a mutation for the
+same reason the delete is one — the part is rewritten, so the old payload does
+not sit on disk waiting for a merge.
 
 ### Rule 3 — a check that cannot run is never a clean result
 
@@ -234,7 +273,7 @@ deleted. So:
 - The failure raises a **Better Stack alert**. A silent fail-closed is a
   suppression system that has stopped working with nobody aware.
 
-A *reduced* check is the middle case. When a report's cross product is too large
+A _reduced_ check is the middle case. When a report's cross product is too large
 to run in full, the composite keys are capped (`FIELD_CAPS`) or dropped entirely
 in favour of the exact email and phone keys, and the answer carries
 `partial: true`. A match under `partial` is as trustworthy as any; a **miss** is
@@ -247,11 +286,11 @@ check stays complete however noisy the payload is.
 
 ## 4. The endpoints, and who calls them
 
-| Endpoint | Caller | Question it answers |
-|---|---|---|
-| `POST /api/drop/check` | website | is this one identifier suppressed? |
-| `POST /api/drop/report-check` | lookup API | does this report touch any DROP key? |
-| `POST /api/drop/match-found` | lookup API | record the match — **before** erasing |
+| Endpoint                        | Caller     | Question it answers                        |
+| ------------------------------- | ---------- | ------------------------------------------ |
+| `POST /api/drop/check`          | website    | is this one identifier suppressed?         |
+| `POST /api/drop/report-check`   | lookup API | does this report touch any DROP key?       |
+| `POST /api/drop/match-found`    | lookup API | record the match — **before** erasing      |
 | `POST /api/drop/erase-incident` | lookup API | the erase is done; verify and close it out |
 
 `report-check` writes nothing and erases nothing. It answers, and the caller
@@ -261,11 +300,11 @@ decides.
 
 `/api/drop/check` is asked about one identifier and returns both:
 
-| Field | Meaning | Who reads it |
-|---|---|---|
-| `listed` | do not search this, do not serve it | the funnel |
+| Field        | Meaning                                 | Who reads it                    |
+| ------------ | --------------------------------------- | ------------------------------- |
+| `listed`     | do not search this, do not serve it     | the funnel                      |
 | `onDropList` | this identifier is on California's list | anything reporting to the state |
-| `source` | `drop` or `suppressed-report` | logs and triage |
+| `source`     | `drop` or `suppressed-report`           | logs and triage                 |
 
 `listed` is true for either source, so a caller that reads nothing else gets the
 cautious behaviour. `onDropList` is the statutory fact and has to be asked for
@@ -282,12 +321,14 @@ Three lines of defence, in order:
 
 1. **Before the write** — a fresh report is screened and listed records are
    never stored (Rules 1 and 2).
-2. **The sweep** — Cron C erases what is already stored, every cycle.
+2. **The sweep** — Cron C erases what is already stored, every cycle, by the
+   same two rules: the whole row set for a phone or email identifier, the
+   matched elements only for a people report.
 3. **The request path** — a cached report is re-checked when someone searches
    for it, and this is where the erase sequence below runs.
 
 Step 3 catches only what steps 1 and 2 missed, so the erase is the small part.
-The important part is what a step-3 event *means*: a report Cron C was told to
+The important part is what a step-3 event _means_: a report Cron C was told to
 erase by a new DROP diff is still sitting in `entity_search_results`. Either the
 sweep has not run since the diff arrived, or it ran and missed — a partial KV
 sync, a failed chunk, a view that did not refresh, a normalization drift. All of
@@ -326,7 +367,7 @@ still discoverable.
 
 It does not set `status = 'deleted'` on the work item. That status is what Cron B
 reports to California as **code 3 Deleted**, and it is a claim about the
-*consumer*, not about one report. This path erased the rows for one
+_consumer_, not about one report. This path erased the rows for one
 `normalized_value`; an `ndz` work item stands for a person who may sit in dozens
 of other cached emails and phone numbers it never touched. Cron C can make that
 claim because it sweeps everything in one run. This path cannot, so it writes the
@@ -373,15 +414,23 @@ Ranked by how hard it is to notice.
 2. **Wrong grouping** — combining keys across people, or failing to combine them
    across providers. No error; the second under-matches exactly the NDZ
    registrations it exists to catch.
+
+   Since v4 the grouping also decides what the sweep is allowed to erase, and
+   that half does **not** fail quietly: a grain that cannot name the matched
+   element makes every people erase a whole-row delete, and the strangers in
+   that array are gone with an `ALTER TABLE … DELETE` that cannot be undone.
+   Cron C refuses a people match with no element rather than widening it, which
+   is why this is the one item on the list that stops the run.
+
 3. **A partial KV sync.** Cron C matches against whatever made it into the
    mirror, and a missed match is indistinguishable from no match.
 4. **A fail-closed nobody alerted on.** The system is refusing to serve, which is
    safe, but it has stopped suppressing anyone and looks healthy from outside.
 
-Every one of these fails quietly and in the direction of serving data we should
-not serve. That is why the checks that exist — the conformance vectors, the KV
-health sample, the read-back verification in `erase-incident` — are not optional
-extras.
+Every one of these fails quietly and, but for the erase noted above, in the
+direction of serving data we should not serve. That is why the checks that exist
+— the conformance vectors, the KV health sample, the read-back verification in
+`erase-incident` — are not optional extras.
 
 ## 7. Where the code does not yet meet this document
 
@@ -390,9 +439,16 @@ ordered by consequence rather than by effort.
 
 ### It stops suppressing, or never starts
 
-- **`DROP_WORKER_URL` is not set anywhere.** Unset means unconfigured, and
-  fail-closed turns that into a 503 on every screened lookup. Deploying the API
-  before setting it takes phone, email and people search down.
+- **The live DEV view is v3, and the sweep does not run until it is v4.** v4
+  changes the view's grain, so it cannot be altered into place: `DROP VIEW`,
+  re-run `sql/clickhouse.sql`'s section 2, `SYSTEM REFRESH VIEW` — in that
+  order, and **before** the Worker is deployed. The grants survive, because
+  ClickHouse records a privilege against the name. Cron C selects
+  `element_digest`, so against a v3 view the match fails outright rather than
+  matching less; a people match that cannot name its element is refused rather
+  than widened into a whole-row delete. That is the right direction — a failed
+  run alerts, and the records are still there for the next one — but for as long
+  as the two disagree there is no sweep.
 - **The Worker has no authentication.** `report-check` is an oracle for testing
   whether a value is on the DROP list, and `erase-incident` writes a compliance
   record and is trusted to have been called honestly. The API sends
@@ -403,27 +459,16 @@ ordered by consequence rather than by effort.
 
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.
-- **`drop_workflow_role` carries grants nobody granted, on DEV.** The live role
-  holds 11 privileges where `sql/clickhouse.sql` §6 expects 8. The extras are
-  `SELECT` and `INSERT` on `ca_drop_match_run`, a table that no longer exists,
-  and `ALTER DELETE` on `ca_drop_work_items`. ClickHouse records a privilege
-  against the *name*, so these survive the table being dropped and would
-  re-attach to anything that reused the name. §3 of the file opens with
-  `REVOKE ALL ON *.* FROM drop_workflow_role`, which is what holds the count at
-  8; DEV still needs that revoke and the grants replayed once.
 - **An oversized report is handled differently on the two sides.** Both cap the
   factors identically. Past the 20,000 total the Worker falls back to the exact
   keys and flags `partial`, while the view drops the composites. Reachable only
   for a very wide people report, and the direction is that the view checks
-  *more* than the Worker rather than less.
+  _more_ than the Worker rather than less.
 - **`arraySort` orders by UTF-8 bytes; JavaScript `sort()` by UTF-16 code
   units.** They agree for everything in the Basic Multilingual Plane, which is
   all of `[a-z0-9]` and almost all CJK. A name containing a character above
   U+FFFF could be capped to a different subset on the two sides. Rare, and it
   only matters for a report already over a cap.
-- **Nothing gates Cron B on Cron C.** Absence of a status reads as `5 Not
-  found`, so a Cron B that fires first reports a clean sheet for a cycle whose
-  matches were never looked for.
 
 ### Rule 3 is implemented except for its alerting half
 
@@ -439,15 +484,9 @@ ordered by consequence rather than by effort.
   `logRun`, so the side that actually knows the check could not run reports
   nothing. The cron paths already use `logRun`/`logMatches` against Better Stack;
   the gate routes should use the same.
-- **`failed` does not say why.** A DROP outage and a provider timeout both
-  surface as `status: "failed"`, so the client cannot distinguish "we could not
-  verify" from "the lookup broke".
 
 ### It costs more than it needs to
 
-- **Nothing calls `/api/drop/check`.** The suppression cache (§5) is written and
-  maintained and no caller reads it, so a permanently-suppressed value still
-  pays a full provider fan-out on every search.
 - **The second half of the erase sequence is fire-and-forget.**
   `reportErasure`'s return value is discarded at both call sites. After a
   successful `match-found` the unrecoverable case is closed, but a lost
@@ -457,7 +496,7 @@ ordered by consequence rather than by effort.
 ### Outside this pipeline, but it decides what the pipeline can audit
 
 - **The ClickHouse write buffer can lose a report.** `flush()` reads and deletes
-  the Redis batch *before* an insert that can fail all three retries, so a
+  the Redis batch _before_ an insert that can fail all three retries, so a
   dropped batch never reaches ClickHouse — and Cron C cannot audit what was
   never stored.
 - **Report history is written at initiation, not on completion.** The website
@@ -467,19 +506,3 @@ ordered by consequence rather than by effort.
   searched value.
 
 ---
-
-## Keeping this file honest
-
-It describes rules, so it goes stale when a rule changes rather than when code
-moves. The places that pin each rule down:
-
-| Rule | Pinned by |
-|---|---|
-| normalization (§1) | `test/drop-report.test.ts` — vectors from the published spec *and* from the view's own SQL |
-| grouping (§2) | `reportGroups()` in `worker/drop-report.ts`, and the tests that assert no key crosses a people boundary |
-| Rule 1 / Rule 2 | `screenAndPersistRecords` and `finalizePeopleReport` in the lookup API |
-| Rule 3 | the 503 contract in `worker/index.ts`, `DropCheckService.unverified` |
-| revocation (§0) | `markWorkItemsRevoked` in `worker/db.ts`, and the `revoked_at IS NULL` filter on all three readers |
-| erase ordering (§4) | the test asserting the literal sequence `['match-found', 'erase']` |
-
-If you change a rule, change this file in the same commit.

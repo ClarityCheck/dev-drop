@@ -55,6 +55,22 @@ SELECT count() AS rows FROM default.ca_drop_combined_search_result
 SQL
 
 echo
+echo "1b. The view is v4, and its people rows name their element"
+echo "    Cron C selects element_digest and refuses a people match without"
+echo "    one, so a v3 view here means the sweep does not run at all."
+ch "spec_version and element identity" "default_format=JSONEachRow" <<'SQL'
+SELECT
+    spec_version,
+    count()                                                         AS rows,
+    countIf(type = 'people')                                        AS people_rows,
+    countIf(type = 'people' AND element_digest = '')                AS people_without_element,
+    uniqExactIf(normalized_value, type = 'people')                  AS people_values
+FROM default.ca_drop_combined_search_result
+GROUP BY spec_version
+SQL
+echo "   Expect v4, and people_without_element = 0."
+
+echo
 echo "2. SELECT on system.view_refreshes"
 ch "read system.view_refreshes" "default_format=JSONEachRow" <<'SQL'
 SELECT status, ifNull(toUnixTimestamp(last_success_time), 0) AS last_success
@@ -146,7 +162,16 @@ SQL
 echo "   keys_emitted should be exactly 50 — the budget, filled across rows."
 
 echo
-echo "6. Nothing beyond the three grants (each of these SHOULD fail)"
+echo "6. SELECT on entity_search_results"
+echo "   The broad one, and granted deliberately: the workflow counts what it"
+echo "   matched before and after so it can verify the erase rather than trust"
+echo "   it, and the incident endpoint reads payloads back through it."
+ch "read entity_search_results" "default_format=JSONEachRow" <<'SQL'
+SELECT count() AS rows FROM default.entity_search_results
+SQL
+
+echo
+echo "7. Nothing beyond the granted five (each of these SHOULD fail)"
 ch_expect_denied() {
 	local label="$1" body code out
 	body=$(cat)
@@ -163,11 +188,16 @@ ch_expect_denied() {
 	fi
 	return 0
 }
-ch_expect_denied "read entity_search_results" <<'SQL'
-SELECT count() FROM default.entity_search_results
-SQL
 ch_expect_denied "write to the view" <<'SQL'
 INSERT INTO default.ca_drop_combined_search_result (type, normalized_value) VALUES ('x','y')
+SQL
+# The erase is ALTER DELETE and ALTER UPDATE and nothing else. An INSERT would
+# let the workflow put a payload BACK, which no part of this pipeline does.
+ch_expect_denied "write to entity_search_results" <<'SQL'
+INSERT INTO default.entity_search_results (type, normalized_value) VALUES ('x','y')
+SQL
+ch_expect_denied "drop entity_search_results" <<'SQL'
+TRUNCATE TABLE default.entity_search_results
 SQL
 
 echo

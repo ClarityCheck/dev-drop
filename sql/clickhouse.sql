@@ -76,10 +76,61 @@ ORDER BY (list_type, hash);
 -- by (list_type, hash) rather than relying on a merge having happened.
 
 
+
 -- =====================================================================
 -- 2. ca_drop_combined_search_result — the candidate keys
 --
 -- CHANGE THE DEFINER BELOW before running. See the note at the top.
+--
+-- ─── THE GRAIN, WHICH IS THE WHOLE DESIGN ────────────────────────────
+--
+--   people          ONE ROW PER ARRAY ELEMENT of one stored row version,
+--                   named by element_digest
+--   phone / email   one row per (type, normalized_value), with every
+--                   provider merged into it
+--
+-- That is BUSINESS-LOGIC.md §2 written as a GROUP BY. A people report's
+-- elements are different people; a phone or e-mail report's elements are
+-- providers describing the one person who was searched for. The grouping
+-- key below carries the element locator for people and a constant for the
+-- other two, so both rules come out of ONE derivation instead of two that
+-- can drift apart.
+--
+-- It is also what lets Cron C obey Rule 2. v3 flattened every element's
+-- keys into one row per identifier, so a match could name only the
+-- identifier and the only erase available was the whole row — forty John
+-- Smiths deleted because one of them registered. A v4 match names the
+-- element, and the sweep edits the array instead of deleting the row.
+--
+-- WHY A DIGEST AND NOT A POSITION. entity_search_results is a
+-- ReplacingMergeTree, so several versions of one key coexist until a merge
+-- collapses them — with different array lengths and different people at
+-- the same index — and this view is refreshed long before the erase runs.
+-- A position is only meaningful against the exact array it was read from.
+-- The SHA-256 of the element's raw JSON is meaningful against any of them:
+-- an element that moved is still the same element, and every stored copy
+-- of it goes in one mutation.
+--
+-- ─── ON A SERVICE THAT ALREADY CARRIES v3 ────────────────────────────
+--
+-- DEV does. v4 changes the grain, so ALTER TABLE ... MODIFY QUERY cannot
+-- get there. Run, as admin:
+--
+--     DROP VIEW default.ca_drop_combined_search_result;
+--
+-- then this statement, then
+--
+--     SYSTEM REFRESH VIEW default.ca_drop_combined_search_result;
+--
+-- Nothing else needs redoing. ClickHouse records a privilege against the
+-- NAME, so section 3's grants survive the drop and re-apply to the new
+-- view, and the view holds no state of its own — every row is derived
+-- from entity_search_results.
+--
+-- DO IT BEFORE DEPLOYING THE WORKER. Cron C selects element_digest, which
+-- v3 has no column for, so the match fails outright against the old view
+-- rather than matching less. That is the direction Rule 3 asks for, but it
+-- does mean the sweep does not run until the view is v4.
 -- =====================================================================
 
 CREATE MATERIALIZED VIEW default.ca_drop_combined_search_result
@@ -87,6 +138,10 @@ REFRESH EVERY 1 YEAR
 (
     `type`              LowCardinality(String),
     `normalized_value`  String,
+    `provider`          String,                -- people: the stored row's provider; '' otherwise
+    `service`           String,                -- people: the stored row's service;  '' otherwise
+    `created_at`        DateTime64(3, 'UTC'),  -- people: the ROW VERSION the element belongs to
+    `element_digest`    String,                -- people: base64(SHA256(the element's raw JSON))
     `source_rows`       UInt64,
     `record_count`      UInt64,
     `oversized_records` UInt64,
@@ -98,79 +153,92 @@ REFRESH EVERY 1 YEAR
     `namevin_keys`      Array(String)
 )
 ENGINE = MergeTree
-ORDER BY (type, normalized_value)
+ORDER BY (type, normalized_value, provider, service, created_at, element_digest)
 DEFINER = `sql-console:access@claritycheck.com`
 SQL SECURITY DEFINER
 AS
--- ── L7 ── pick the path by type, and drop the composites if the total is
---          past the cut. `oversized_records` now means "composites
---          dropped", which with the caps in place is the only way they can
---          be missing.
+-- ── L5 ── drop the composites if the REPORT is past the cut.
+--          `oversized_records` means "composites dropped", which with the
+--          caps in place is the only way they can be missing.
 SELECT
     type,
     normalized_value,
+    provider,
+    service,
+    created_at,
+    element_digest,
     source_rows,
     record_count,
-    toUInt64(total_width > 20000)                        AS oversized_records,
+    toUInt64(report_width > 20000)             AS oversized_records,
     last_seen_at,
-    'v3'                                                 AS spec_version,
+    'v4'                                       AS spec_version,
     email_keys,
     phone_keys,
-    if(total_width > 20000, [],
-       if(type = 'people', people_ndz_keys, merged_ndz_keys))         AS ndz_keys,
-    if(total_width > 20000, [],
-       if(type = 'people', people_namevin_keys, merged_namevin_keys)) AS namevin_keys
+    if(report_width > 20000, [], ndz_keys)     AS ndz_keys,
+    if(report_width > 20000, [], namevin_keys) AS namevin_keys
 FROM
 (
-    -- ── L6 ── the merged cross product, and the total the cut applies to
+    -- ── L4 ── the cross product, and the total the cut applies to.
+    --
+    --          The window is what keeps the cut a REPORT-level decision now
+    --          that a people report is many rows. For phone and e-mail the
+    --          partition is this one row; for people it sums every element,
+    --          which is the same arithmetic as the Worker's
+    --          groups.reduce(countReportKeys). Composites are then dropped
+    --          for the whole report or for none of it, never per element.
     SELECT
         type,
         normalized_value,
+        provider,
+        service,
+        created_at,
+        element_digest,
         source_rows,
         record_count,
         last_seen_at,
         email_keys,
         phone_keys,
-        people_ndz_keys,
-        people_namevin_keys,
 
-        if(type = 'people', people_width, merged_width)
-            + length(email_keys) + length(phone_keys)    AS total_width,
+        sum(width + length(email_keys) + length(phone_keys))
+            OVER (PARTITION BY type, normalized_value) AS report_width,
 
         arrayDistinct(arrayFlatten(arrayMap(f ->
             arrayFlatten(arrayMap(l ->
                 arrayFlatten(arrayMap(d ->
-                    arrayMap(z -> base64Encode(SHA256(concat(f, l, d, z))), mzh),
-                mdh)),
-            mlh)),
-        mfh))) AS merged_ndz_keys,
+                    arrayMap(z -> base64Encode(SHA256(concat(f, l, d, z))), zh),
+                dh)),
+            lh)),
+        fh))) AS ndz_keys,
 
         arrayDistinct(arrayFlatten(arrayMap(f ->
             arrayFlatten(arrayMap(l ->
-                arrayMap(v -> base64Encode(SHA256(concat(f, l, v))), mvh),
-            mlh)),
-        mfh))) AS merged_namevin_keys
+                arrayMap(v -> base64Encode(SHA256(concat(f, l, v))), vh),
+            lh)),
+        fh))) AS namevin_keys
     FROM
     (
-        -- ── L5 ── cap the MERGED values, then hash them. Cap after the
-        --          merge, never before it.
+        -- ── L3 ── cap the GROUP's values, then hash them. Sorted and sliced
+        --          on the normalized values and before hashing, matching
+        --          FIELD_CAPS: the Worker sorts values, and sorting hashes
+        --          instead would select a different subset.
         SELECT
             type,
             normalized_value,
+            provider,
+            service,
+            created_at,
+            element_digest,
             source_rows,
             record_count,
             last_seen_at,
             email_keys,
             phone_keys,
-            people_ndz_keys,
-            people_namevin_keys,
-            people_width,
 
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_firsts), 1, 10)) AS mfh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_lasts),  1, 10)) AS mlh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_dobs),   1, 5))  AS mdh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_zips),   1, 24)) AS mzh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_vins),   1, 12)) AS mvh,
+            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_firsts), 1, 10)) AS fh,
+            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_lasts),  1, 10)) AS lh,
+            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_dobs),   1, 5))  AS dh,
+            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_zips),   1, 24)) AS zh,
+            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_vins),   1, 12)) AS vh,
 
             (toFloat64(length(arraySlice(all_firsts, 1, 10)))
                 * length(arraySlice(all_lasts, 1, 10))
@@ -178,205 +246,171 @@ FROM
                 * length(arraySlice(all_zips,  1, 24)))
             + (toFloat64(length(arraySlice(all_firsts, 1, 10)))
                 * length(arraySlice(all_lasts, 1, 10))
-                * length(arraySlice(all_vins,  1, 12)))                                      AS merged_width
+                * length(arraySlice(all_vins,  1, 12)))                                      AS width
         FROM
         (
-            -- ── L4 ── one row per (type, normalized_value). The people
-            --          keys are already built per element; the raw fields
-            --          come up unaggregated for the merged path.
+            -- ── L2 ── THE GROUP BY IS THE RULE.
+            --
+            --          One group per people element — so one person's name is
+            --          never combined with another's date of birth and ZIP —
+            --          and one group per phone or e-mail identifier, so the
+            --          name from Veriphone joins the date of birth and ZIP
+            --          from Pipl and forms the ndz key that a per-provider
+            --          grouping would never derive.
+            --
+            --          Capping happens after this, never before: taking each
+            --          provider's own first ten names and merging those is
+            --          not the ten the Worker picks.
             SELECT
                 type,
                 normalized_value,
-                uniqExact((provider, service, created_at))                AS source_rows,
-                sum(rec_present)                                          AS record_count,
-                max(created_at)                                           AS last_seen_at,
-                arrayDistinct(arrayFlatten(groupArray(rec_email_keys)))   AS email_keys,
-                arrayDistinct(arrayFlatten(groupArray(rec_phone_keys)))   AS phone_keys,
-                arrayDistinct(arrayFlatten(groupArray(rec_ndz_keys)))     AS people_ndz_keys,
-                arrayDistinct(arrayFlatten(groupArray(rec_namevin_keys))) AS people_namevin_keys,
-                sum(rec_ndz_width) + sum(rec_namevin_width)               AS people_width,
-                arrayDistinct(arrayFlatten(groupArray(firsts)))           AS all_firsts,
-                arrayDistinct(arrayFlatten(groupArray(lasts)))            AS all_lasts,
-                arrayDistinct(arrayFlatten(groupArray(dobs)))             AS all_dobs,
-                arrayDistinct(arrayFlatten(groupArray(zips)))             AS all_zips,
-                arrayDistinct(arrayFlatten(groupArray(vins)))             AS all_vins
+                if(type = 'people', row_provider,   '')                        AS provider,
+                if(type = 'people', row_service,    '')                        AS service,
+                if(type = 'people', row_created_at, toDateTime64(0, 3, 'UTC')) AS created_at,
+                if(type = 'people', row_digest,     '')                        AS element_digest,
+
+                uniqExact((row_provider, row_service, row_created_at)) AS source_rows,
+                sum(toUInt64(has_record))                              AS record_count,
+                max(row_created_at)                                    AS last_seen_at,
+
+                -- The exact keys, hashed once per group rather than once per
+                -- element. Hashing the union and unioning the hashes give the
+                -- same set, and these are never capped.
+                arrayDistinct(arrayConcat(
+                    if(type = 'email',
+                       [base64Encode(SHA256(lowerUTF8(replaceRegexpAll(normalized_value, '\\s', ''))))],
+                       []),
+                    arrayMap(x -> base64Encode(SHA256(x)),
+                             arrayDistinct(arrayFlatten(groupArray(emails))))
+                )) AS email_keys,
+
+                arrayDistinct(arrayConcat(
+                    if(type = 'phone',
+                       [base64Encode(SHA256(right(replaceRegexpAll(normalized_value, '[^0-9]', ''), 10)))],
+                       []),
+                    arrayMap(x -> base64Encode(SHA256(x)),
+                             arrayDistinct(arrayFlatten(groupArray(phones))))
+                )) AS phone_keys,
+
+                arrayDistinct(arrayFlatten(groupArray(firsts))) AS all_firsts,
+                arrayDistinct(arrayFlatten(groupArray(lasts)))  AS all_lasts,
+                arrayDistinct(arrayFlatten(groupArray(dobs)))   AS all_dobs,
+                arrayDistinct(arrayFlatten(groupArray(zips)))   AS all_zips,
+                arrayDistinct(arrayFlatten(groupArray(vins)))   AS all_vins
             FROM
             (
-                -- ── L3 ── per element: cap, hash, and build the element's
-                --          own keys. Used by the people path; the raw
-                --          fields pass straight through for the other one.
+                -- ── L1 ── normalization, per DROP's rules, and the digest
+                --          that names the element. The conformance vectors in
+                --          test/drop-report.test.ts pin the normalization;
+                --          row_digest is hashed from `r` exactly as it came
+                --          out of JSONExtractArrayRaw, which is what
+                --          erasePeopleElements re-derives when it filters the
+                --          stored array.
+                WITH
+                    ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'ς', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω', 'ά', 'έ', 'ί', 'ή', 'ύ', 'ό', 'ώ', 'ϊ', 'ΐ', 'ϋ', 'ΰ', 'а', 'б', 'в', 'г', 'д', 'е', 'ё', 'ж', 'з', 'и', 'й', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я', 'є', 'і', 'ї', 'ґ', 'ў', 'ß', 'æ', 'œ', 'ø', 'ð', 'þ', 'ł', 'đ', 'ħ', 'ŋ', 'ı', 'ĳ', 'ŀ'] AS tr_src,
+                    ['a', 'v', 'g', 'd', 'e', 'z', 'i', 'th', 'i', 'k', 'l', 'm', 'n', 'x', 'o', 'p', 'r', 's', 's', 't', 'y', 'f', 'ch', 'ps', 'o', 'a', 'e', 'i', 'i', 'y', 'o', 'o', 'i', 'i', 'y', 'y', 'a', 'b', 'v', 'g', 'd', 'e', 'yo', 'zh', 'z', 'i', 'y', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't', 'u', 'f', 'kh', 'ts', 'ch', 'sh', 'shch', '', 'y', '', 'e', 'yu', 'ya', 'e', 'i', 'i', 'g', 'u', 'ss', 'ae', 'oe', 'o', 'd', 'th', 'l', 'd', 'h', 'n', 'i', 'ij', 'l'] AS tr_dst,
+                    '[^a-z0-9\\p{Han}\\p{Hiragana}\\p{Katakana}\\p{Hangul}\\p{Arabic}\\p{Hebrew}]' AS strip_re
                 SELECT
                     type,
                     normalized_value,
-                    provider,
-                    service,
-                    created_at,
-                    firsts,
-                    lasts,
-                    dobs,
-                    zips,
-                    vins,
+                    row_provider,
+                    row_service,
+                    row_created_at,
+                    (r != '')               AS has_record,
+                    base64Encode(SHA256(r)) AS row_digest,
 
-                    arrayDistinct(arrayConcat(
-                        if(type = 'email',
-                           [base64Encode(SHA256(lowerUTF8(replaceRegexpAll(normalized_value, '\\s', ''))))],
-                           []),
-                        arrayMap(x -> base64Encode(SHA256(x)), emails)
-                    )) AS rec_email_keys,
+                    arrayDistinct(arrayFilter(x -> x != '',
+                        arrayMap(x -> lowerUTF8(replaceRegexpAll(x, '\\s', '')),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                                if(JSONType(r, 'contactInfo', 'email') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'email'), [JSONExtractRaw(r, 'contactInfo', 'email')]),
+                                if(JSONType(r, 'contactInfo', 'emails') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'emails'), [JSONExtractRaw(r, 'contactInfo', 'emails')]),
+                                arrayMap(o -> JSONExtractRaw(o, 'address'), JSONExtractArrayRaw(r, 'emails'))
+                            )))))) AS emails,
 
-                    arrayDistinct(arrayConcat(
-                        if(type = 'phone',
-                           [base64Encode(SHA256(right(replaceRegexpAll(normalized_value, '[^0-9]', ''), 10)))],
-                           []),
-                        arrayMap(x -> base64Encode(SHA256(x)), phones)
-                    )) AS rec_phone_keys,
+                    arrayDistinct(arrayFilter(x -> x != '',
+                        arrayMap(x -> right(replaceRegexpAll(x, '[^0-9]', ''), 10),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                                if(JSONType(r, 'contactInfo', 'phone') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'phone'), [JSONExtractRaw(r, 'contactInfo', 'phone')]),
+                                if(JSONType(r, 'contactInfo', 'phones') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'phones'), [JSONExtractRaw(r, 'contactInfo', 'phones')]),
+                                arrayMap(o -> JSONExtractRaw(o, 'number'), JSONExtractArrayRaw(r, 'phones'))
+                            )))))) AS phones,
 
-                    arrayDistinct(arrayFlatten(arrayMap(f ->
-                        arrayFlatten(arrayMap(l ->
-                            arrayFlatten(arrayMap(d ->
-                                arrayMap(z -> base64Encode(SHA256(concat(f, l, d, z))), czh),
-                            cdh)),
-                        clh)),
-                    cfh))) AS rec_ndz_keys,
+                    arrayDistinct(arrayFilter(x -> x != '',
+                        arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                                if(JSONType(r, 'personalInfo', 'firstName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstName'), [JSONExtractRaw(r, 'personalInfo', 'firstName')]),
+                                if(JSONType(r, 'personalInfo', 'firstNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstNames'), [JSONExtractRaw(r, 'personalInfo', 'firstNames')]),
+                                arrayMap(o -> JSONExtractRaw(o, 'first'), JSONExtractArrayRaw(r, 'names'))
+                            )))))) AS firsts,
 
-                    arrayDistinct(arrayFlatten(arrayMap(f ->
-                        arrayFlatten(arrayMap(l ->
-                            arrayMap(v -> base64Encode(SHA256(concat(f, l, v))), cvh),
-                        clh)),
-                    cfh))) AS rec_namevin_keys,
+                    arrayDistinct(arrayFilter(x -> x != '',
+                        arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                                if(JSONType(r, 'personalInfo', 'lastName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastName'), [JSONExtractRaw(r, 'personalInfo', 'lastName')]),
+                                if(JSONType(r, 'personalInfo', 'lastNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastNames'), [JSONExtractRaw(r, 'personalInfo', 'lastNames')]),
+                                arrayMap(o -> JSONExtractRaw(o, 'last'), JSONExtractArrayRaw(r, 'names'))
+                            )))))) AS lasts,
 
-                    toFloat64(length(cfh)) * length(clh) * length(cdh) * length(czh) AS rec_ndz_width,
-                    toFloat64(length(cfh)) * length(clh) * length(cvh)               AS rec_namevin_width,
-                    toUInt64(has_record)                                            AS rec_present
+                    arrayDistinct(arrayFilter(x -> length(x) = 8,
+                        arrayMap(x -> if(match(x, '^(19|20)\\d{2}'), substring(replaceRegexpAll(x, '[^0-9]', ''), 1, 8), ''),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                                if(JSONType(r, 'personalInfo', 'birthDate') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'birthDate'), [JSONExtractRaw(r, 'personalInfo', 'birthDate')]),
+                                if(JSONType(r, 'personalInfo', 'birthDates') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'birthDates'), [JSONExtractRaw(r, 'personalInfo', 'birthDates')]),
+                                [JSONExtractRaw(r, 'dateOfBirth', 'start')]
+                            )))))) AS dobs,
+
+                    arrayDistinct(arrayFilter(x -> x != '',
+                        arrayMap(x -> substring(replaceRegexpOne(replaceRegexpAll(lowerUTF8(splitByChar('-', x)[1]), '[^a-z0-9]', ''), '^0+', ''), 1, 5),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                                arrayMap(o -> JSONExtractRaw(o, 'zip'),     JSONExtractArrayRaw(r, 'contactInfo', 'fullAddresses')),
+                                arrayMap(o -> JSONExtractRaw(o, 'zipCode'), JSONExtractArrayRaw(r, 'contactInfo', 'fullAddresses')),
+                                arrayMap(o -> JSONExtractRaw(o, 'zip'),     JSONExtractArrayRaw(r, 'addresses')),
+                                arrayMap(o -> JSONExtractRaw(o, 'zipCode'), JSONExtractArrayRaw(r, 'addresses')),
+                                [JSONExtractRaw(r, 'contactInfo', 'zip')]
+                            )))))) AS zips,
+
+                    arrayDistinct(arrayFilter(x -> x != '',
+                        arrayMap(x -> replaceRegexpAll(lowerUTF8(x), '[^a-z0-9]', ''),
+                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x),
+                                arrayMap(o -> JSONExtractRaw(o, 'vin'), JSONExtractArrayRaw(r, 'vehicles'))
+                            ))))) AS vins
                 FROM
                 (
-                    -- ── L2 ── the per-element caps, as hashes. Sorted then
-                    --          sliced on the VALUES, matching FIELD_CAPS.
+                    -- ── L0 ── one row per array element for people, one per
+                    --          provider row otherwise. The row's own identity
+                    --          travels under row_* so that L2 can group by it
+                    --          for people and discard it for the other two.
                     SELECT
                         type,
                         normalized_value,
-                        provider,
-                        service,
-                        created_at,
-                        has_record,
-                        emails,
-                        phones,
-                        firsts,
-                        lasts,
-                        dobs,
-                        zips,
-                        vins,
-                        arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(firsts), 1, 10)) AS cfh,
-                        arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(lasts),  1, 10)) AS clh,
-                        arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(dobs),   1, 5))  AS cdh,
-                        arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(zips),   1, 24)) AS czh,
-                        arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(vins),   1, 12)) AS cvh
+                        provider   AS row_provider,
+                        service    AS row_service,
+                        created_at AS row_created_at,
+                        arrayJoin(if(empty(recs), [''], recs)) AS r
                     FROM
                     (
-                        -- ── L1 ── normalization, per DROP's rules. Unchanged
-                        --          from v2; the conformance vectors in
-                        --          test/drop-report.test.ts pin these.
-                        WITH
-                            ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'ς', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω', 'ά', 'έ', 'ί', 'ή', 'ύ', 'ό', 'ώ', 'ϊ', 'ΐ', 'ϋ', 'ΰ', 'а', 'б', 'в', 'г', 'д', 'е', 'ё', 'ж', 'з', 'и', 'й', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я', 'є', 'і', 'ї', 'ґ', 'ў', 'ß', 'æ', 'œ', 'ø', 'ð', 'þ', 'ł', 'đ', 'ħ', 'ŋ', 'ı', 'ĳ', 'ŀ'] AS tr_src,
-                            ['a', 'v', 'g', 'd', 'e', 'z', 'i', 'th', 'i', 'k', 'l', 'm', 'n', 'x', 'o', 'p', 'r', 's', 's', 't', 'y', 'f', 'ch', 'ps', 'o', 'a', 'e', 'i', 'i', 'y', 'o', 'o', 'i', 'i', 'y', 'y', 'a', 'b', 'v', 'g', 'd', 'e', 'yo', 'zh', 'z', 'i', 'y', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't', 'u', 'f', 'kh', 'ts', 'ch', 'sh', 'shch', '', 'y', '', 'e', 'yu', 'ya', 'e', 'i', 'i', 'g', 'u', 'ss', 'ae', 'oe', 'o', 'd', 'th', 'l', 'd', 'h', 'n', 'i', 'ij', 'l'] AS tr_dst,
-                            '[^a-z0-9\\p{Han}\\p{Hiragana}\\p{Katakana}\\p{Hangul}\\p{Arabic}\\p{Hebrew}]' AS strip_re
                         SELECT
                             type,
                             normalized_value,
                             provider,
                             service,
                             created_at,
-                            (r != '') AS has_record,
-
-                            arrayDistinct(arrayFilter(x -> x != '',
-                                arrayMap(x -> lowerUTF8(replaceRegexpAll(x, '\\s', '')),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                        if(JSONType(r, 'contactInfo', 'email') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'email'), [JSONExtractRaw(r, 'contactInfo', 'email')]),
-                                        if(JSONType(r, 'contactInfo', 'emails') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'emails'), [JSONExtractRaw(r, 'contactInfo', 'emails')]),
-                                        arrayMap(o -> JSONExtractRaw(o, 'address'), JSONExtractArrayRaw(r, 'emails'))
-                                    )))))) AS emails,
-
-                            arrayDistinct(arrayFilter(x -> x != '',
-                                arrayMap(x -> right(replaceRegexpAll(x, '[^0-9]', ''), 10),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                        if(JSONType(r, 'contactInfo', 'phone') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'phone'), [JSONExtractRaw(r, 'contactInfo', 'phone')]),
-                                        if(JSONType(r, 'contactInfo', 'phones') = 'Array', JSONExtractArrayRaw(r, 'contactInfo', 'phones'), [JSONExtractRaw(r, 'contactInfo', 'phones')]),
-                                        arrayMap(o -> JSONExtractRaw(o, 'number'), JSONExtractArrayRaw(r, 'phones'))
-                                    )))))) AS phones,
-
-                            arrayDistinct(arrayFilter(x -> x != '',
-                                arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                        if(JSONType(r, 'personalInfo', 'firstName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstName'), [JSONExtractRaw(r, 'personalInfo', 'firstName')]),
-                                        if(JSONType(r, 'personalInfo', 'firstNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstNames'), [JSONExtractRaw(r, 'personalInfo', 'firstNames')]),
-                                        arrayMap(o -> JSONExtractRaw(o, 'first'), JSONExtractArrayRaw(r, 'names'))
-                                    )))))) AS firsts,
-
-                            arrayDistinct(arrayFilter(x -> x != '',
-                                arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                        if(JSONType(r, 'personalInfo', 'lastName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastName'), [JSONExtractRaw(r, 'personalInfo', 'lastName')]),
-                                        if(JSONType(r, 'personalInfo', 'lastNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastNames'), [JSONExtractRaw(r, 'personalInfo', 'lastNames')]),
-                                        arrayMap(o -> JSONExtractRaw(o, 'last'), JSONExtractArrayRaw(r, 'names'))
-                                    )))))) AS lasts,
-
-                            arrayDistinct(arrayFilter(x -> length(x) = 8,
-                                arrayMap(x -> if(match(x, '^(19|20)\\d{2}'), substring(replaceRegexpAll(x, '[^0-9]', ''), 1, 8), ''),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                        if(JSONType(r, 'personalInfo', 'birthDate') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'birthDate'), [JSONExtractRaw(r, 'personalInfo', 'birthDate')]),
-                                        if(JSONType(r, 'personalInfo', 'birthDates') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'birthDates'), [JSONExtractRaw(r, 'personalInfo', 'birthDates')]),
-                                        [JSONExtractRaw(r, 'dateOfBirth', 'start')]
-                                    )))))) AS dobs,
-
-                            arrayDistinct(arrayFilter(x -> x != '',
-                                arrayMap(x -> substring(replaceRegexpOne(replaceRegexpAll(lowerUTF8(splitByChar('-', x)[1]), '[^a-z0-9]', ''), '^0+', ''), 1, 5),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                        arrayMap(o -> JSONExtractRaw(o, 'zip'),     JSONExtractArrayRaw(r, 'contactInfo', 'fullAddresses')),
-                                        arrayMap(o -> JSONExtractRaw(o, 'zipCode'), JSONExtractArrayRaw(r, 'contactInfo', 'fullAddresses')),
-                                        arrayMap(o -> JSONExtractRaw(o, 'zip'),     JSONExtractArrayRaw(r, 'addresses')),
-                                        arrayMap(o -> JSONExtractRaw(o, 'zipCode'), JSONExtractArrayRaw(r, 'addresses')),
-                                        [JSONExtractRaw(r, 'contactInfo', 'zip')]
-                                    )))))) AS zips,
-
-                            arrayDistinct(arrayFilter(x -> x != '',
-                                arrayMap(x -> replaceRegexpAll(lowerUTF8(x), '[^a-z0-9]', ''),
-                                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x),
-                                        arrayMap(o -> JSONExtractRaw(o, 'vin'), JSONExtractArrayRaw(r, 'vehicles'))
-                                    ))))) AS vins
-                        FROM
-                        (
-                            -- ── L0 ── one row per array element for people,
-                            --          one per provider row otherwise.
-                            SELECT
-                                type,
-                                normalized_value,
-                                provider,
-                                service,
-                                created_at,
-                                arrayJoin(if(empty(recs), [''], recs)) AS r
-                            FROM
-                            (
-                                SELECT
-                                    type,
-                                    normalized_value,
-                                    provider,
-                                    service,
-                                    created_at,
-                                    if(JSONType(payload_json) = 'Array', JSONExtractArrayRaw(payload_json), [payload_json]) AS recs
-                                FROM default.entity_search_results
-                                WHERE type IN ('email', 'phone', 'people')
-                            )
-                        )
+                            if(JSONType(payload_json) = 'Array', JSONExtractArrayRaw(payload_json), [payload_json]) AS recs
+                        FROM default.entity_search_results
+                        WHERE type IN ('email', 'phone', 'people')
                     )
                 )
             )
             GROUP BY
                 type,
-                normalized_value
+                normalized_value,
+                provider,
+                service,
+                created_at,
+                element_digest
         )
     )
 );
-
 -- =====================================================================
 -- 3. The role
 --
@@ -399,7 +433,7 @@ CREATE ROLE drop_workflow_role;
 --
 -- On a genuinely fresh service this is a no-op. That is the point: it
 -- costs nothing there and is the only thing that makes section 6's count
--- of 8 true anywhere else.
+-- of 9 true anywhere else.
 REVOKE ALL ON *.* FROM drop_workflow_role;
 
 -- The candidate keys.
@@ -429,16 +463,22 @@ GRANT SELECT, INSERT, TRUNCATE ON default.ca_drop_work_items TO drop_workflow_ro
 --                 DELETE FROM, which only marks rows and leaves the data
 --                 on disk until some later merge — not good enough for a
 --                 statutory deletion.
+--   ALTER UPDATE  the people half of the erase, and Rule 2 cannot be kept
+--                 without it. A matched people report loses the matched
+--                 array elements and the row survives, so the payload is
+--                 rewritten in place rather than deleted. Also a mutation,
+--                 so the old payload is not left on disk either.
 --   SELECT        the predicate reads the columns, and the workflow counts
---                 the matching rows before and after so it can verify the
---                 delete instead of trusting it. The incident endpoint
---                 reads payloads back through the same grant.
+--                 what it matched before and after so it can verify the
+--                 erase instead of trusting it — rows for a phone or e-mail
+--                 report, listed elements for a people one. The incident
+--                 endpoint reads payloads back through the same grant.
 --
 -- entity_search_results holds the raw provider payloads, so SELECT on it
 -- is broad — it is the table this whole pipeline exists to protect.
 -- Granted because the alternative is a workflow that reports deletions it
 -- cannot confirm.
-GRANT SELECT, ALTER DELETE ON default.entity_search_results TO drop_workflow_role;
+GRANT SELECT, ALTER DELETE, ALTER UPDATE ON default.entity_search_results TO drop_workflow_role;
 
 
 -- =====================================================================
@@ -487,14 +527,15 @@ ALTER USER drop_workflow SETTINGS
 -- 6. Verify — run as admin
 -- =====================================================================
 
--- Expect EXACTLY these eight rows:
+-- Expect EXACTLY these nine rows:
 --   SELECT        default   ca_drop_combined_search_result
 --   SYSTEM VIEWS  default   ca_drop_combined_search_result
 --   SELECT        default   ca_drop_work_items
 --   INSERT        default   ca_drop_work_items
 --   TRUNCATE      default   ca_drop_work_items
---   SELECT        default   entity_search_results
 --   ALTER DELETE  default   entity_search_results
+--   ALTER UPDATE  default   entity_search_results
+--   SELECT        default   entity_search_results
 --   SELECT        system    view_refreshes
 SELECT access_type, database, table
 FROM system.grants
@@ -517,7 +558,7 @@ SELECT access_type, database, table
 FROM system.grants
 WHERE user_name = 'drop_workflow';
 
--- Expect spec_version v3 on every row once the view has been refreshed.
+-- Expect spec_version v4 on every row once the view has been refreshed.
 -- It is empty until then; REFRESH is the next step.
 SELECT spec_version, count() AS rows
 FROM default.ca_drop_combined_search_result

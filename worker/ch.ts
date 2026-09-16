@@ -160,3 +160,140 @@ export async function deleteEntityRows(
 
 	return { before, after: await count() };
 }
+
+/**
+ * One element of a stored people payload, as the combined view names it.
+ *
+ * The digest is base64(SHA256(the element's raw JSON)), taken from the same
+ * JSONExtractArrayRaw output the erase re-derives it from, and NOT a position.
+ * entity_search_results is a ReplacingMergeTree, so several versions of one key
+ * coexist with different array lengths and different people at the same index,
+ * and the view is refreshed long before the sweep reaches the erase. A position
+ * is only meaningful against the array it was read from; the digest is
+ * meaningful against every stored copy of that element.
+ */
+export type ElementKey = { normalized_value: string; element_digest: string };
+
+/**
+ * The people predicate, shared by the count and the update so they cannot drift.
+ *
+ * Two parameters, both JSON in a single String for the reason ENTITY_MATCH
+ * gives: a normalized_value is arbitrary consumer input and a hand-built IN
+ * list would eventually erase the wrong people rather than merely error.
+ *
+ * The identifiers and the digests travel as two sets rather than as pairs, so
+ * one mutation covers a whole chunk. The consequence is deliberate: a listed
+ * element stored under a SECOND matched identifier in the same chunk goes too.
+ * Byte-identical JSON is the same record about the same consumer, and it is a
+ * consumer who asked to be deleted, so removing it there as well is the rule
+ * being applied, not an over-reach.
+ */
+const PEOPLE_VALUE_MATCH = `type = 'people' AND normalized_value IN (
+    SELECT arrayJoin(JSONExtract({values:String}, 'Array(String)'))
+)`;
+
+/** The stored array, read exactly as the view's L0 reads it. */
+const STORED_ELEMENTS = `if(JSONType(payload_json) = 'Array',
+    JSONExtractArrayRaw(payload_json), [payload_json])`;
+
+const LISTED_ELEMENTS = `arrayFilter(
+    e -> has(JSONExtract({digests:String}, 'Array(String)'), base64Encode(SHA256(e))),
+    ${STORED_ELEMENTS}
+)`;
+
+function peopleParams(keys: ElementKey[]): Record<string, string> {
+	return {
+		values: JSON.stringify([...new Set(keys.map((k) => k.normalized_value))]),
+		digests: JSON.stringify([...new Set(keys.map((k) => k.element_digest))]),
+	};
+}
+
+/**
+ * Elements per statement.
+ *
+ * Both parameters travel in the query string, where ClickHouse's
+ * http_max_uri_size ends the request at 1 MiB — and a digest is 44 bytes before
+ * the identifier it came with. A chunk of matches can hold thousands, so it is
+ * split rather than risk losing the erase to a 400 after the match rows have
+ * already been written. Splitting is safe: the batches carry disjoint digests,
+ * so removing one batch's elements cannot change what the next one counts.
+ */
+const ELEMENT_BATCH = 500;
+
+/**
+ * How many stored records these digests still account for.
+ *
+ * Records, not rows. A people row survives its erasure by design, so a row
+ * count says nothing about whether it happened — the question is whether the
+ * listed elements are still inside the array.
+ */
+export async function countPeopleElements(env: Env, keys: ElementKey[]): Promise<number> {
+	if (keys.length === 0) return 0;
+	const [r] = await chQuery<{ n: string }>(
+		env,
+		`SELECT sum(length(${LISTED_ELEMENTS})) AS n
+		 FROM default.entity_search_results
+		 WHERE ${PEOPLE_VALUE_MATCH}`,
+		peopleParams(keys),
+	);
+	return Number(r?.n ?? 0);
+}
+
+/**
+ * Erase the matched elements of a stored people report, and nothing else.
+ *
+ * BUSINESS-LOGIC.md Rule 2: the report is still served and still stored,
+ * without those people. Search "John Smith", get back forty; one of them
+ * registered with DROP and the other thirty-nine are strangers whose records
+ * stay. deleteEntityRows would take all forty, which is why it is not used for
+ * this type.
+ *
+ * ALTER TABLE ... UPDATE, the same array surgery the lookup API performs in
+ * eraseEntitySearchResultRecords, and a mutation for the same reason the delete
+ * is one: the part is rewritten, so the old payload does not sit on disk
+ * waiting for a merge.
+ *
+ * ClickHouse does the surgery on its own stored value and only the digests
+ * travel. Sending a rewritten payload back would not work at any size worth
+ * having — a people payload runs to megabytes.
+ *
+ * The WHERE keeps the rewrite to rows that really do carry a listed element, so
+ * a row whose people are all strangers is not touched at all, and its payload
+ * keeps whatever shape it was stored in.
+ *
+ * Counted before and after rather than inferred from the number of digests
+ * asked for: `after` is what tells the caller the erase actually happened.
+ */
+export async function erasePeopleElements(
+	env: Env,
+	keys: ElementKey[],
+): Promise<{ before: number; after: number }> {
+	let before = 0;
+	let after = 0;
+
+	for (let i = 0; i < keys.length; i += ELEMENT_BATCH) {
+		const batch = keys.slice(i, i + ELEMENT_BATCH);
+		const count = () => countPeopleElements(env, batch);
+
+		const found = await count();
+		if (found === 0) continue;
+		before += found;
+
+		await chQuery(
+			env,
+			`ALTER TABLE default.entity_search_results
+			 UPDATE payload_json = concat('[', arrayStringConcat(
+			     arrayFilter(
+			         e -> NOT has(JSONExtract({digests:String}, 'Array(String)'), base64Encode(SHA256(e))),
+			         ${STORED_ELEMENTS}
+			     ), ','), ']')
+			 WHERE ${PEOPLE_VALUE_MATCH} AND notEmpty(${LISTED_ELEMENTS})
+			 SETTINGS mutations_sync = 2`,
+			peopleParams(batch),
+		);
+
+		after += await count();
+	}
+
+	return { before, after };
+}
