@@ -566,7 +566,7 @@ describe("POST /api/drop/report-check", () => {
 		expect(json.keysChecked).toBe(1);
 	});
 
-	it("flags the whole report, not a record, when the searched e-mail is listed", async () => {
+	it("flags every record when the searched e-mail is listed", async () => {
 		await env.kv.put(await sha256Base64("listed.person@example.com"), "work-item-email");
 
 		const { status, json } = await check({
@@ -575,14 +575,77 @@ describe("POST /api/drop/report-check", () => {
 			report: { personalInfo: { firstName: "Listed" } },
 		});
 
+		// An e-mail report is one person seen by several providers, so the
+		// verdict is the report's and every element carries it. subjectListed
+		// stays separate: it is the statutory fact that the searched identifier
+		// is itself on a DROP list, which is what decides whether the finding is
+		// recorded as a suppression.
 		expect(status).toBe(200);
 		expect(json).toMatchObject({
 			type: "email",
 			listed: true,
 			subjectListed: true,
 			matched: ["email"],
-			records: [{ index: 0, listed: false, matched: [] }],
+			records: [{ index: 0, listed: true, matched: ["email"] }],
 		});
+	});
+
+	it("combines name, date of birth and ZIP across providers into one NDZ key", async () => {
+		// The point of the merge. No single provider carries all four factors,
+		// so a per-provider cross product derives no NDZ key at all and the
+		// consumer is never matched.
+		const ndz = await sha256Base64(
+			(await sha256Base64("ada")) +
+				(await sha256Base64("lovelace")) +
+				(await sha256Base64("19851103")) +
+				(await sha256Base64("94107")),
+		);
+		await env.kv.put(ndz, "work-item-ndz");
+
+		const { status, json } = await check({
+			type: "phone",
+			value: "+1 415 555 9317",
+			report: [
+				{ personalInfo: { firstName: "Ada", lastName: "Lovelace" } },
+				{ personalInfo: { birthDate: "1985-11-03" }, contactInfo: { zip: "94107" } },
+			],
+		});
+
+		expect(status).toBe(200);
+		expect(json).toMatchObject({
+			type: "phone",
+			listed: true,
+			subjectListed: false,
+			matched: ["ndz"],
+			records: [
+				{ index: 0, listed: true, matched: ["ndz"] },
+				{ index: 1, listed: true, matched: ["ndz"] },
+			],
+		});
+	});
+
+	it("keeps a people report's elements independent of one another", async () => {
+		// The mirror of the test above: the same four factors split across two
+		// ARRAY ELEMENTS are two different people, so combining them would
+		// invent a key for someone who does not exist. Nothing matches.
+		const ndz = await sha256Base64(
+			(await sha256Base64("ada")) +
+				(await sha256Base64("lovelace")) +
+				(await sha256Base64("19851103")) +
+				(await sha256Base64("94107")),
+		);
+		await env.kv.put(ndz, "work-item-ndz-people");
+
+		const { status, json } = await check({
+			type: "people",
+			report: [
+				{ personalInfo: { firstName: "Ada", lastName: "Lovelace" } },
+				{ personalInfo: { birthDate: "1985-11-03" }, contactInfo: { zip: "94107" } },
+			],
+		});
+
+		expect(status).toBe(200);
+		expect(json).toMatchObject({ type: "people", listed: false, matched: [] });
 	});
 
 	it("answers a clean subject with a listed report, and the recording cannot fail it", async () => {
