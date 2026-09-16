@@ -1,9 +1,8 @@
 # DROP suppression — business logic
 
-What the pipeline is obliged to do, and the rules that decide it. Written for
-whoever changes this Worker or the lookup API next; the architecture (Workflow,
-KV, Hyperdrive, ClickHouse) is in the diagram, and the code comments explain
-mechanism. This file is only about the rules.
+The rules this pipeline is obliged to follow. The architecture (Workflow, KV,
+Hyperdrive, ClickHouse) is in the diagram and the code comments explain
+mechanism; this file is only about the rules.
 
 The regulation: California's Delete Request and Opt-out Platform. A consumer
 registers with the state, the state publishes hashed identifiers, and a
@@ -15,52 +14,50 @@ Specification: https://privacy.ca.gov/drop-for-data-brokers/technical-specificat
 
 ## 0. The obligation, and the clock
 
-Two duties, and they are separate. Confusing them is how a pipeline ends up
-suppressing correctly and still being non-compliant.
+Two separate duties. Meeting one and missing the other is still non-compliant.
 
-**Suppress.** Do not process or serve data about a registered consumer. This is
-continuous, and it is what everything below Rule 1 is about.
+**Suppress.** Do not process or serve data about a registered consumer.
+Continuous; everything from Rule 1 onwards serves this.
 
-**Report.** Tell the state what we did about every work item we were given. This
-is periodic, and it is Cron B's job. A work item nobody has looked at is still
-reported — as `5 Not found` — so silence is an answer, and it is an answer we
-may be wrong about.
+**Report.** Tell the state what we did about every work item we were given.
+Periodic, and Cron B's job. A work item nobody has looked at is still reported —
+as `5 Not found` — so silence is an answer, and one we may be wrong about.
 
 The list must be downloaded **at least every 45 days**. The cycle is the unit of
 work: download, match, erase, report. Cron B has to run *after* Cron C for its
-answers to be true, and nothing yet enforces that ordering.
+answers to be true, and nothing enforces that ordering.
 
-### The download is a delta, and that has a consequence
+### The download is a delta
 
 Per the specification, "after initial download and completed upload, future
 downloads will include only new identifiers since previous list download". The
-first download is the whole list; every later one carries only what is new.
+first download is the whole list; every later one carries only what is new. Two
+consequences:
 
-**The complete set therefore exists only on our side, and DROP cannot re-serve
-it.** R2 holds every raw ZIP verbatim and is the only source it could ever be
-rebuilt from. Backing up R2 and testing the restore is a compliance control, not
-housekeeping.
+**The complete set exists only on our side, and DROP cannot re-serve it.** R2
+holds every raw ZIP verbatim and is the only source it can be rebuilt from.
+Backing up R2 and testing the restore is a compliance control, not housekeeping.
 
-It also means KV must be **cumulative**. Clearing it and loading only the newest
-delta would stop suppressing everyone registered in an earlier cycle — silently,
-and with no way to tell from the outside. `clearKv` defaults to `false` for this
-reason; it exists for rebuilding from the archive, not for normal runs.
+**KV must be cumulative.** Clearing it and loading only the newest delta stops
+suppressing everyone registered in an earlier cycle — silently, and invisibly
+from outside. `clearKv` defaults to `false`; it exists for rebuilding from the
+archive, not for normal runs.
 
 ### Consumers can be removed
 
 DROP publishes a removals file alongside the four lists — `Id,Hash,ListType` —
 when a consumer withdraws their request or the state revokes an entry. Two
-things then have to happen, and they are different obligations:
+different obligations follow:
 
-- **stop suppressing them.** The hash is deleted from KV, so the gate releases
+- **Stop suppressing them.** The hash is deleted from KV, so the gate releases
   them on the next request.
-- **stop answering for them.** `revoked_at` is stamped on the
-  `ca_drop_work_item` row, so they are no longer a work item we owe California
-  a status for.
+- **Stop answering for them.** `revoked_at` is stamped on the
+  `ca_drop_work_item` row, so they are no longer a work item we owe California a
+  status for.
 
-The row is kept rather than deleted. It is the record that we were once asked to
-suppress this consumer and then released, and Cron B needs to tell "never given
-to us" apart from "given and then withdrawn".
+The row is kept rather than deleted: it records that we were once asked to
+suppress this consumer and then released, and Cron B needs "never given to us"
+to differ from "given and then withdrawn".
 
 **Supabase is stamped before KV is deleted from**, and the order is load-bearing:
 
@@ -70,10 +67,10 @@ to us" apart from "given and then withdrawn".
 | KV deleted, stamp fails | we release them *and* still report them as ours, and the KV repair puts the hash straight back |
 
 Everything that reads work items reads **live ones only** — the KV rebuild, the
-KV health sample, and the expected-count comparison Cron C makes. That is not
-tidiness. A revoked item is absent from KV by design, so counting it would make
-every revocation look like a key KV had lost, and `kv-repair` would resurrect
-the hash and suppress a consumer who had asked to be released.
+KV health sample, and the expected-count comparison Cron C makes. A revoked item
+is absent from KV by design, so counting it would make every revocation look
+like a key KV had lost, and `kv-repair` would resurrect the hash and suppress a
+consumer who had asked to be released.
 
 A removal naming a work item we never held marks nothing, which is normal: DROP
 does not know which of its identifiers we were given.
@@ -88,12 +85,12 @@ does not know which of its identifiers we were given.
 | `5` | Not found | we hold nothing about them |
 
 Codes `0` and `1` are unused by the specification. `5` is the default for
-anything untouched, which is why a Cron B that runs before Cron C would report a
+anything untouched, which is why a Cron B that runs before Cron C reports a
 clean sheet for a cycle whose matches were never looked for.
 
-`3 Deleted` is the only one that rests on something having happened, and it is
-the reason the erase is verified by re-reading rather than assumed from the
-absence of an exception.
+`3 Deleted` is the only code that rests on something having happened, and the
+reason the erase is verified by re-reading rather than assumed from the absence
+of an exception.
 
 ---
 
@@ -108,76 +105,63 @@ Four lists. Each entry is a work item ID and a Base64 SHA-256 hash.
 | `ndz` | `sha256(first) + sha256(last) + sha256(dob) + sha256(zip)`, hashed again |
 | `namevin` | `sha256(first) + sha256(last) + sha256(vin)`, hashed again |
 
-Normalization lives in `worker/drop-normalize.ts` and `worker/drop-report.ts`,
-and again in the ClickHouse view that Cron C matches against. **If those two
-ever disagree, no error is raised anywhere** — the gate simply answers "not
-listed" for someone who is. Two sets of conformance vectors exist for that
-reason: `test/drop-report.test.ts` asserts the specification's own published
-hashes, and both it and `test/drop-normalize.test.ts` carry vectors generated
-from the view's SQL.
+`ndz` and `namevin` are composites: every first name, last name, date of birth
+and ZIP held for a person is hashed in every combination, so one consumer can
+produce thousands of candidate keys.
 
-The per-field rules do agree. **The grouping does not** — see §2 and §7.
-
-`ndz` and `namevin` are composites: we take every first name, last name, date of
-birth and ZIP we hold for a person and hash every combination. One consumer can
-therefore produce thousands of candidate keys.
+Normalization and key derivation exist twice — in `worker/drop-normalize.ts` and
+`worker/drop-report.ts`, and again in the ClickHouse view Cron C matches
+against. **If the two ever disagree, no error is raised anywhere**: the gate
+simply answers "not listed" for someone who is. Two sets of conformance vectors
+guard that seam. `test/drop-report.test.ts` asserts the specification's own
+published hashes, and both it and `test/drop-normalize.test.ts` carry vectors
+generated from the view's SQL.
 
 ## 2. The rule that governs everything else: what an array element *is*
 
 Every report we check is an array. What its elements represent decides how a
-match propagates, and getting this wrong is the difference between suppressing a
+match propagates, and getting it wrong is the difference between suppressing a
 consumer and only appearing to.
 
 **A people report's elements are different people.** Search "John Smith", get
-back forty John Smiths. One of them registered with DROP; the other
-thirty-nine did not, and their records are not his.
+back forty John Smiths. One registered with DROP; the other thirty-nine did
+not, and their records are not his.
 
 **A phone or email report's elements are providers.** Search a phone number, get
-back one payload per provider — Veriphone, Pipl, PDL — and every one of them
-describes the *same* person, the subject of the search. They are views, not
-people.
+one payload per provider — Veriphone, Pipl, PDL — each describing the *same*
+person, the subject of the search. They are views, not people.
 
-Two consequences, and they run in opposite directions:
+Two consequences, running in opposite directions:
 
 - **Keys may be combined across providers, and must not be combined across
-  people.** If Veriphone returns the name and Pipl returns the date of birth and
-  ZIP, those four factors belong to one person and must form one `ndz` key.
-  Deriving them per provider produces *no* `ndz` key at all — each provider is
-  missing a factor — and an NDZ-registered consumer is never matched. Doing the
-  same across two people in a people report would invent a key for someone who
-  does not exist.
+  people.** If Veriphone returns the name and Pipl the date of birth and ZIP,
+  those four factors belong to one person and form one `ndz` key. Deriving them
+  per provider produces *no* `ndz` key at all — each provider is missing a
+  factor — and an NDZ-registered consumer is never matched. Combining across two
+  people in a people report invents a key for someone who does not exist.
 - **A match condemns the whole phone/email report, and only one element of a
   people report.** Every provider row is about the listed consumer, so none of
   it may be served or stored. In a people report the other thirty-nine are
   strangers and their records stay.
 
-`reportGroups()` in `worker/drop-report.ts` is where this is decided: one group
-per element for people, one merged group for phone and email. The subject stays
-its own group in both cases, so `subjectListed` still distinguishes the
-statutory fact — *this identifier is on a DROP list* — from the wider finding
-that the report is about someone who is.
+`reportGroups()` in `worker/drop-report.ts` decides this: one group per element
+for people, one merged group for phone and email. The subject is its own group
+in both cases, so `subjectListed` distinguishes the statutory fact — *this
+identifier is on a DROP list* — from the wider finding that the report is about
+someone who is.
 
-### Cron C groups the same way, since v3 of the view
+### Cron C groups the same way
 
-It did not until recently, and it was the pipeline's largest correctness gap.
-`spec_version` v2 derived keys **per source row** and unioned them — right for
-people, where a source row is one array element, and wrong for phone and email,
-where a source row is one provider. It never combined a name from Veriphone with
-a date of birth and ZIP from Pipl, so it derived *no* `ndz` key whenever the four
-factors arrived from different providers, which is the ordinary case. Cron C
-under-matched precisely the NDZ registrations it exists to catch, silently.
+`sql/clickhouse.sql` builds view `ca_drop_combined_search_result`, `spec_version`
+v3, which merges providers for phone and email and keeps per-element grouping
+for people, matching `reportGroups()`. It is live on DEV.
 
-`sql/clickhouse.sql` (view `spec_version` v3) merges the providers for phone and email
-and keeps per-element grouping for people, matching `reportGroups()`. It is **live on
-DEV** and every row reports `spec_version` v3.
-
-**The caps came with it, and had to.** Merging multiplies the factors, so v2's
-rule — drop the composites when the width passes 20,000 — would have fired on
-most email values and derived nothing, which is worse than the bug. The view now
-caps exactly as `FIELD_CAPS` does: 10 first names, 10 last names, 5 dates of
-birth, 24 ZIPs, 12 VINs, **sorted then sliced on the normalized values and
-before hashing**, because the Worker sorts values and sorting hashes instead
-would pick a different subset.
+The view caps the factors exactly as `FIELD_CAPS` does — 10 first names, 10 last
+names, 5 dates of birth, 24 ZIPs, 12 VINs — **sorted and sliced on the
+normalized values, before hashing**, because the Worker sorts values and sorting
+hashes instead would select a different subset. Without the caps, merging
+providers multiplies the factors far enough that most email values would pass
+the 20,000 cut and derive no composites at all.
 
 Order matters twice over:
 
@@ -189,29 +173,11 @@ Order matters twice over:
 Capping before merging would take each provider's first ten names and merge
 those, which is not the ten the Worker picks.
 
-One group is then bounded at `10·10·5·24 + 10·10·12` = 13,200 keys, so for phone
-and email the 20,000 cut is unreachable and the two sides agree exactly. A people
-report sums its groups and can still cross it, and the composites are dropped —
-as they are in the Worker.
-
-The fix was verified against DEV with the two cases that distinguish the
-behaviours: fields for one person split across two *providers* now produce one
-`ndz` key, byte-identical to the Anna / Smith / 19800101 / 90210 conformance
-vector; the same fields split across two *array elements* still produce none.
-
-The deployed view then confirmed it at scale. Across 2,033 values:
-
-| type | values | carry an `ndz` key | carry a `namevin` key | `ndz` keys | widest one value |
-|---|---|---|---|---|---|
-| email | 862 | 259 | 77 | 110,634 | 12,000 |
-| phone | 1,102 | 265 | 143 | 43,268 | 3,168 |
-| people | 69 | 30 | 27 | 2,267 | 245 |
-
-355,865 keys in total against v2's 224,121. The 259 email and 265 phone values are
-the ones that matter: under v2 most of those carried no `ndz` key at all, because
-their four factors came from different providers. `oversized_records` is 0 on every
-row, so the 20,000 cut has not fired once — the caps make it unreachable in
-practice for phone and email, and no people report has yet been wide enough.
+One group is bounded at `10·10·5·24 + 10·10·12` = 13,200 keys, so for phone and
+email the 20,000 cut is unreachable and the two sides agree exactly. A people
+report sums its groups and can still cross it; its composites are then dropped,
+as they are in the Worker. On DEV no row has crossed it — `oversized_records` is
+0 across all 2,033 values.
 
 ## 2a. What is checked, and what is not
 
@@ -235,11 +201,11 @@ is an unfinished decision.
 Nothing from it is served, and nothing from it is stored.
 
 - **Fresh report.** No provider row is written to ClickHouse. Provider responses
-  are held (`pendingRows`) until the report is screened, and flushed only if it
+  are held (`pendingRows`) until the report is screened and flushed only if it
   comes back clean; a match means they are dropped, not written and deleted.
 - **Cached report.** Every `entity_search_results` row for the subject is
-  erased, by `(type, normalized_value)` — all providers, not the one the match
-  came from.
+  erased, by `(type, normalized_value)` — all providers, not just the one the
+  match came from.
 - **Response.** Empty, and it does not say why. The user sees a report with no
   results, indistinguishable from a search that found nothing. DROP is never
   named in an API response.
@@ -250,8 +216,8 @@ The report is still served and still stored, without those people.
 
 - **Fresh report.** The filtered array is written.
 - **Cached report.** The stored payload is edited in place: the matched array
-  positions are removed and the row survives. It is pinned to the exact row
-  version that was read, because positions belong to one array and applying
+  positions are removed and the row survives. The edit is pinned to the exact
+  row version that was read, because positions belong to one array and applying
   them to another deletes the wrong people.
 
 ### Rule 3 — a check that cannot run is never a clean result
@@ -266,14 +232,14 @@ deleted. So:
   this and should only ever be set deliberately.
 - An unverified report is **never** written to ClickHouse, under either setting.
 - The failure raises a **Better Stack alert**. A silent fail-closed is a
-  suppression system that has stopped working and nobody knows.
+  suppression system that has stopped working with nobody aware.
 
 A *reduced* check is the middle case. When a report's cross product is too large
-to run in full the composite keys are capped (`FIELD_CAPS`) or dropped entirely
-in favour of the exact email and phone keys. The answer carries `partial: true`.
-A match under `partial` is as trustworthy as any; a **miss** is weaker evidence,
-and the caller must not cache it — the reduction is deterministic, so every
-later search would reduce the same way and miss the same way, making one weak
+to run in full, the composite keys are capped (`FIELD_CAPS`) or dropped entirely
+in favour of the exact email and phone keys, and the answer carries
+`partial: true`. A match under `partial` is as trustworthy as any; a **miss** is
+weaker evidence and must not be cached — the reduction is deterministic, so
+every later search reduces the same way and misses the same way, making one weak
 answer permanent.
 
 Exact email and phone keys are never capped. The high-confidence half of the
@@ -303,9 +269,8 @@ decides.
 
 `listed` is true for either source, so a caller that reads nothing else gets the
 cautious behaviour. `onDropList` is the statutory fact and has to be asked for
-**by name** — that separation is deliberate, because a suppressed-report value
-read as DROP membership would put a match into a compliance record California
-never asked for.
+**by name**, because a suppressed-report value read as DROP membership would put
+a match into a compliance record California never asked for.
 
 The intended caller is the **website, before the lookup funnel starts**: one
 question, and a listed subject costs no provider call at all. Nothing calls it
@@ -313,15 +278,15 @@ today (§7).
 
 ### The cached-report path is a fallback, and reaching it is a failure
 
-This is the third line of defence, not a normal path:
+Three lines of defence, in order:
 
-1. **Before the write** — a fresh report is screened and the listed records are
+1. **Before the write** — a fresh report is screened and listed records are
    never stored (Rules 1 and 2).
 2. **The sweep** — Cron C erases what is already stored, every cycle.
 3. **The request path** — a cached report is re-checked when someone searches
    for it, and this is where the erase sequence below runs.
 
-Step 3 catches only what steps 1 and 2 missed. So the erase is the small part.
+Step 3 catches only what steps 1 and 2 missed, so the erase is the small part.
 The important part is what a step-3 event *means*: a report Cron C was told to
 erase by a new DROP diff is still sitting in `entity_search_results`. Either the
 sweep has not run since the diff arrived, or it ran and missed — a partial KV
@@ -335,20 +300,17 @@ sweep is broken" is indistinguishable from the events meaning "the sweep is
 working". It needs its own paging signal on that path alone, carrying the
 `runId`, the list type and the count, and nothing identifying.
 
-A fallback that works silently is the one thing a fallback must not be: it hides
-a broken Cron C for as long as nobody reads the log.
-
 ### The erase sequence, and why it splits
 
 Cron C finds a match, erases, and records. When the **lookup API** performs the
 erase — it owns the write path for `entity_search_results`, so it owns the
-delete — the sequence has to split at the same seam:
+delete — the sequence splits at the same seam:
 
 1. `match-found` — the match row and the alert. **Before** the erase.
 2. the API erases.
 3. `erase-incident` — verify it happened, then the R2 evidence file.
 
-The order is not cosmetic. The erase destroys the only other evidence the
+The order is not cosmetic. The erase destroys the only other evidence that the
 consumer was ever in our data. A match row written first and then a failed erase
 is recoverable: Cron C finds the rows again next run. An erase with no match row
 is not: the rows are gone, the view has nothing left to match, and the only
@@ -423,8 +385,8 @@ extras.
 
 ## 7. Where the code does not yet meet this document
 
-Rules 1 and 2 are implemented as described above. Everything below is a known
-gap, ordered by consequence rather than by effort.
+Rules 1 and 2 are implemented as described. Everything below is a known gap,
+ordered by consequence rather than by effort.
 
 ### It stops suppressing, or never starts
 
@@ -445,21 +407,20 @@ gap, ordered by consequence rather than by effort.
   holds 11 privileges where `sql/clickhouse.sql` §6 expects 8. The extras are
   `SELECT` and `INSERT` on `ca_drop_match_run`, a table that no longer exists,
   and `ALTER DELETE` on `ca_drop_work_items`. ClickHouse records a privilege
-  against the *name*, so these survived the table being dropped and would
-  re-attach to anything that reused the name later. §3 of the file now opens
-  with `REVOKE ALL ON *.* FROM drop_workflow_role`, which is what keeps the
-  count at 8; DEV still needs that revoke and the grants replayed once.
-- **An oversized report is still handled differently on the two sides.** Both
-  cap the factors identically. Past the 20,000 total the Worker falls back to
-  the exact keys and flags `partial`; the view drops the composites. With the
-  caps in place this is now reachable only for a very wide people report, and
-  the direction is that the view checks *more* than the Worker rather than
-  less.
+  against the *name*, so these survive the table being dropped and would
+  re-attach to anything that reused the name. §3 of the file opens with
+  `REVOKE ALL ON *.* FROM drop_workflow_role`, which is what holds the count at
+  8; DEV still needs that revoke and the grants replayed once.
+- **An oversized report is handled differently on the two sides.** Both cap the
+  factors identically. Past the 20,000 total the Worker falls back to the exact
+  keys and flags `partial`, while the view drops the composites. Reachable only
+  for a very wide people report, and the direction is that the view checks
+  *more* than the Worker rather than less.
 - **`arraySort` orders by UTF-8 bytes; JavaScript `sort()` by UTF-16 code
   units.** They agree for everything in the Basic Multilingual Plane, which is
   all of `[a-z0-9]` and almost all CJK. A name containing a character above
-  U+FFFF could be capped to a different subset on the two sides. Vanishingly
-  rare, and it only matters for a report already over a cap.
+  U+FFFF could be capped to a different subset on the two sides. Rare, and it
+  only matters for a report already over a cap.
 - **Nothing gates Cron B on Cron C.** Absence of a status reads as `5 Not
   found`, so a Cron B that fires first reports a clean sheet for a cycle whose
   matches were never looked for.
@@ -485,7 +446,7 @@ gap, ordered by consequence rather than by effort.
 ### It costs more than it needs to
 
 - **Nothing calls `/api/drop/check`.** The suppression cache (§5) is written and
-  maintained, and no caller reads it, so a permanently-suppressed value still
+  maintained and no caller reads it, so a permanently-suppressed value still
   pays a full provider fan-out on every search.
 - **The second half of the erase sequence is fire-and-forget.**
   `reportErasure`'s return value is discarded at both call sites. After a
@@ -509,8 +470,8 @@ gap, ordered by consequence rather than by effort.
 
 ## Keeping this file honest
 
-It describes rules, so it goes stale the moment a rule changes rather than when
-code moves. The places that pin each rule down:
+It describes rules, so it goes stale when a rule changes rather than when code
+moves. The places that pin each rule down:
 
 | Rule | Pinned by |
 |---|---|
@@ -521,7 +482,4 @@ code moves. The places that pin each rule down:
 | revocation (§0) | `markWorkItemsRevoked` in `worker/db.ts`, and the `revoked_at IS NULL` filter on all three readers |
 | erase ordering (§4) | the test asserting the literal sequence `['match-found', 'erase']` |
 
-If you change a rule, change this file in the same commit. A document that
-describes an intention nobody implemented is worse than no document, because the
-next person believes it.
-
+If you change a rule, change this file in the same commit.
