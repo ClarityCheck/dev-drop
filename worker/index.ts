@@ -10,7 +10,6 @@ import { IncidentFailed, recordEraseIncident, recordMatchFound } from "./drop-in
 import type { IncidentStage } from "./drop-incident";
 import { lookupGate, recordSuppression } from "./drop-suppression";
 import {
-	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
 	boundReportFields,
 	buildReportKeys,
@@ -144,9 +143,11 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
  * - POST /api/drop/check - is this e-mail or phone on the DROP list?
- * - POST /api/drop/report-check - does a whole report touch any DROP key,
- *     and which of its records do? Answers only; it writes nothing and
- *     erases nothing. The caller filters before it persists, and Cron C
+ * - POST /api/drop/report-check - does a whole report touch any DROP key?
+ *     Answers `{ type, listed }`, plus per-element `records` for a people
+ *     report, whose elements are different people. It writes nothing and
+ *     erases nothing, and a check it cannot run in full is a 503, never
+ *     `listed: false`. The caller filters before it persists, and Cron C
  *     sweeps what was stored before this check existed.
  * - POST /api/drop/match-found - a cached report has joined the DROP list
  *     and the caller is ABOUT to erase it. Records the match row and the
@@ -392,46 +393,27 @@ export default {
 
 			const subject = subjectFields(type, typeof value === "string" ? value : undefined);
 			const reportRecords = extractReportRecords(report);
-
-			// Bound the cross product before counting it. An aggregated email
-			// payload can reach tens of millions of combinations, and refusing it
-			// meant that subject's lookup failed forever — so the factors are
-			// capped and the report says which ones were.
-			const bounded = reportGroups(
+			const groups = reportGroups(
 				type,
 				subject,
 				reportRecords.map((record) => record.fields),
-			).map(boundReportFields);
-			const capped = [...new Set(bounded.flatMap((b) => b.capped))].sort();
-			let groups = bounded.map((b) => b.fields);
+			);
 
-			// Still too big — many records, each individually within its caps. Drop
-			// the inferred keys and check the exact ones, which cost one key each
-			// and are the half worth keeping. Never answer "not listed" on the
-			// strength of a check that did not run.
-			let exactOnly = false;
-			if (groups.reduce((total, g) => total + countReportKeys(g), 0) > MAX_REPORT_KEYS) {
-				groups = groups.map(exactFieldsOnly);
-				exactOnly = true;
-			}
-
-			const partial = capped.length > 0 || exactOnly;
+			// The answer is `listed` and nothing else, so anything less than the
+			// whole check is not an answer. A report whose cross product does not
+			// fit, and one that yields no key at all, both fail here rather than
+			// coming back as a reduced or empty "not listed" the caller cannot tell
+			// apart from a clean one.
 			const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
 			if (candidates === 0) {
-				return Response.json({
-					type,
-					listed: false,
-					subjectListed: false,
-					matched: [],
-					keysChecked: 0,
-					records: reportRecords.map((record) => ({
-						index: record.index,
-						...(record.id === undefined ? {} : { id: record.id }),
-						listed: false,
-						matched: [],
-					})),
-					reason: "no DROP key could be derived from the report",
-				});
+				return Response.json(
+					{
+						error: "check did not run",
+						detail: "no DROP key could be derived from the report",
+						hint: "treat as unknown, not as not-listed",
+					},
+					{ status: 503 },
+				);
 			}
 			if (candidates > MAX_REPORT_KEYS) {
 				return Response.json(
@@ -459,15 +441,8 @@ export default {
 				);
 			}
 
-			const { keysChecked, matched } = checked;
+			const { matched } = checked;
 			const [subjectMatched, ...rest] = matched;
-
-			// people  one verdict per element, each from its own group.
-			// email   one group covered the whole report, so its verdict IS every
-			// phone   element's verdict: a match means the report is about a
-			//         listed consumer and none of it may be served.
-			const recordMatched =
-				type === "people" ? rest : reportRecords.map(() => rest[0] ?? []);
 			const reportListed = matched.some((families) => families.length > 0);
 
 			// The subject is clean but its report is not: the aggregated data
@@ -488,29 +463,20 @@ export default {
 				);
 			}
 
+			// A people report's elements are different people, each checked from
+			// its own group, so the caller is told which ones matched — it is what
+			// lets it remove those and keep the strangers. A phone or email report
+			// is one person seen by several providers: the verdict is the report's
+			// and there is nothing to name.
 			return Response.json({
 				type,
 				listed: reportListed,
-				subjectListed: subjectMatched.length > 0,
-				matched: DROP_KEY_FAMILIES.filter((family) =>
-					matched.some((families) => families.includes(family)),
-				),
-				keysChecked,
-				records: reportRecords.map((record, i) => ({
-					index: record.index,
-					...(record.id === undefined ? {} : { id: record.id }),
-					listed: recordMatched[i].length > 0,
-					matched: recordMatched[i],
-				})),
-				// The inferred half of the check was reduced to keep it runnable.
-				// The exact e-mail and phone keys were still checked in full, so a
-				// match here is as trustworthy as any; a MISS is weaker evidence
-				// than usual and `partial` is how a caller knows.
-				...(partial
+				...(type === "people"
 					? {
-							partial: true,
-							...(capped.length > 0 ? { capped } : {}),
-							...(exactOnly ? { exactKeysOnly: true } : {}),
+							records: reportRecords.map((record, i) => ({
+								index: record.index,
+								listed: (rest[i] ?? []).length > 0,
+							})),
 						}
 					: {}),
 			});

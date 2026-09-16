@@ -5,6 +5,7 @@ import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-nor
 import { isSuppressedKey, suppressedKey } from "../worker/drop-suppression";
 import {
 	FIELD_CAPS,
+	MAX_REPORT_KEYS,
 	NO_FIELDS,
 	boundReportFields,
 	buildReportKeys,
@@ -475,19 +476,21 @@ describe("POST /api/drop/report-check", () => {
 		expect((await check({ type: "people" })).status).toBe(400);
 	});
 
-	it("says so when no key can be derived", async () => {
+	it("fails when no key can be derived", async () => {
 		const { status, json } = await check({ type: "people", report: { socialProfiles: {} } });
-		expect(status).toBe(200);
-		expect(json.listed).toBe(false);
-		expect(json.keysChecked).toBe(0);
-		expect(json.reason).toBe("no DROP key could be derived from the report");
+		expect(status).toBe(503);
+		expect(json).toMatchObject({
+			error: "check did not run",
+			detail: "no DROP key could be derived from the report",
+		});
 	});
 
-	it("answers a pathological report by capping it, not by refusing", async () => {
+	it("fails a pathological report rather than reducing it", async () => {
 		// Measured on DEV, one aggregated email row reaches 33,202,400 candidate
 		// keys: 82 first names, 71 last names, 230 birthDates, 140 ZIPs, all
-		// multiplied together. Refusing meant that subject's lookup failed with a
-		// 503 every time, permanently. The factors are capped instead.
+		// multiplied together. The answer is `listed` alone, so a reduced check
+		// has no way to say it was reduced — it fails instead, and the lookup API
+		// marks the search failed.
 		const many = (n: number, prefix: string) =>
 			Array.from({ length: n }, (_, i) => `${prefix}${i}`);
 
@@ -508,29 +511,19 @@ describe("POST /api/drop/report-check", () => {
 			},
 		});
 
-		expect(status).toBe(200);
-		expect(json).toMatchObject({ type: "email", listed: false, partial: true });
-		expect(json.capped).toEqual(
-			expect.arrayContaining(["dobs", "firstNames", "lastNames", "zips"]),
-		);
-		// Capped, so bounded — and the cap is the product of FIELD_CAPS.
-		expect(json.keysChecked as number).toBeLessThanOrEqual(10 * 10 * 5 * 24 + 1);
+		expect(status).toBe(503);
+		expect(json).toMatchObject({ error: "check did not run" });
+		expect(json.detail).toContain(`over the ${MAX_REPORT_KEYS} limit`);
 	});
 
-	it("still checks every exact key when the product has to be dropped", async () => {
-		// Many records, each within its own caps, still over the total. The
-		// composite inference goes; the e-mail and phone keys cost one each and
-		// are the half worth keeping, so they are checked in full.
-		const listed = await sha256Base64("buried.listed@example.com");
-		await env.kv.put(listed, "work-item-buried");
-
+	it("fails when many records are individually fine but together over the limit", async () => {
 		const person = (i: number) => ({
 			names: Array.from({ length: 10 }, (_, n) => ({ first: `f${n}`, last: `l${n}` })),
 			dateOfBirth: { start: "1980-01-01" },
 			addresses: Array.from({ length: 24 }, (_, z) => ({
 				zipCode: `1${String(z).padStart(4, "0")}`,
 			})),
-			emails: [{ address: i === 40 ? "Buried.Listed@Example.com" : `p${i}@example.com` }],
+			emails: [{ address: `p${i}@example.com` }],
 		});
 
 		const { status, json } = await check({
@@ -538,15 +531,8 @@ describe("POST /api/drop/report-check", () => {
 			report: Array.from({ length: 60 }, (_, i) => person(i)),
 		});
 
-		expect(status).toBe(200);
-		expect(json).toMatchObject({
-			type: "people",
-			listed: true,
-			matched: ["email"],
-			partial: true,
-			exactKeysOnly: true,
-		});
-		expect((json.records as { index: number; listed: boolean }[])[40].listed).toBe(true);
+		expect(status).toBe(503);
+		expect(json).toMatchObject({ error: "check did not run" });
 	});
 
 	it("answers false for a report that touches no DROP key", async () => {
@@ -555,18 +541,14 @@ describe("POST /api/drop/report-check", () => {
 			value: "nobody@example.com",
 			report: { personalInfo: { firstName: "Nobody", lastName: "Here" } },
 		});
+
+		// Two fields, and nothing else: no per-record verdicts, no key families,
+		// no count of what was checked.
 		expect(status).toBe(200);
-		expect(json).toMatchObject({
-			type: "email",
-			listed: false,
-			subjectListed: false,
-			matched: [],
-			records: [{ index: 0, listed: false, matched: [] }],
-		});
-		expect(json.keysChecked).toBe(1);
+		expect(json).toEqual({ type: "email", listed: false });
 	});
 
-	it("flags every record when the searched e-mail is listed", async () => {
+	it("answers listed when the searched e-mail is on the list", async () => {
 		await env.kv.put(await sha256Base64("listed.person@example.com"), "work-item-email");
 
 		const { status, json } = await check({
@@ -575,19 +557,8 @@ describe("POST /api/drop/report-check", () => {
 			report: { personalInfo: { firstName: "Listed" } },
 		});
 
-		// An e-mail report is one person seen by several providers, so the
-		// verdict is the report's and every element carries it. subjectListed
-		// stays separate: it is the statutory fact that the searched identifier
-		// is itself on a DROP list, which is what decides whether the finding is
-		// recorded as a suppression.
 		expect(status).toBe(200);
-		expect(json).toMatchObject({
-			type: "email",
-			listed: true,
-			subjectListed: true,
-			matched: ["email"],
-			records: [{ index: 0, listed: true, matched: ["email"] }],
-		});
+		expect(json).toEqual({ type: "email", listed: true });
 	});
 
 	it("combines name, date of birth and ZIP across providers into one NDZ key", async () => {
@@ -612,22 +583,15 @@ describe("POST /api/drop/report-check", () => {
 		});
 
 		expect(status).toBe(200);
-		expect(json).toMatchObject({
-			type: "phone",
-			listed: true,
-			subjectListed: false,
-			matched: ["ndz"],
-			records: [
-				{ index: 0, listed: true, matched: ["ndz"] },
-				{ index: 1, listed: true, matched: ["ndz"] },
-			],
-		});
+		expect(json).toEqual({ type: "phone", listed: true });
 	});
 
 	it("keeps a people report's elements independent of one another", async () => {
-		// The mirror of the test above: the same four factors split across two
-		// ARRAY ELEMENTS are two different people, so combining them would
-		// invent a key for someone who does not exist. Nothing matches.
+		// The mirror of the test above: the listed NDZ key is Ada's name and dob
+		// with the 94107 ZIP, and those factors sit in two different ARRAY
+		// ELEMENTS — two different people. Each element derives its own keys, so
+		// the check runs in full; combining them across elements would invent a
+		// key for someone who does not exist, and nothing matches.
 		const ndz = await sha256Base64(
 			(await sha256Base64("ada")) +
 				(await sha256Base64("lovelace")) +
@@ -639,13 +603,26 @@ describe("POST /api/drop/report-check", () => {
 		const { status, json } = await check({
 			type: "people",
 			report: [
-				{ personalInfo: { firstName: "Ada", lastName: "Lovelace" } },
-				{ personalInfo: { birthDate: "1985-11-03" }, contactInfo: { zip: "94107" } },
+				{
+					personalInfo: { firstName: "Ada", lastName: "Lovelace", birthDate: "1985-11-03" },
+					contactInfo: { zip: "10001" },
+				},
+				{
+					personalInfo: { firstName: "Unrelated", lastName: "Person", birthDate: "1970-01-01" },
+					contactInfo: { zip: "94107" },
+				},
 			],
 		});
 
 		expect(status).toBe(200);
-		expect(json).toMatchObject({ type: "people", listed: false, matched: [] });
+		expect(json).toEqual({
+			type: "people",
+			listed: false,
+			records: [
+				{ index: 0, listed: false },
+				{ index: 1, listed: false },
+			],
+		});
 	});
 
 	it("answers a clean subject with a listed report, and the recording cannot fail it", async () => {
@@ -666,13 +643,7 @@ describe("POST /api/drop/report-check", () => {
 		});
 
 		expect(status).toBe(200);
-		expect(json).toMatchObject({
-			type: "email",
-			listed: true,
-			subjectListed: false,
-			matched: ["ndz"],
-			records: [{ index: 0, listed: true, matched: ["ndz"] }],
-		});
+		expect(json).toEqual({ type: "email", listed: true });
 	});
 
 	it("answers without writing to or erasing anything", async () => {
@@ -692,19 +663,19 @@ describe("POST /api/drop/report-check", () => {
 		// so a 200 here is itself the assertion: the endpoint touched none of
 		// them. The caller filters before it persists.
 		expect(status).toBe(200);
-		expect(json).toMatchObject({
+		expect(json).toEqual({
 			type: "people",
 			listed: true,
-			matched: ["namevin"],
-			records: [{ index: 0, listed: true, matched: ["namevin"] }],
+			records: [{ index: 0, listed: true }],
 		});
-		expect(json.erased).toBeUndefined();
-		expect(json.error).toBeUndefined();
 	});
 
-	it("names only the matching record of a people report", async () => {
+	it("names only the matching element of a people report", async () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-ndz");
 
+		// The elements are different people, so the verdict is per element and
+		// the caller removes only the one that matched. The other thirty-nine
+		// John Smiths are strangers and their records stay.
 		const { json } = await check({
 			type: "people",
 			value: "Anna Smith",
@@ -724,19 +695,17 @@ describe("POST /api/drop/report-check", () => {
 			],
 		});
 
-		expect(json).toMatchObject({
+		expect(json).toEqual({
 			type: "people",
 			listed: true,
-			subjectListed: false,
-			matched: ["ndz"],
 			records: [
-				{ index: 0, id: "pipl-clean", listed: false, matched: [] },
-				{ index: 1, id: "pipl-listed", listed: true, matched: ["ndz"] },
+				{ index: 0, listed: false },
+				{ index: 1, listed: true },
 			],
 		});
 	});
 
-	it("does not flag a record built from another record's dob and zip", async () => {
+	it("does not invent a key from another record's dob and zip", async () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-ndz");
 
 		const { json } = await check({
@@ -751,7 +720,7 @@ describe("POST /api/drop/report-check", () => {
 			],
 		});
 
-		expect(json).toMatchObject({
+		expect(json).toEqual({
 			type: "people",
 			listed: false,
 			records: [
@@ -761,7 +730,7 @@ describe("POST /api/drop/report-check", () => {
 		});
 	});
 
-	it("flags the record whose own e-mail is listed", async () => {
+	it("names the element whose own e-mail is listed", async () => {
 		await env.kv.put(await sha256Base64("second@example.com"), "work-item-record-email");
 
 		const { json } = await check({
@@ -772,18 +741,15 @@ describe("POST /api/drop/report-check", () => {
 			],
 		});
 
-		expect(json).toMatchObject({
+		expect(json).toEqual({
 			type: "people",
 			listed: true,
-			subjectListed: false,
-			matched: ["email"],
 			records: [
-				{ index: 0, listed: false, matched: [] },
-				{ index: 1, listed: true, matched: ["email"] },
+				{ index: 0, listed: false },
+				{ index: 1, listed: true },
 			],
 		});
 	});
-
 });
 
 describe("POST /api/drop/erase-incident", () => {

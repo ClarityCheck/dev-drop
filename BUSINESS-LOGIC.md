@@ -145,10 +145,26 @@ Two consequences, running in opposite directions:
   strangers and their records stay.
 
 `reportGroups()` in `worker/drop-report.ts` decides this: one group per element
-for people, one merged group for phone and email. The subject is its own group
-in both cases, so `subjectListed` distinguishes the statutory fact — _this
-identifier is on a DROP list_ — from the wider finding that the report is about
-someone who is.
+for people, one merged group for phone and email.
+
+### What `report-check` answers
+
+`POST /api/drop/report-check` returns `{ type, listed }`, and for a people
+report also `records: [{ index, listed }]` — one verdict per array element,
+because that is what lets the caller remove the matched person and keep the
+strangers. A phone or email report has nothing to name, so it gets the two
+fields alone.
+
+Nothing else travels to the caller: no matched key families, no count of keys
+checked, no `partial`. The lookup API acts on `listed`, places a people match
+with `records`, and logs a match as an error carrying only the report type —
+never a record count or any of the matched data.
+
+`index` is a position in **the array the caller sent**, which is not the array
+it holds: the Worker skips payloads it cannot read, so the caller maps the
+indexes back itself (`readable` in `DropCheckService`). A people match whose
+verdicts cannot be placed at all suppresses the whole report — the Worker
+called it listed, and serving the element that matched is not an option.
 
 ### Cron C groups the same way
 
@@ -273,16 +289,23 @@ deleted. So:
 - The failure raises a **Better Stack alert**. A silent fail-closed is a
   suppression system that has stopped working with nobody aware.
 
-A _reduced_ check is the middle case. When a report's cross product is too large
-to run in full, the composite keys are capped (`FIELD_CAPS`) or dropped entirely
-in favour of the exact email and phone keys, and the answer carries
-`partial: true`. A match under `partial` is as trustworthy as any; a **miss** is
-weaker evidence and must not be cached — the reduction is deterministic, so
-every later search reduces the same way and misses the same way, making one weak
-answer permanent.
+**There is no middle case any more.** A reduced check used to answer with
+`partial: true`, leaving the caller to treat a miss as weaker evidence. The
+answer no longer carries that warning, so `report-check` runs the check in full
+or fails:
 
-Exact email and phone keys are never capped. The high-confidence half of the
-check stays complete however noisy the payload is.
+| Situation                                     | Answer                                 |
+| --------------------------------------------- | -------------------------------------- |
+| cross product over `MAX_REPORT_KEYS` (20,000) | **503**, `detail` names the count      |
+| no DROP key derivable from the report at all  | **503**, `detail` says so              |
+| KV unreachable                                | **503**, `detail` carries the KV error |
+
+All three reach the lookup API as a failed check: it logs the worker's reason,
+raises, and the lookup is marked **failed**. A pathological report — the
+measured worst case is an aggregated email row at 33M candidate keys — now
+fails that subject's lookup instead of being capped down to something runnable.
+`FIELD_CAPS` and `exactFieldsOnly()` still bound the **incident** paths, where a
+subset of the hits is worth having because the erasure already happened.
 
 ## 4. The endpoints, and who calls them
 
@@ -459,11 +482,11 @@ ordered by consequence rather than by effort.
 
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.
-- **An oversized report is handled differently on the two sides.** Both cap the
-  factors identically. Past the 20,000 total the Worker falls back to the exact
-  keys and flags `partial`, while the view drops the composites. Reachable only
-  for a very wide people report, and the direction is that the view checks
-  _more_ than the Worker rather than less.
+- **An oversized report now fails the lookup.** `report-check` caps nothing: a
+  report over the 20,000 key total is a 503, so that subject's lookup fails
+  every time until the payload gets narrower. Cron C's view still checks it, by
+  dropping the composites, so the consumer is not missed — but the live search
+  stays broken, and nothing measures how often this fires.
 - **`arraySort` orders by UTF-8 bytes; JavaScript `sort()` by UTF-16 code
   units.** They agree for everything in the Basic Multilingual Plane, which is
   all of `[a-z0-9]` and almost all CJK. A name containing a character above
