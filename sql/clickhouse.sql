@@ -386,6 +386,22 @@ FROM
 
 CREATE ROLE drop_workflow_role;
 
+-- Do not drop this line because the file is create-only.
+--
+-- ClickHouse records a privilege against the NAME, not the object, so a
+-- grant outlives the table it referenced and re-applies to any future
+-- table that reuses the name. On a service where the role already exists
+-- — every service this has run on so far — the grants below are added to
+-- whatever was there before rather than replacing it. Dev proved it: the
+-- role still carried SELECT and INSERT on ca_drop_match_run, a table
+-- deleted long ago, and ALTER DELETE on ca_drop_work_items, which no
+-- version of this file grants.
+--
+-- On a genuinely fresh service this is a no-op. That is the point: it
+-- costs nothing there and is the only thing that makes section 6's count
+-- of 8 true anywhere else.
+REVOKE ALL ON *.* FROM drop_workflow_role;
+
 -- The candidate keys.
 GRANT SELECT ON default.ca_drop_combined_search_result TO drop_workflow_role;
 

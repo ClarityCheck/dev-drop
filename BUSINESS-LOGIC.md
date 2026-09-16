@@ -168,7 +168,8 @@ factors arrived from different providers, which is the ordinary case. Cron C
 under-matched precisely the NDZ registrations it exists to catch, silently.
 
 `sql/clickhouse.sql` (view `spec_version` v3) merges the providers for phone and email
-and keeps per-element grouping for people, matching `reportGroups()`.
+and keeps per-element grouping for people, matching `reportGroups()`. It is **live on
+DEV** and every row reports `spec_version` v3.
 
 **The caps came with it, and had to.** Merging multiplies the factors, so v2's
 rule — drop the composites when the width passes 20,000 — would have fired on
@@ -197,6 +198,20 @@ The fix was verified against DEV with the two cases that distinguish the
 behaviours: fields for one person split across two *providers* now produce one
 `ndz` key, byte-identical to the Anna / Smith / 19800101 / 90210 conformance
 vector; the same fields split across two *array elements* still produce none.
+
+The deployed view then confirmed it at scale. Across 2,033 values:
+
+| type | values | carry an `ndz` key | carry a `namevin` key | `ndz` keys | widest one value |
+|---|---|---|---|---|---|
+| email | 862 | 259 | 77 | 110,634 | 12,000 |
+| phone | 1,102 | 265 | 143 | 43,268 | 3,168 |
+| people | 69 | 30 | 27 | 2,267 | 245 |
+
+355,865 keys in total against v2's 224,121. The 259 email and 265 phone values are
+the ones that matter: under v2 most of those carried no `ndz` key at all, because
+their four factors came from different providers. `oversized_records` is 0 on every
+row, so the 20,000 cut has not fired once — the caps make it unreachable in
+practice for phone and email, and no people report has yet been wide enough.
 
 ## 2a. What is checked, and what is not
 
@@ -426,9 +441,14 @@ gap, ordered by consequence rather than by effort.
 
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.
-- **The view is not deployed until it is rebuilt.** v3 fixes the grouping, and
-  nothing takes effect until `sql/clickhouse.sql` is run and the
-  view refreshed. Until then Cron C is still matching on v2's per-provider keys.
+- **`drop_workflow_role` carries grants nobody granted, on DEV.** The live role
+  holds 11 privileges where `sql/clickhouse.sql` §6 expects 8. The extras are
+  `SELECT` and `INSERT` on `ca_drop_match_run`, a table that no longer exists,
+  and `ALTER DELETE` on `ca_drop_work_items`. ClickHouse records a privilege
+  against the *name*, so these survived the table being dropped and would
+  re-attach to anything that reused the name later. §3 of the file now opens
+  with `REVOKE ALL ON *.* FROM drop_workflow_role`, which is what keeps the
+  count at 8; DEV still needs that revoke and the grants replayed once.
 - **An oversized report is still handled differently on the two sides.** Both
   cap the factors identically. Past the 20,000 total the Worker falls back to
   the exact keys and flags `partial`; the view drops the composites. With the
@@ -505,18 +525,3 @@ If you change a rule, change this file in the same commit. A document that
 describes an intention nobody implemented is worse than no document, because the
 next person believes it.
 
-- **No dedicated Better Stack alert on a fail-closed.** The lookup API logs at
-  `error` (`DropCheckService.unverified`, `CoordinatorProcessor.process`), which
-  the Logtail transport ships to Better Stack — so the signal is there only if an
-  alert rule is configured on those messages, and nothing in either repo defines
-  one. There is no Sentry or Slack path either: the `AppExceptionFilter` that
-  would provide it runs for HTTP requests, not BullMQ jobs, so the
-  `DROP_CHECK_UNAVAILABLE` exception never reaches it.
-- **The Worker logs nothing when the check fails.** The 503s in
-  `/api/drop/report-check` and `/api/drop/check` return without calling
-  `logRun`, so the side that actually knows the check could not run reports
-  nothing. The cron paths already use `logRun`/`logMatches` against Better Stack;
-  the gate routes should use the same.
-- **`failed` does not say why.** A DROP outage and a provider timeout both
-  surface as `status: "failed"`, so the client cannot distinguish "we could not
-  verify" from "the lookup broke".
