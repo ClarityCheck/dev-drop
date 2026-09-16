@@ -80,28 +80,28 @@ CREATE TABLE public.ca_drop_suppressed_value
     -- from it without guessing.
     value       text        NOT NULL CHECK (value <> ''),
 
-    -- When it was last written. A repeat search that still matches
-    -- refreshes it, which is what keeps the KV fast path warm: the repair
-    -- restores only recent rows.
+    -- When it was added. A repeat search for the same value changes
+    -- nothing: the row is written once and stays, so this is the date the
+    -- value was first found in a matching report.
     added_at    timestamptz NOT NULL DEFAULT now(),
 
     UNIQUE (search_type, value)
 );
 
--- The repair reads recent rows, oldest first, in pages.
-CREATE INDEX ca_drop_suppressed_value_added_idx
-    ON public.ca_drop_suppressed_value (added_at, id);
+-- The repair walks every row, oldest first, paged by id -- which the
+-- primary key already serves, so there is no second index to keep.
 
 
 -- =====================================================================
 -- 3. Grants for the Workflow role
 --
 -- The role already exists -- supabase-1-create.sql section 2 created it.
--- UPDATE is needed because the insert upserts: a value that matches again
--- refreshes added_at rather than inserting a duplicate.
+-- No UPDATE: a row is inserted once and never changed. A repeat match is
+-- ON CONFLICT DO NOTHING. No DELETE either -- a value recorded here is
+-- not processed again, and nothing revokes that.
 -- =====================================================================
 
-GRANT SELECT, INSERT, UPDATE ON public.ca_drop_suppressed_value         TO drop_workflow;
+GRANT SELECT, INSERT ON public.ca_drop_suppressed_value                 TO drop_workflow;
 GRANT USAGE, SELECT  ON SEQUENCE public.ca_drop_suppressed_value_id_seq TO drop_workflow;
 
 
@@ -123,7 +123,7 @@ CREATE POLICY drop_workflow_full_access
 -- 5. Verify
 -- =====================================================================
 
--- drop_workflow, and INSERT, SELECT, UPDATE -- nothing else, nobody else.
+-- drop_workflow, and INSERT, SELECT -- nothing else, nobody else.
 SELECT grantee, table_name,
        string_agg(privilege_type, ', ' ORDER BY privilege_type) AS privs
 FROM information_schema.table_privileges
@@ -151,5 +151,6 @@ WHERE table_schema = 'public' AND table_name = 'ca_drop_suppressed_search';
 -- what it did before any of this existed.
 --
 -- Cron A with clearKv wipes the KV namespace, this table's fast path
--- included, so run POST /api/kv-repair/start after a clear.
+-- included, so run POST /api/kv-repair/start after a clear. The repair
+-- restores every row, because every row still applies.
 -- =====================================================================

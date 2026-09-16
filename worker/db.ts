@@ -642,9 +642,9 @@ export async function sampleWorkItems(
  * A value whose report had to be suppressed although the value itself was not
  * on the DROP list.
  *
- * One row per (type, value), written when a report matches and refreshed when
- * it matches again. No counters, no matched families, no clearing: the row is a
- * hint that saves a provider fan-out, and everything beyond "we have seen this"
+ * One row per (type, value), written the first time a report matches. No
+ * counters, no matched families, no clearing and no expiry: once a value is
+ * here it is not processed again, and everything beyond "we have seen this"
  * was cost without a reader.
  *
  * `value` is DROP-normalized, so one consumer is one row however the search was
@@ -661,7 +661,7 @@ export async function recordSuppressedValue(
 			sql`
 				INSERT INTO public.ca_drop_suppressed_value (search_type, value)
 				VALUES (${searchType}, ${value})
-				ON CONFLICT (search_type, value) DO UPDATE SET added_at = now()
+				ON CONFLICT (search_type, value) DO NOTHING
 			`,
 			20000,
 			"upsert ca_drop_suppressed_value",
@@ -674,12 +674,6 @@ export async function recordSuppressedValue(
 /**
  * Recent suppressed values, oldest first, for rebuilding the KV fast path.
  *
- * `withinDays` is what stands in for a clearing path. A suppression is a claim
- * about a report, and reports change -- DROP revokes work items, providers
- * return different data -- so a finding nobody has re-confirmed in a month
- * stops being restored and the next search re-derives it. The KV key carries
- * the same expiry, so the two agree.
- *
  * Paged by id rather than OFFSET so a repair running while rows are added
  * cannot skip one: the cursor is a row that exists.
  */
@@ -687,7 +681,6 @@ export async function pageSuppressedValues(
 	env: Env,
 	afterId: string,
 	limit: number,
-	withinDays: number,
 ): Promise<{ id: string; search_type: string; value: string }[]> {
 	const sql = connect(env);
 	try {
@@ -696,7 +689,6 @@ export async function pageSuppressedValues(
 				SELECT id::text AS id, search_type, value
 				FROM public.ca_drop_suppressed_value
 				WHERE id > ${afterId}::bigint
-				  AND added_at > now() - make_interval(days => ${withinDays})
 				ORDER BY id
 				LIMIT ${limit}
 			`,

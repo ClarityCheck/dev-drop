@@ -33,22 +33,6 @@ import { logRun } from "./logs";
  */
 export const SUPPRESSED_PREFIX = "suppressed:";
 
-/**
- * How long a suppression stays on the fast path before it has to be re-earned.
- *
- * A finding about a report is not permanent the way DROP membership is. The
- * report can change, and DROP can revoke the work item that caused it — its
- * removal list does exactly that. Without an expiry the gate would answer
- * listed: true for that value forever, on evidence nobody ever re-checks,
- * because a short-circuited search never reaches the check that would notice.
- *
- * So the key expires. On the next search after that, the funnel runs once, the
- * report is checked properly, and the finding is either re-recorded or cleared.
- * Thirty days is the cost of one wasted lookup per value per month against a
- * suppression that can never be wrong for longer than that.
- */
-export const SUPPRESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
-
 export function suppressedKey(hash: string): string {
 	return `${SUPPRESSED_PREFIX}${hash}`;
 }
@@ -113,13 +97,9 @@ export type Suppression = {
  * because that is what the gate has in hand and it keeps plaintext out of a
  * store the gate reads on ordinary traffic.
  *
- * There is no counterpart that clears it. An earlier version ran an UPDATE
- * against Supabase on every clean lookup to un-suppress a value that had
- * recovered, which put a Hyperdrive connection and a write on the overwhelming
- * majority of lookups -- all of which had nothing to clear. The expiry does the
- * same job for nothing: the KV key lasts SUPPRESSION_TTL_SECONDS, the repair
- * restores only rows refreshed within the same window, and a value that stops
- * matching simply stops being renewed.
+ * It is written once and stays. A phone number or e-mail whose report carried
+ * DROP-listed data is not processed again -- there is no clearing path and no
+ * expiry, so a value recorded here is answered from here from then on.
  *
  * Best effort by design, and the one place in this Worker where that is the
  * right answer. Losing it costs one provider fan-out, which is what happened
@@ -159,7 +139,6 @@ export async function putSuppressedKey(
 	searchType: string,
 ): Promise<void> {
 	await env.kv.put(suppressedKey(hash), searchType, {
-		expirationTtl: SUPPRESSION_TTL_SECONDS,
 		metadata: { kind: "suppressed-report", search_type: searchType },
 	});
 }

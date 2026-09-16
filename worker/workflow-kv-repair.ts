@@ -4,7 +4,7 @@ import { countWorkItems, pageSuppressedValues, pageWorkItems } from "./db";
 import { dropKey } from "./drop-normalize";
 import type { DropListType } from "./drop-normalize";
 import { logRun, tracer } from "./logs";
-import { SUPPRESSION_TTL_SECONDS, putSuppressedKey } from "./drop-suppression";
+import { putSuppressedKey } from "./drop-suppression";
 
 /**
  * KV repair  (workflow: drop-kv-repair)
@@ -156,14 +156,10 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 
 				const restored: { cursor: string; written: number; done: boolean } =
 					await tracedStep(`restore suppressions · page ${suppressionPage}`, async () => {
-						// Only what has been re-confirmed inside the expiry window. A
-						// finding nobody has seen for a month is not restored, and the
-						// next search for that value derives it again or does not.
 						const rows = await pageSuppressedValues(
 							this.env,
 							suppressionCursor,
 							pageSize,
-							SUPPRESSION_TTL_SECONDS / 86400,
 						);
 						if (rows.length === 0) {
 							return { cursor: suppressionCursor, written: 0, done: true };
