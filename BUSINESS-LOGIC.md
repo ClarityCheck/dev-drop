@@ -167,7 +167,7 @@ a date of birth and ZIP from Pipl, so it derived *no* `ndz` key whenever the fou
 factors arrived from different providers, which is the ordinary case. Cron C
 under-matched precisely the NDZ registrations it exists to catch, silently.
 
-`sql/clickhouse-view-rebuild.sql` (v3) merges the providers for phone and email
+`sql/clickhouse.sql` (view `spec_version` v3) merges the providers for phone and email
 and keeps per-element grouping for people, matching `reportGroups()`.
 
 **The caps came with it, and had to.** Merging multiplies the factors, so v2's
@@ -427,7 +427,7 @@ gap, ordered by consequence rather than by effort.
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.
 - **The view is not deployed until it is rebuilt.** v3 fixes the grouping, and
-  nothing takes effect until `sql/clickhouse-view-rebuild.sql` is run and the
+  nothing takes effect until `sql/clickhouse.sql` is run and the
   view refreshed. Until then Cron C is still matching on v2's per-provider keys.
 - **An oversized report is still handled differently on the two sides.** Both
   cap the factors identically. Past the 20,000 total the Worker falls back to

@@ -1,65 +1,86 @@
 -- =====================================================================
--- default.ca_drop_combined_search_result  —  spec_version v3
+-- CA DROP — the whole ClickHouse side, from nothing.
 --
--- v3 changes ONE thing and it is a bug fix: how a phone or e-mail report
--- is grouped before the cross product is taken.
+-- One file, run once, as an admin user, TOP TO BOTTOM. There are no
+-- DROPs and no IF NOT EXISTS: every statement creates. If one fails
+-- saying something already exists, this is not a fresh service — stop
+-- and find out what is there, because the grants further down assume
+-- this file built what they point at.
 --
--- WHAT WAS WRONG IN v2
+-- ─── TWO THINGS TO DO FIRST ──────────────────────────────────────────
 --
--- v2 derived keys per SOURCE ROW and unioned them. For a people report a
--- source row is one array element, which is right — the elements are
--- different people and combining one person's name with another's ZIP
--- would invent a key for someone who does not exist.
+-- 1. entity_search_results must already exist. The lookup API creates it
+--    itself, from src/modules/db/clickhouse/types/entity-search-result-table.ts,
+--    so start the API against this service once before running this file.
+--    Section 2's view reads that table and section 4 grants on it; both
+--    fail if it is not there.
 --
--- For a phone or e-mail report a source row is one PROVIDER, and every
--- provider describes the SAME person: the subject of the search. So when
--- Veriphone returns the name and Pipl returns the date of birth and the
--- ZIP, those four factors belong to one consumer and must form one NDZ
--- key. Deriving them per provider produces NO ndz key at all — each
--- provider is missing a factor — and an NDZ-registered consumer is never
--- matched by Cron C. Silently: no error is raised anywhere.
+-- 2. THE VIEW'S DEFINER, in section 2, names an account that exists in
+--    the DEV service and will not exist in a new one. Change it to an
+--    admin account on the target service before running.
 --
--- worker/drop-report.ts reportGroups() has merged the providers for phone
--- and e-mail since the request path was built, so the sweep has been
--- under-matching exactly the registrations the request path catches. This
--- brings the view into line.
+--    It is load-bearing, not decoration. The view is SQL SECURITY
+--    DEFINER, so a refresh reads entity_search_results as the definer
+--    rather than as drop_workflow — which is why drop_workflow needs no
+--    SELECT on that table for the match, only for the erase. If the
+--    definer account is ever removed, refreshes break and no grant in
+--    this file will fix it.
 --
--- THE CAPS COME WITH IT, AND HAVE TO
+-- ─── WHAT THIS BUILDS ────────────────────────────────────────────────
 --
--- Merging the providers multiplies the factors. Measured on DEV, a single
--- e-mail provider row already reaches 82 first names x 71 last names x
--- 230 birthDates x 140 ZIPs; merged across eleven providers the product
--- is far larger. v2's rule — drop the composites when the width exceeds
--- 20,000 — would then fire on most e-mail values and derive nothing,
--- which is worse than the bug being fixed.
+--   ca_drop_combined_search_result  the candidate keys, derived in SQL
+--                                   from entity_search_results
+--   ca_drop_work_items              the DROP hash set, borrowed from KV
+--                                   only while a run is matching
+--   drop_workflow_role / _user      the five privileges Cron C needs
 --
--- So the factors are capped exactly as the Worker caps them, in
--- worker/drop-report.ts FIELD_CAPS:
+-- The Supabase side is sql/supabase.sql. The rules these serve are in
+-- BUSINESS-LOGIC.md.
 --
---     firstNames 10   lastNames 10   dobs 5   zips 24   vins 12
---
--- Sorted, then sliced, on the NORMALIZED VALUES and before hashing —
--- because the Worker sorts values, and sorting hashes instead would
--- select a different subset and put the two back out of step.
---
--- Capping bounds one group at 10*10*5*24 + 10*10*12 = 13,200 keys, so for
--- a phone or e-mail report the 20,000 cut is now unreachable and the two
--- sides agree exactly. For a people report the groups are summed, so a
--- very wide report can still cross it and the composites are dropped —
--- which is what the Worker does too.
---
--- ORDER OF OPERATIONS, because it is load-bearing:
---
---     people        cap per element, then keys per element, then union
---     phone/email   union the raw fields across providers, THEN cap,
---                   THEN one cross product
---
--- Capping before merging would select each provider's first ten names and
--- then merge, which is not the same ten names as the Worker picks.
+-- No ON CLUSTER anywhere: access entities in ClickHouse Cloud are stored
+-- replicated, so users, roles and grants propagate on their own.
 -- =====================================================================
 
-DROP VIEW IF EXISTS default.ca_drop_combined_search_result;
 
+-- =====================================================================
+-- 1. ca_drop_work_items — the DROP set, while a run is using it
+--
+-- The match is a join between the DROP hash set and the candidate keys,
+-- and the only question is which side travels. The DROP set is the small
+-- one; the candidate keys run to hundreds of thousands. ClickHouse
+-- cannot join against KV, so the small side is copied in here and the
+-- join happens next to the data.
+--
+-- The measured difference is not marginal: comparing the keys one at a
+-- time from the Worker took about five hours and exceeded the Worker CPU
+-- limit, where the same join inside ClickHouse returns in well under a
+-- second.
+--
+-- It is a working copy, not a store. Truncated at the start of every run
+-- and again at the end, so the DROP hashes are resident only while a run
+-- is using them. KV remains the source of truth.
+-- =====================================================================
+
+CREATE TABLE default.ca_drop_work_items
+(
+    list_type    LowCardinality(String),
+    hash         String,                       -- Base64, exactly as DROP published it
+    work_item_id String,                       -- DROP's Id, case-sensitive
+    request_date Nullable(Date),
+    loaded_at    DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(loaded_at)
+ORDER BY (list_type, hash);
+-- ReplacingMergeTree because a retried sync page re-inserts rows it
+-- already wrote. Dedup is not immediate, so the match query also groups
+-- by (list_type, hash) rather than relying on a merge having happened.
+
+
+-- =====================================================================
+-- 2. ca_drop_combined_search_result — the candidate keys
+--
+-- CHANGE THE DEFINER BELOW before running. See the note at the top.
+-- =====================================================================
 
 CREATE MATERIALIZED VIEW default.ca_drop_combined_search_result
 REFRESH EVERY 1 YEAR
@@ -355,3 +376,149 @@ FROM
         )
     )
 );
+
+-- =====================================================================
+-- 3. The role
+--
+-- Cron C touches exactly five things. Anything granted beyond them is
+-- surface area with no user.
+-- =====================================================================
+
+CREATE ROLE drop_workflow_role;
+
+-- The candidate keys.
+GRANT SELECT ON default.ca_drop_combined_search_result TO drop_workflow_role;
+
+-- Step ① runs  SYSTEM REFRESH VIEW default.ca_drop_combined_search_result.
+-- SELECT does not cover it, and without this line the first step of every
+-- run fails with ACCESS_DENIED.
+GRANT SYSTEM VIEWS ON default.ca_drop_combined_search_result TO drop_workflow_role;
+
+-- REQUIRED, and confirmed the hard way. Having asked for a refresh, the
+-- workflow waits for it by polling here. Reads of system tables are
+-- implicit and row-filtered for many tables, which is why this looks
+-- optional. It is not:
+--     Code: 497. drop_workflow: Not enough privileges. To execute this
+--     query, it's necessary to have the grant SELECT ON system.view_refreshes
+GRANT SELECT ON system.view_refreshes TO drop_workflow_role;
+
+-- TRUNCATE is what lets the workflow clear the helper table itself, at
+-- the start of a run and again when it finishes.
+GRANT SELECT, INSERT, TRUNCATE ON default.ca_drop_work_items TO drop_workflow_role;
+
+-- The erase, and the one real widening of the role.
+--
+--   ALTER DELETE  runs ALTER TABLE ... DELETE, a real mutation: the parts
+--                 are rewritten without the rows. NOT the lightweight
+--                 DELETE FROM, which only marks rows and leaves the data
+--                 on disk until some later merge — not good enough for a
+--                 statutory deletion.
+--   SELECT        the predicate reads the columns, and the workflow counts
+--                 the matching rows before and after so it can verify the
+--                 delete instead of trusting it. The incident endpoint
+--                 reads payloads back through the same grant.
+--
+-- entity_search_results holds the raw provider payloads, so SELECT on it
+-- is broad — it is the table this whole pipeline exists to protect.
+-- Granted because the alternative is a workflow that reports deletions it
+-- cannot confirm.
+GRANT SELECT, ALTER DELETE ON default.entity_search_results TO drop_workflow_role;
+
+
+-- =====================================================================
+-- 4. The user
+--
+-- REPLACE THE PASSWORD, then put the same value into the Worker:
+--     npx wrangler secret put CH_PASSWORD
+-- =====================================================================
+
+CREATE USER drop_workflow
+  IDENTIFIED WITH sha256_password BY 'PUT_THE_REAL_PASSWORD_HERE';
+
+GRANT drop_workflow_role TO drop_workflow;
+ALTER USER drop_workflow DEFAULT ROLE drop_workflow_role;
+
+-- Everything reaches the user through the role and nothing directly.
+-- This revokes privileges only; role membership is separate and survives.
+REVOKE ALL ON *.* FROM drop_workflow;
+
+
+-- =====================================================================
+-- 5. Settings
+--
+-- ALTER USER ... SETTINGS REPLACES the whole list, so all four go in one
+-- statement or the omitted ones are dropped.
+--
+-- readonly = 0 is already the default and changes nothing — kept as
+-- documentation, because it is not obviously the default and SYSTEM
+-- REFRESH VIEW is blocked under readonly 1 or 2.
+--
+-- max_result_bytes is the cap that bites, not max_result_rows: a match
+-- row carries a whole key array, which makes rows a poor proxy for size.
+-- 64 MiB will not trip in normal use, and it turns "matchChunk was raised
+-- to something absurd" into a clean ClickHouse error rather than a Worker
+-- that runs out of memory part-way through a chunk.
+-- =====================================================================
+
+ALTER USER drop_workflow SETTINGS
+  max_execution_time = 900,
+  max_result_rows    = 200000,
+  max_result_bytes   = 67108864,
+  readonly           = 0;
+
+
+-- =====================================================================
+-- 6. Verify — run as admin
+-- =====================================================================
+
+-- Expect EXACTLY these eight rows:
+--   SELECT        default   ca_drop_combined_search_result
+--   SYSTEM VIEWS  default   ca_drop_combined_search_result
+--   SELECT        default   ca_drop_work_items
+--   INSERT        default   ca_drop_work_items
+--   TRUNCATE      default   ca_drop_work_items
+--   SELECT        default   entity_search_results
+--   ALTER DELETE  default   entity_search_results
+--   SELECT        system    view_refreshes
+SELECT access_type, database, table
+FROM system.grants
+WHERE role_name = 'drop_workflow_role'
+ORDER BY database, table, access_type;
+
+-- Expect: default_roles_list = ['drop_workflow_role'], default_roles_all = 0
+SELECT name, auth_type, default_roles_all, default_roles_list
+FROM system.users
+WHERE name = 'drop_workflow';
+
+-- Expect the four settings from section 5.
+SELECT setting_name, value
+FROM system.settings_profile_elements
+WHERE user_name = 'drop_workflow'
+ORDER BY setting_name;
+
+-- Expect no rows: the user must hold no privileges of its own.
+SELECT access_type, database, table
+FROM system.grants
+WHERE user_name = 'drop_workflow';
+
+-- Expect spec_version v3 on every row once the view has been refreshed.
+-- It is empty until then; REFRESH is the next step.
+SELECT spec_version, count() AS rows
+FROM default.ca_drop_combined_search_result
+GROUP BY spec_version;
+
+
+-- =====================================================================
+-- 7. Then, in order
+--
+--   1. Put the password from section 4 into  npx wrangler secret put CH_PASSWORD
+--   2. SYSTEM REFRESH VIEW default.ca_drop_combined_search_result;
+--      The view is REFRESH EVERY 1 YEAR, so it is empty until asked. It
+--      is also why Cron C polls last_success_time rather than the status:
+--      'Scheduled' is this view's resting state as well as its finished
+--      state, so a status check can read a queued refresh as a done one
+--      and match against the previous contents.
+--   3. Run sql/supabase.sql if it has not been run yet.
+--   4. POST /api/downloader/start     Cron A
+--   5. POST /api/workflow/start       Cron C
+-- =====================================================================

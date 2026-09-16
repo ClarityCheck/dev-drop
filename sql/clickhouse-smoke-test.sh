@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Proves the grants in clickhouse-cron-c.sql from the outside, as the Worker
+# Proves the grants in clickhouse.sql from the outside, as the Worker
 # sees them — as drop_workflow over HTTPS, not as admin in the SQL console.
 # An admin session can read system.grants and still be wrong about what the
 # role can actually do.
