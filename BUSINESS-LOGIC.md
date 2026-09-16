@@ -48,14 +48,35 @@ reason; it exists for rebuilding from the archive, not for normal runs.
 
 ### Consumers can be removed
 
-DROP publishes a removals file: a consumer withdraws, or the state revokes an
-entry. Cron A deletes those hashes from KV, so the gate stops suppressing them
-immediately.
+DROP publishes a removals file alongside the four lists — `Id,Hash,ListType` —
+when a consumer withdraws their request or the state revokes an entry. Two
+things then have to happen, and they are different obligations:
 
-`ca_drop_work_item` has no column for a revocation, so the row stays and the
-removal is only a counter in the run log. A revoked work item can therefore
-still be reported to California in a later cycle. Live behaviour is right; the
-bookkeeping is not.
+- **stop suppressing them.** The hash is deleted from KV, so the gate releases
+  them on the next request.
+- **stop answering for them.** `revoked_at` is stamped on the
+  `ca_drop_work_item` row, so they are no longer a work item we owe California
+  a status for.
+
+The row is kept rather than deleted. It is the record that we were once asked to
+suppress this consumer and then released, and Cron B needs to tell "never given
+to us" apart from "given and then withdrawn".
+
+**Supabase is stamped before KV is deleted from**, and the order is load-bearing:
+
+| Failure | Result |
+|---|---|
+| stamped, KV delete fails | we keep suppressing someone who withdrew — over-suppression, and the next run retries |
+| KV deleted, stamp fails | we release them *and* still report them as ours, and the KV repair puts the hash straight back |
+
+Everything that reads work items reads **live ones only** — the KV rebuild, the
+KV health sample, and the expected-count comparison Cron C makes. That is not
+tidiness. A revoked item is absent from KV by design, so counting it would make
+every revocation look like a key KV had lost, and `kv-repair` would resurrect
+the hash and suppress a consumer who had asked to be released.
+
+A removal naming a work item we never held marks nothing, which is normal: DROP
+does not know which of its identifiers we were given.
 
 ### The four status codes
 
@@ -391,8 +412,6 @@ gap, ordered by consequence rather than by effort.
   that record's composite keys entirely (`if(ndz_width > 20000, [], …)`), so
   Cron C never matches it. A record too wide is checked weakly on the request
   path and not at all by the sweep.
-- **A revoked work item is never un-reported** (§0). The removal reaches KV and
-  not `ca_drop_work_item`.
 - **Nothing gates Cron B on Cron C.** Absence of a status reads as `5 Not
   found`, so a Cron B that fires first reports a clean sheet for a cycle whose
   matches were never looked for.
@@ -451,6 +470,7 @@ code moves. The places that pin each rule down:
 | grouping (§2) | `reportGroups()` in `worker/drop-report.ts`, and the tests that assert no key crosses a people boundary |
 | Rule 1 / Rule 2 | `screenAndPersistRecords` and `finalizePeopleReport` in the lookup API |
 | Rule 3 | the 503 contract in `worker/index.ts`, `DropCheckService.unverified` |
+| revocation (§0) | `markWorkItemsRevoked` in `worker/db.ts`, and the `revoked_at IS NULL` filter on all three readers |
 | erase ordering (§4) | the test asserting the literal sequence `['match-found', 'erase']` |
 
 If you change a rule, change this file in the same commit. A document that

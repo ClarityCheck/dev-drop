@@ -197,6 +197,44 @@ export function subjectFields(type: ReportType, value: string | undefined): Repo
 	return NO_FIELDS;
 }
 
+const FIELD_NAMES = Object.keys(NO_FIELDS) as (keyof ReportFields)[];
+
+export function mergeReportFields(groups: ReportFields[]): ReportFields {
+	const merged = { ...NO_FIELDS };
+	for (const field of FIELD_NAMES) {
+		merged[field] = [...new Set(groups.flatMap((group) => group[field]))];
+	}
+	return merged;
+}
+
+/**
+ * How a report is divided into key groups, which decides what a cross product
+ * may span.
+ *
+ * people   one group per array element. The elements are different people, so
+ *          combining one person's name with another's ZIP would invent a key
+ *          for someone who does not exist.
+ *
+ * email    one group for the whole report. The elements are providers, not
+ * phone    people -- every one of them describes the searched subject -- so the
+ *          union of their fields is that one person, and a name from one
+ *          provider belongs with a DOB and a ZIP from another. Splitting them
+ *          per provider derives no NDZ key at all whenever the four factors
+ *          arrive from different providers, which is the ordinary case.
+ *
+ * The subject stays its own group either way, so a caller can still tell the
+ * statutory fact -- the searched identifier is itself on a DROP list -- from
+ * the wider finding that the report is about someone who is.
+ */
+export function reportGroups(
+	type: ReportType,
+	subject: ReportFields,
+	perRecord: ReportFields[],
+): ReportFields[] {
+	if (type === "people") return [subject, ...perRecord];
+	return [subject, mergeReportFields([subject, ...perRecord])];
+}
+
 /**
  * Per-field caps on the composite cross product.
  *

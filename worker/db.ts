@@ -560,12 +560,21 @@ export async function dbPing(env: Env): Promise<Record<string, unknown>> {
 	return { ...out, ok: true };
 }
 
-/** How many work items exist. The number KV is expected to match. */
+/**
+ * How many LIVE work items exist. The number KV is expected to match.
+ *
+ * Revoked items are excluded because they are deliberately absent from KV —
+ * counting them would make every revocation look like a key KV had lost.
+ */
 export async function countWorkItems(env: Env): Promise<number> {
 	const sql = connect(env);
 	try {
 		const [r] = await withTimeout(
-			sql<{ n: string }[]>`SELECT count(*)::text AS n FROM public.ca_drop_work_item`,
+			sql<{ n: string }[]>`
+				SELECT count(*)::text AS n
+				FROM public.ca_drop_work_item
+				WHERE revoked_at IS NULL
+			`,
 			15000,
 			"count ca_drop_work_item",
 		);
@@ -598,6 +607,7 @@ export async function pageWorkItems(
 				       to_char(request_date, 'YYYY-MM-DD') AS request_date
 				FROM public.ca_drop_work_item
 				WHERE id > ${afterId}::bigint
+				  AND revoked_at IS NULL
 				ORDER BY id
 				LIMIT ${limit}
 			`,
@@ -627,6 +637,7 @@ export async function sampleWorkItems(
 			sql<{ list_type: string; work_item_id: string; hash: string }[]>`
 				SELECT list_type, work_item_id, hash
 				FROM public.ca_drop_work_item
+				WHERE revoked_at IS NULL
 				ORDER BY random()
 				LIMIT ${n}
 			`,
@@ -695,6 +706,56 @@ export async function pageSuppressedValues(
 			30000,
 			"page ca_drop_suppressed_value",
 		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * Mark work items as revoked, from a DROP removals file.
+ *
+ * The row is stamped rather than deleted. It is the record that we were once
+ * asked to suppress this consumer and then released, and Cron B needs to know
+ * the difference between "never given to us" and "given and then withdrawn".
+ *
+ * Idempotent: `revoked_at IS NULL` in the WHERE means a re-run of the same
+ * removals file is a no-op and does not move the timestamp, so the date stays
+ * the date we first saw the revocation.
+ *
+ * Returns how many rows this call actually changed. A removal naming a work
+ * item we never held counts nothing, which is normal — DROP does not know
+ * which of its identifiers we were given.
+ */
+export async function markWorkItemsRevoked(
+	env: Env,
+	rows: { list_type: string; work_item_id: string }[],
+): Promise<number> {
+	if (rows.length === 0) return 0;
+
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ revoked: string }[]>`
+				WITH v AS (
+					SELECT *
+					FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb)
+						AS v(list_type text, work_item_id text)
+				),
+				upd AS (
+					UPDATE public.ca_drop_work_item w
+					SET revoked_at = now()
+					FROM v
+					WHERE w.list_type = v.list_type
+					  AND w.work_item_id = v.work_item_id
+					  AND w.revoked_at IS NULL
+					RETURNING w.id
+				)
+				SELECT count(*)::text AS revoked FROM upd
+			`,
+			30000,
+			"revoke ca_drop_work_item",
+		);
+		return Number(r?.revoked ?? 0);
 	} finally {
 		await closeQuietly(sql);
 	}

@@ -19,6 +19,7 @@ import {
 	extractReportRecords,
 	isReportType,
 	lookupDropKeys,
+	reportGroups,
 	subjectFields,
 } from "./drop-report";
 import type { ReportType } from "./drop-report";
@@ -72,10 +73,11 @@ async function confirmIncidentMatch(
 	}
 
 	const subject = subjectFields(type, typeof value === "string" ? value : undefined);
-	const bounded = [
+	const bounded = reportGroups(
+		type,
 		subject,
-		...extractReportRecords(report).map((record) => record.fields),
-	].map(boundReportFields);
+		extractReportRecords(report).map((record) => record.fields),
+	).map(boundReportFields);
 
 	// Bounded the same way report-check bounds it, and for a sharper reason
 	// here: refusing a pathological report would mean an erasure that ALREADY
@@ -395,9 +397,11 @@ export default {
 			// payload can reach tens of millions of combinations, and refusing it
 			// meant that subject's lookup failed forever — so the factors are
 			// capped and the report says which ones were.
-			const bounded = [subject, ...reportRecords.map((record) => record.fields)].map(
-				boundReportFields,
-			);
+			const bounded = reportGroups(
+				type,
+				subject,
+				reportRecords.map((record) => record.fields),
+			).map(boundReportFields);
 			const capped = [...new Set(bounded.flatMap((b) => b.capped))].sort();
 			let groups = bounded.map((b) => b.fields);
 
@@ -456,21 +460,16 @@ export default {
 			}
 
 			const { keysChecked, matched } = checked;
-			const [subjectMatched, ...recordMatched] = matched;
+			const [subjectMatched, ...rest] = matched;
 
-			// The subject is clean but its report is not: the aggregated data
-			// carries a listed person, or a listed secondary contact detail. The
-			// value will be searched again, and without a record of this the funnel
-			// spends a credit and rebuilds a report that gets suppressed again.
-			//
-			// Only for e-mail and phone, because only those are DROP keys the gate
-			// can be asked about. A people search is a name, which /api/drop/check
-			// does not accept.
-			//
-			// waitUntil, and nothing awaited before it: the answer is what the
-			// caller is waiting for, and a cost optimisation must not delay it, or
-			// be able to fail it. Hashing and both writes happen after the response
-			// has gone out.
+			// people  one verdict per element, each from its own group.
+			// email   one group covered the whole report, so its verdict IS every
+			// phone   element's verdict: a match means the report is about a
+			//         listed consumer and none of it may be served.
+			const recordMatched =
+				type === "people" ? rest : reportRecords.map(() => rest[0] ?? []);
+			const reportListed = matched.some((families) => families.length > 0);
+
 			// The subject is clean but its report is not: the aggregated data
 			// carries a listed person, or a listed contact detail of one. Remember
 			// the value, so /api/drop/check short-circuits the next search for it
@@ -483,11 +482,7 @@ export default {
 			// waitUntil, with nothing awaited before it: the answer is what the
 			// caller is waiting for, and a cache hint must not delay it or be able
 			// to fail it.
-			if (
-				type !== "people" &&
-				!subjectMatched.length &&
-				matched.some((families) => families.length > 0)
-			) {
+			if (type !== "people" && !subjectMatched.length && reportListed) {
 				ctx.waitUntil(
 					recordSuppression(env, { searchType: type, value: value as string }),
 				);
@@ -495,7 +490,7 @@ export default {
 
 			return Response.json({
 				type,
-				listed: matched.some((families) => families.length > 0),
+				listed: reportListed,
 				subjectListed: subjectMatched.length > 0,
 				matched: DROP_KEY_FAMILIES.filter((family) =>
 					matched.some((families) => families.includes(family)),

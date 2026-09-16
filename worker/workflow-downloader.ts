@@ -1,7 +1,7 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { writeAuditLog } from "./audit";
-import { upsertWorkItems } from "./db";
+import { markWorkItemsRevoked, upsertWorkItems } from "./db";
 import { logRun, tracer } from "./logs";
 import { LISTS, listTypeOf, parseCsv, unzip } from "./zip";
 import type { ListType } from "./zip";
@@ -226,16 +226,39 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			}
 
 			// -----------------------------------------------------------
-			// ⑥ Removed identifiers → delete from KV. ca_drop_work_item has
-			//    no column for a revocation, so this is a counter only.
+			// ⑥ Removed identifiers. A consumer has withdrawn their request,
+			//    or the state has revoked the entry, so we stop suppressing
+			//    them and stop answering for them.
+			//
+			//    SUPABASE FIRST, THEN KV, and the order is the safe one.
+			//
+			//    Stamped and then the KV delete fails: we keep suppressing
+			//    someone who withdrew. Over-suppression, and the next run
+			//    retries it.
+			//
+			//    KV deleted and then the stamp fails: we stop suppressing
+			//    them AND still report them to California as ours to answer
+			//    for — and kv-repair, which pages live work items, would put
+			//    the hash straight back and suppress them again.
 			// -----------------------------------------------------------
 			let removed = 0;
+			let revoked = 0;
 			if ((counts.removed ?? 0) > 0) {
-				removed = await tracedStep("apply removals", async () => {
+				const applied = await tracedStep("apply removals", async () => {
 					const { removed: rows } = await this.readArchive(zipKey);
-					for (const r of rows as RemovedRow[]) await this.env.kv.delete(r.hash);
-					return rows.length;
+					const removals = rows as RemovedRow[];
+
+					const marked = await markWorkItemsRevoked(
+						this.env,
+						removals.map((r) => ({ list_type: r.list_type, work_item_id: r.id })),
+					);
+
+					for (const r of removals) await this.env.kv.delete(r.hash);
+
+					return { seen: removals.length, revoked: marked };
 				});
+				removed = applied.seen;
+				revoked = applied.revoked;
 			}
 
 			// -----------------------------------------------------------
@@ -255,6 +278,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 						kv_loaded: Object.values(loadedKv).reduce((a, b) => a + b, 0),
 						kv_cleared: clearKv ? cleared : "not cleared",
 						removals_applied: removed,
+						work_items_revoked: revoked,
 						duration_ms: Date.now() - startedAt,
 					},
 				}),
@@ -268,6 +292,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 				loadedKv,
 				savedDb,
 				removalsApplied: removed,
+				workItemsRevoked: revoked,
 				auditLog: logKey,
 			};
 			console.log("drop-downloader finished:", summary);
