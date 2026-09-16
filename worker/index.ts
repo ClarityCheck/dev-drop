@@ -8,7 +8,7 @@ import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
 import { IncidentFailed, recordEraseIncident, recordMatchFound } from "./drop-incident";
 import type { IncidentStage } from "./drop-incident";
-import { clearSuppression, lookupGate, recordSuppression } from "./drop-suppression";
+import { lookupGate, recordSuppression } from "./drop-suppression";
 import {
 	DROP_KEY_FAMILIES,
 	MAX_REPORT_KEYS,
@@ -471,27 +471,25 @@ export default {
 			// caller is waiting for, and a cost optimisation must not delay it, or
 			// be able to fail it. Hashing and both writes happen after the response
 			// has gone out.
-			const reportListed = matched.some((families) => families.length > 0);
-
-			// The mirror of recording it. A value whose report used to carry a
-			// listed person and no longer does must stop being short-circuited, or
-			// a consumer DROP has released stays suppressed until the key expires.
-			// A partial check is not evidence of clean, so it never clears.
-			if (type !== "people" && !reportListed && !partial) {
-				ctx.waitUntil(clearSuppression(env, type, value as string));
-			}
-
-			if (type !== "people" && !subjectMatched.length && reportListed) {
+			// The subject is clean but its report is not: the aggregated data
+			// carries a listed person, or a listed contact detail of one. Remember
+			// the value, so /api/drop/check short-circuits the next search for it
+			// instead of paying for the whole funnel again.
+			//
+			// Nothing here un-remembers it. That cost a Hyperdrive connection and
+			// an UPDATE on every clean lookup, and every one of those had nothing
+			// to clear; the expiry on the KV key does the same job for nothing.
+			//
+			// waitUntil, with nothing awaited before it: the answer is what the
+			// caller is waiting for, and a cache hint must not delay it or be able
+			// to fail it.
+			if (
+				type !== "people" &&
+				!subjectMatched.length &&
+				matched.some((families) => families.length > 0)
+			) {
 				ctx.waitUntil(
-					recordSuppression(env, {
-						searchType: type,
-						value: value as string,
-						matched: DROP_KEY_FAMILIES.filter((family) =>
-							recordMatched.some((f) => f.includes(family)),
-						),
-						recordsSuppressed: recordMatched.filter((f) => f.length > 0).length,
-						recordsTotal: reportRecords.length,
-					}),
+					recordSuppression(env, { searchType: type, value: value as string }),
 				);
 			}
 

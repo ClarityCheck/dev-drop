@@ -1,8 +1,10 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { countWorkItems, pageSuppressedSearches, pageWorkItems } from "./db";
+import { countWorkItems, pageSuppressedValues, pageWorkItems } from "./db";
+import { dropKey } from "./drop-normalize";
+import type { DropListType } from "./drop-normalize";
 import { logRun, tracer } from "./logs";
-import { SUPPRESSION_TTL_SECONDS, suppressedKey } from "./drop-suppression";
+import { SUPPRESSION_TTL_SECONDS, putSuppressedKey } from "./drop-suppression";
 
 /**
  * KV repair  (workflow: drop-kv-repair)
@@ -154,10 +156,14 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 
 				const restored: { cursor: string; written: number; done: boolean } =
 					await tracedStep(`restore suppressions · page ${suppressionPage}`, async () => {
-						const rows = await pageSuppressedSearches(
+						// Only what has been re-confirmed inside the expiry window. A
+						// finding nobody has seen for a month is not restored, and the
+						// next search for that value derives it again or does not.
+						const rows = await pageSuppressedValues(
 							this.env,
 							suppressionCursor,
 							pageSize,
+							SUPPRESSION_TTL_SECONDS / 86400,
 						);
 						if (rows.length === 0) {
 							return { cursor: suppressionCursor, written: 0, done: true };
@@ -166,17 +172,14 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 						let put = 0;
 						if (!dryRun) {
 							for (const r of rows) {
-								await this.env.kv.put(suppressedKey(r.hash), "suppressed", {
-									// Restored with the same expiry it had, so a repair cannot
-									// turn a finding that was due to be re-checked into one
-									// that lives forever.
-									expirationTtl: SUPPRESSION_TTL_SECONDS,
-									metadata: {
-										kind: "suppressed-report",
-										search_type: r.search_type,
-										restored_at: new Date().toISOString(),
-									},
-								});
+								// The hash is derived from the stored value, by the same
+								// dropKey the gate uses -- so a restored key is the key the
+								// gate will look for, and the table needs no hash column.
+								const { hash } = await dropKey(
+									r.search_type as DropListType,
+									r.value,
+								);
+								await putSuppressedKey(this.env, hash, r.search_type);
 								put += 1;
 							}
 						}

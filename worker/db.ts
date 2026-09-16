@@ -639,125 +639,70 @@ export async function sampleWorkItems(
 }
 
 /**
- * A search whose report had to be suppressed although the searched value was
- * not itself on the DROP list.
+ * A value whose report had to be suppressed although the value itself was not
+ * on the DROP list.
  *
- * `hash` is the same Base64 SHA-256 the real-time gate computes — DROP's
- * normalization for the type, then the digest — so the gate can answer from
- * this table with the hash it already has, and no plaintext is stored.
- */
-export type SuppressedSearch = {
-	search_type: string;
-	hash: string;
-	matched: string[];
-	records_suppressed: number;
-	records_total: number;
-};
-
-/**
- * Remember, or re-confirm, a suppressed search.
+ * One row per (type, value), written when a report matches and refreshed when
+ * it matches again. No counters, no matched families, no clearing: the row is a
+ * hint that saves a provider fan-out, and everything beyond "we have seen this"
+ * was cost without a reader.
  *
- * Upsert rather than insert: the same value gets searched again, and the row
- * is a finding about that value rather than an event log. A repeat bumps
- * last_seen_at and times_seen, widens `matched` instead of replacing it — a
- * later report can match on a family the first one did not — and clears
- * cleared_at, because the finding applies again.
+ * `value` is DROP-normalized, so one consumer is one row however the search was
+ * typed, and so the KV key can be derived from it during a repair.
  */
-export async function recordSuppressedSearch(
+export async function recordSuppressedValue(
 	env: Env,
-	row: SuppressedSearch,
-): Promise<{ inserted: boolean; timesSeen: number }> {
+	searchType: string,
+	value: string,
+): Promise<void> {
 	const sql = connect(env);
 	try {
-		const [r] = await withTimeout(
-			sql<{ times_seen: number; inserted: boolean }[]>`
-				INSERT INTO public.ca_drop_suppressed_search
-					(search_type, hash, matched, records_suppressed, records_total)
-				VALUES (
-					${row.search_type}, ${row.hash}, ${row.matched},
-					${row.records_suppressed}, ${row.records_total}
-				)
-				ON CONFLICT (search_type, hash) DO UPDATE
-				SET last_seen_at       = now(),
-				    times_seen         = public.ca_drop_suppressed_search.times_seen + 1,
-				    matched            = (
-				        SELECT array_agg(DISTINCT m ORDER BY m)
-				        FROM unnest(
-				            public.ca_drop_suppressed_search.matched || excluded.matched
-				        ) AS m
-				    ),
-				    records_suppressed = excluded.records_suppressed,
-				    records_total      = excluded.records_total,
-				    cleared_at         = NULL
-				RETURNING times_seen, (times_seen = 1) AS inserted
+		await withTimeout(
+			sql`
+				INSERT INTO public.ca_drop_suppressed_value (search_type, value)
+				VALUES (${searchType}, ${value})
+				ON CONFLICT (search_type, value) DO UPDATE SET added_at = now()
 			`,
 			20000,
-			"upsert ca_drop_suppressed_search",
+			"upsert ca_drop_suppressed_value",
 		);
-		return { inserted: r?.inserted ?? false, timesSeen: Number(r?.times_seen ?? 0) };
 	} finally {
 		await closeQuietly(sql);
 	}
 }
 
 /**
- * The suppressions still in force, oldest first.
+ * Recent suppressed values, oldest first, for rebuilding the KV fast path.
  *
- * Paged by id rather than OFFSET so a rebuild that runs while rows are being
- * added cannot skip one: the cursor is a row that exists.
+ * `withinDays` is what stands in for a clearing path. A suppression is a claim
+ * about a report, and reports change -- DROP revokes work items, providers
+ * return different data -- so a finding nobody has re-confirmed in a month
+ * stops being restored and the next search re-derives it. The KV key carries
+ * the same expiry, so the two agree.
+ *
+ * Paged by id rather than OFFSET so a repair running while rows are added
+ * cannot skip one: the cursor is a row that exists.
  */
-export async function pageSuppressedSearches(
+export async function pageSuppressedValues(
 	env: Env,
 	afterId: string,
 	limit: number,
-): Promise<{ id: string; search_type: string; hash: string }[]> {
+	withinDays: number,
+): Promise<{ id: string; search_type: string; value: string }[]> {
 	const sql = connect(env);
 	try {
 		return await withTimeout(
-			sql<{ id: string; search_type: string; hash: string }[]>`
-				SELECT id::text AS id, search_type, hash
-				FROM public.ca_drop_suppressed_search
-				WHERE cleared_at IS NULL
-				  AND id > ${afterId}::bigint
+			sql<{ id: string; search_type: string; value: string }[]>`
+				SELECT id::text AS id, search_type, value
+				FROM public.ca_drop_suppressed_value
+				WHERE id > ${afterId}::bigint
+				  AND added_at > now() - make_interval(days => ${withinDays})
 				ORDER BY id
 				LIMIT ${limit}
 			`,
 			30000,
-			"page ca_drop_suppressed_search",
+			"page ca_drop_suppressed_value",
 		);
-	} finally {
-		await closeQuietly(sql);
-	}
-}
-
-/**
- * Mark a suppression as no longer applying.
- *
- * Called when a later report for the same value comes back clean: the consumer
- * came off the DROP list, or the provider data that carried them has changed.
- * The row is kept and stamped rather than deleted, so the history of a
- * suppression survives and kv-repair stops restoring it.
- */
-export async function clearSuppressedSearch(
-	env: Env,
-	searchType: string,
-	hash: string,
-): Promise<boolean> {
-	const sql = connect(env);
-	try {
-		const rows = await withTimeout(
-			sql<{ id: string }[]>`
-				UPDATE public.ca_drop_suppressed_search
-				SET cleared_at = now()
-				WHERE search_type = ${searchType}
-				  AND hash = ${hash}
-				  AND cleared_at IS NULL
-				RETURNING id::text AS id
-			`,
-			20000,
-			"clear ca_drop_suppressed_search",
-		);
-		return rows.length > 0;
 	} finally {
 		await closeQuietly(sql);
 	}

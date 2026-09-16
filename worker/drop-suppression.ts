@@ -1,8 +1,7 @@
-import { clearSuppressedSearch, recordSuppressedSearch } from "./db";
+import { recordSuppressedValue } from "./db";
 import { dropKey } from "./drop-normalize";
 import type { DropListType } from "./drop-normalize";
 import { logRun } from "./logs";
-import type { DropKeyFamily } from "./drop-report";
 
 /**
  * A search that must be short-circuited even though its subject is not on the
@@ -102,113 +101,65 @@ export async function lookupGate(
 
 export type Suppression = {
 	searchType: DropListType;
-	/** the raw searched value; the hash is derived here, not by the caller */
+	/** the raw searched value; normalization and hashing happen here */
 	value: string;
-	matched: DropKeyFamily[];
-	recordsSuppressed: number;
-	recordsTotal: number;
 };
 
 /**
- * Remember a suppressed search, in Supabase and in KV.
+ * Remember that a search produced a report we had to suppress.
  *
- * Supabase is the source of truth — Cron A with clearKv wipes the KV namespace,
- * and the fast path is rebuilt from the table afterwards. KV is written second
- * and is what the gate actually reads.
+ * Two writes and nothing else. Supabase takes the normalized value, so the
+ * finding is readable and auditable and survives a KV wipe; KV takes the hash,
+ * because that is what the gate has in hand and it keeps plaintext out of a
+ * store the gate reads on ordinary traffic.
+ *
+ * There is no counterpart that clears it. An earlier version ran an UPDATE
+ * against Supabase on every clean lookup to un-suppress a value that had
+ * recovered, which put a Hyperdrive connection and a write on the overwhelming
+ * majority of lookups -- all of which had nothing to clear. The expiry does the
+ * same job for nothing: the KV key lasts SUPPRESSION_TTL_SECONDS, the repair
+ * restores only rows refreshed within the same window, and a value that stops
+ * matching simply stops being renewed.
  *
  * Best effort by design, and the one place in this Worker where that is the
- * right answer. The finding is a cost optimisation: losing it means the next
- * search spends a credit and gets suppressed again, which is what happened
- * before this existed. It is not a compliance record — that is
- * ca_drop_work_item_match — so it must never fail a request or change an
- * answer. Failures are logged and swallowed.
- *
- * Everything it does, the hashing included, is meant to run after the response
- * has been sent. Nothing here is on the answer's path.
+ * right answer. Losing it costs one provider fan-out, which is what happened
+ * before any of this existed. It is not a compliance record -- that is
+ * ca_drop_work_item_match -- so it must never fail a request or change an
+ * answer, and everything here is meant to run after the response has gone out.
  */
 export async function recordSuppression(env: Env, s: Suppression): Promise<boolean> {
-	let hash: string;
-	// A real id per recording. "email" grouped every suppression in the
-	// namespace into one bucket, which is the opposite of what a run id is for.
-	const ctx = { workflow: "drop-suppressed-search", run_id: crypto.randomUUID() };
+	const ctx = { workflow: "drop-suppressed-value", run_id: crypto.randomUUID() };
 
 	try {
-		hash = (await dropKey(s.searchType, s.value)).hash;
-	} catch (e) {
-		await logRun(env, ctx, "failed", {
-			error: `hash: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
-		});
-		return false;
-	}
+		const { normalized, hash } = await dropKey(s.searchType, s.value);
+		if (normalized === "") return false;
 
-	try {
-		await recordSuppressedSearch(env, {
-			search_type: s.searchType,
-			hash,
-			matched: s.matched,
-			records_suppressed: s.recordsSuppressed,
-			records_total: s.recordsTotal,
-		});
+		await recordSuppressedValue(env, s.searchType, normalized);
+		await putSuppressedKey(env, hash, s.searchType);
+		return true;
 	} catch (e) {
 		await logRun(env, ctx, "failed", {
 			error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-			result: { recordsSuppressed: s.recordsSuppressed },
 		});
 		return false;
 	}
-
-	try {
-		// No list_type in the metadata, and a prefixed name, so Cron C's pass over
-		// the namespace cannot read this as a DROP hash.
-		await env.kv.put(suppressedKey(hash), s.matched.join(",") || "suppressed", {
-			expirationTtl: SUPPRESSION_TTL_SECONDS,
-			metadata: {
-				kind: "suppressed-report",
-				search_type: s.searchType,
-				matched: s.matched,
-				recorded_at: new Date().toISOString(),
-			},
-		});
-	} catch (e) {
-		await logRun(env, ctx, "failed", {
-			error: `KV: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
-		});
-		return false;
-	}
-
-	return true;
 }
 
 /**
- * A later report for this value came back clean, so the suppression no longer
- * applies: stamp the row and take the key off the fast path.
+ * The KV half, also used by the repair.
  *
- * This is the other half of the expiry. The TTL guarantees a suppression is
- * re-checked eventually; this acts on the re-check when it happens, so a
- * consumer DROP has released stops being suppressed at the first search rather
- * than at the end of the window.
- *
- * Best effort, for the same reason as recording: it can only ever cost one
- * wasted lookup.
+ * No list_type in the metadata and a prefixed name, so Cron C's pass over the
+ * namespace cannot read this as a DROP hash. The value is the search type, not
+ * the identifier: KV is read on ordinary traffic and has no business holding
+ * the plaintext when the hash is the thing being looked up.
  */
-export async function clearSuppression(
+export async function putSuppressedKey(
 	env: Env,
-	searchType: DropListType,
-	value: string,
-): Promise<boolean> {
-	const ctx = { workflow: "drop-suppressed-search", run_id: crypto.randomUUID() };
-
-	try {
-		const { hash } = await dropKey(searchType, value);
-
-		// KV first. It is what the gate reads, so clearing it is what actually
-		// stops the short-circuit; the row is bookkeeping.
-		await env.kv.delete(suppressedKey(hash));
-		return await clearSuppressedSearch(env, searchType, hash);
-	} catch (e) {
-		await logRun(env, ctx, "failed", {
-			error: `clear: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
-		});
-		return false;
-	}
+	hash: string,
+	searchType: string,
+): Promise<void> {
+	await env.kv.put(suppressedKey(hash), searchType, {
+		expirationTtl: SUPPRESSION_TTL_SECONDS,
+		metadata: { kind: "suppressed-report", search_type: searchType },
+	});
 }
