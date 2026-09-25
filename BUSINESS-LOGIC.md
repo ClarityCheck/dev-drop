@@ -75,6 +75,27 @@ consumer who had asked to be released.
 A removal naming a work item we never held marks nothing, which is normal: DROP
 does not know which of its identifiers we were given.
 
+### Two consumers can share one identifier
+
+A household phone or a family e-mail registered by two people is two work
+items with **one hash**. The specification guarantees a work item Id is
+unique, not a hash, and its code `4` exists precisely for "multiple consumers
+linked to the same identifier".
+
+KV and ClickHouse keep one work item per hash, so neither may be what decides
+which work items a match belongs to:
+
+- **A match is linked by hash, in Supabase.** It records a match row against,
+  marks and reports every live work item holding that `(list_type, hash)` —
+  not the one id KV happened to keep. Otherwise one consumer is reported
+  `3 Deleted` and the other `5 Not found` for the same erased data.
+- **A removal withdraws a work item, not a hash.** After `revoked_at` is
+  stamped, the hash leaves KV only if no other live work item holds it; if one
+  does, the key is rewritten to point at that one. Deleting it would stop
+  suppressing the consumer who did not withdraw.
+- **KV is expected to hold one key per distinct live hash**, not one per work
+  item, and Cron C's drift check counts it that way.
+
 ### The four status codes
 
 | Code | Meaning   | When we say it                               |

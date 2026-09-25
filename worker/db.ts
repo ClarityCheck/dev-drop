@@ -46,11 +46,18 @@ export type WorkItemRow = {
 export type MatchRow = {
 	/** DROP list the hash came from, per the KV metadata */
 	list_type: string;
-	/** DROP's own Id, case-sensitive */
-	work_item_id: string;
+	/**
+	 * The DROP hash that matched. Work items are linked by this, not by a
+	 * work_item_id: two consumers can share a phone or e-mail, which gives two
+	 * work items one hash, and KV and ClickHouse each keep only one of them.
+	 */
+	hash: string;
 	/** the identifier the hash matched — e-mail, phone, or the NDZ/NameVIN source value */
 	matched_normalized_value: string;
 };
+
+/** A live work item a match was linked to, by DROP's own identifiers. */
+export type LinkedWorkItem = { list_type: string; work_item_id: string; hash: string };
 
 /**
  * sql.end() waits for the connection to close, and on a half-open TLS socket
@@ -280,7 +287,9 @@ export type MatchWriteResult = {
 	submitted: number;
 	/** dropped before the insert because the CHECK constraint would reject them */
 	skippedEmpty: number;
-	/** of those sent, the ones that resolved to a row in ca_drop_work_item */
+	/** of those sent, the ones whose hash no live work item holds */
+	unlinked: number;
+	/** (match, work item) pairs — above `submitted` when work items share a hash */
 	linked: number;
 	/** distinct work items among the linked rows */
 	workItems: number;
@@ -288,6 +297,8 @@ export type MatchWriteResult = {
 	inserted: number;
 	/** ids of those work items, for the status write once ClickHouse is clear */
 	workItemIds: string[];
+	/** the same work items by DROP's identifiers, for the alert and the evidence file */
+	linkedWorkItems: LinkedWorkItem[];
 };
 
 /**
@@ -304,9 +315,9 @@ export function incompleteReason(r: MatchWriteResult): string | null {
 	if (r.skippedEmpty > 0) {
 		return `${r.skippedEmpty} match(es) had an empty normalized value and could not be stored`;
 	}
-	if (r.linked < r.submitted) {
+	if (r.unlinked > 0) {
 		return (
-			`${r.submitted - r.linked} of ${r.submitted} match(es) had no row in ` +
+			`${r.unlinked} of ${r.submitted} match(es) had no live row in ` +
 			`ca_drop_work_item — KV and Supabase have drifted, or Cron A has not run since ` +
 			`the table was last rebuilt`
 		);
@@ -317,9 +328,15 @@ export function incompleteReason(r: MatchWriteResult): string | null {
 /**
  * Record the matches Cron C found.
  *
- * ca_drop_work_item_match references ca_drop_work_item by its bigint id, but
- * KV only knows DROP's own (list_type, work_item_id) — so the join happens
- * here, in one statement, rather than as a lookup per match.
+ * ca_drop_work_item_match references ca_drop_work_item by its bigint id, and
+ * the join happens here, in one statement, rather than as a lookup per match.
+ *
+ * It joins on (list_type, hash) against LIVE work items, never on the
+ * work_item_id KV carries. Two consumers can share a phone or e-mail, so one
+ * hash can belong to several work items, and KV and ClickHouse keep only one
+ * id per hash. Joining on that id would link one consumer and leave the other
+ * unmatched, to be reported as 5 Not found for data that was erased. Joining
+ * on the hash links every one of them.
  *
  * The rows travel as a single jsonb parameter rather than N placeholders or a
  * text[]: it is one bind regardless of batch size, and it does not depend on
@@ -366,7 +383,16 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 	}
 
 	if (usable.length === 0) {
-		return { submitted: rows.length, skippedEmpty, linked: 0, workItems: 0, inserted: 0, workItemIds: [] };
+		return {
+			submitted: rows.length,
+			skippedEmpty,
+			unlinked: 0,
+			linked: 0,
+			workItems: 0,
+			inserted: 0,
+			workItemIds: [],
+			linkedWorkItems: [],
+		};
 	}
 
 	console.log(`db: recording ${usable.length} match(es) → ${describe(env)}`);
@@ -376,25 +402,29 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 			sql<
 				{
 					submitted: string;
+					unlinked: string;
 					linked: string;
 					work_items: string;
 					inserted: string;
 					item_ids: string;
+					linked_items: string;
 				}[]
 			>`
 				WITH v AS (
 					SELECT *
 					FROM jsonb_to_recordset(${JSON.stringify(usable)}::text::jsonb)
-						AS v(list_type text, work_item_id text, matched_normalized_value text)
+						AS v(list_type text, hash text, matched_normalized_value text)
 				),
 				linked AS (
-					SELECT w.id, v.matched_normalized_value
+					SELECT w.id, w.list_type, w.work_item_id, w.hash, v.matched_normalized_value
 					FROM v
 					JOIN public.ca_drop_work_item w
-						ON w.list_type = v.list_type AND w.work_item_id = v.work_item_id
+						ON w.list_type = v.list_type
+					   AND w.hash = v.hash
+					   AND w.revoked_at IS NULL
 				),
 				items AS (
-					SELECT DISTINCT id FROM linked
+					SELECT DISTINCT id, list_type, work_item_id, hash FROM linked
 				),
 				ins AS (
 					INSERT INTO public.ca_drop_work_item_match
@@ -405,10 +435,21 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 					RETURNING 1
 				)
 				SELECT (SELECT count(*) FROM v)      AS submitted,
+				       (SELECT count(*) FROM v
+				        WHERE NOT EXISTS (
+				            SELECT 1 FROM public.ca_drop_work_item w
+				            WHERE w.list_type = v.list_type
+				              AND w.hash = v.hash
+				              AND w.revoked_at IS NULL
+				        ))                           AS unlinked,
 				       (SELECT count(*) FROM linked) AS linked,
 				       (SELECT count(*) FROM items)  AS work_items,
 				       (SELECT count(*) FROM ins)    AS inserted,
-				       (SELECT coalesce(jsonb_agg(id), '[]'::jsonb) FROM items)::text AS item_ids
+				       (SELECT coalesce(jsonb_agg(id), '[]'::jsonb) FROM items)::text AS item_ids,
+				       (SELECT coalesce(jsonb_agg(jsonb_build_object(
+				            'list_type', list_type,
+				            'work_item_id', work_item_id,
+				            'hash', hash)), '[]'::jsonb) FROM items)::text AS linked_items
 			`,
 			30000,
 			"insert ca_drop_work_item_match",
@@ -417,10 +458,12 @@ export async function recordMatches(env: Env, rows: MatchRow[]): Promise<MatchWr
 		return {
 			submitted: Number(r?.submitted ?? 0) + skippedEmpty,
 			skippedEmpty,
+			unlinked: Number(r?.unlinked ?? 0),
 			linked: Number(r?.linked ?? 0),
 			workItems: Number(r?.work_items ?? 0),
 			inserted: Number(r?.inserted ?? 0),
 			workItemIds: JSON.parse(r?.item_ids ?? "[]") as string[],
+			linkedWorkItems: JSON.parse(r?.linked_items ?? "[]") as LinkedWorkItem[],
 		};
 	} finally {
 		await closeQuietly(sql);
@@ -969,6 +1012,78 @@ export async function markReported(
 			`,
 			30000,
 			"mark ca_drop_work_item reported",
+		);
+		return Number(r?.n ?? 0);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+export type HashHolder = {
+	list_type: string;
+	hash: string;
+	work_item_id: string;
+	request_date: string | null;
+};
+
+/**
+ * For each (list_type, hash), one LIVE work item that still holds it — or
+ * nothing, if none does.
+ *
+ * A removal withdraws one work item, not one hash: a household sharing a phone
+ * is two consumers and two work items under one hash. Before a removal takes
+ * the hash out of KV, this says whether someone else still needs it there.
+ */
+export async function liveHoldersOf(
+	env: Env,
+	pairs: { list_type: string; hash: string }[],
+): Promise<HashHolder[]> {
+	if (pairs.length === 0) return [];
+	const sql = connect(env);
+	try {
+		return await withTimeout(
+			sql<HashHolder[]>`
+				WITH v AS (
+					SELECT DISTINCT list_type, hash
+					FROM jsonb_to_recordset(${JSON.stringify(pairs)}::text::jsonb)
+						AS v(list_type text, hash text)
+				)
+				SELECT DISTINCT ON (w.list_type, w.hash)
+				       w.list_type, w.hash, w.work_item_id,
+				       to_char(w.request_date, 'YYYY-MM-DD') AS request_date
+				FROM v
+				JOIN public.ca_drop_work_item w
+					ON w.list_type = v.list_type
+				   AND w.hash = v.hash
+				   AND w.revoked_at IS NULL
+				ORDER BY w.list_type, w.hash, w.id DESC
+			`,
+			30000,
+			"live holders of ca_drop_work_item hashes",
+		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * How many distinct live (list_type, hash) pairs exist — the number of keys KV
+ * should hold. Not the number of work items: two sharing a hash are one key.
+ */
+export async function countLiveHashes(env: Env): Promise<number> {
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ n: string }[]>`
+				SELECT count(*)::text AS n
+				FROM (
+					SELECT DISTINCT list_type, hash
+					FROM public.ca_drop_work_item
+					WHERE revoked_at IS NULL
+				) d
+			`,
+			15000,
+			"count live ca_drop_work_item hashes",
 		);
 		return Number(r?.n ?? 0);
 	} finally {

@@ -1,7 +1,8 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { writeAuditLog } from "./audit";
-import { markWorkItemsRevoked, upsertWorkItems } from "./db";
+import { liveHoldersOf, markWorkItemsRevoked, upsertWorkItems } from "./db";
+import type { HashHolder } from "./db";
 import { logRun, tracer } from "./logs";
 import { LISTS, listTypeOf, parseCsv, unzip } from "./zip";
 import type { ListType } from "./zip";
@@ -47,6 +48,40 @@ type Params = {
 
 type Row = { id: string; hash: string; request_date?: string; source_file: string };
 type RemovedRow = { id: string; hash: string; list_type: string };
+
+export type KvRemoval =
+	| { hash: string; action: "delete" }
+	| { hash: string; action: "reassign"; holder: HashHolder };
+
+/**
+ * What a removals file does to KV, one decision per hash.
+ *
+ * A removal withdraws a work item, and a hash can belong to more than one:
+ * two consumers sharing a phone or e-mail are two work items under one hash,
+ * and KV holds one key for both. Deleting the key for one of them would stop
+ * suppressing the other, who never withdrew. So a hash leaves KV only when no
+ * live work item still holds it; otherwise the key is rewritten to point at
+ * one that does, because the id it carried may be the one just withdrawn.
+ *
+ * `holders` is read AFTER the removals are stamped, so the withdrawn work
+ * items are already excluded from it.
+ */
+export function planKvRemovals(
+	removals: { hash: string }[],
+	holders: HashHolder[],
+): KvRemoval[] {
+	const byHash = new Map(holders.map((h) => [h.hash, h]));
+	const seen = new Set<string>();
+	const plan: KvRemoval[] = [];
+
+	for (const r of removals) {
+		if (seen.has(r.hash)) continue;
+		seen.add(r.hash);
+		const holder = byHash.get(r.hash);
+		plan.push(holder ? { hash: r.hash, action: "reassign", holder } : { hash: r.hash, action: "delete" });
+	}
+	return plan;
+}
 
 const RAW_PREFIX = "ca-drop/raw/";
 
@@ -244,6 +279,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			// -----------------------------------------------------------
 			let removed = 0;
 			let revoked = 0;
+			let keptForOthers = 0;
 			if ((counts.removed ?? 0) > 0) {
 				const applied = await tracedStep("apply removals", async () => {
 					const { removed: rows } = await this.readArchive(zipKey);
@@ -254,12 +290,34 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 						removals.map((r) => ({ list_type: r.list_type, work_item_id: r.id })),
 					);
 
-					for (const r of removals) await this.env.kv.delete(r.hash);
+					// Only now, with the withdrawn items stamped, ask who still
+					// holds each hash — see planKvRemovals.
+					const holders = await liveHoldersOf(
+						this.env,
+						removals.map((r) => ({ list_type: r.list_type, hash: r.hash })),
+					);
 
-					return { seen: removals.length, revoked: marked };
+					let reassigned = 0;
+					for (const step of planKvRemovals(removals, holders)) {
+						if (step.action === "delete") {
+							await this.env.kv.delete(step.hash);
+							continue;
+						}
+						await this.env.kv.put(step.hash, step.holder.work_item_id, {
+							metadata: {
+								work_item_id: step.holder.work_item_id,
+								list_type: step.holder.list_type,
+								request_date: step.holder.request_date ?? undefined,
+							},
+						});
+						reassigned += 1;
+					}
+
+					return { seen: removals.length, revoked: marked, reassigned };
 				});
 				removed = applied.seen;
 				revoked = applied.revoked;
+				keptForOthers = applied.reassigned;
 			}
 
 			// -----------------------------------------------------------
@@ -280,6 +338,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 						kv_cleared: clearKv ? cleared : "not cleared",
 						removals_applied: removed,
 						work_items_revoked: revoked,
+						kv_keys_kept_for_others: keptForOthers,
 						duration_ms: Date.now() - startedAt,
 					},
 				}),
@@ -294,6 +353,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 				savedDb,
 				removalsApplied: removed,
 				workItemsRevoked: revoked,
+				kvKeysKeptForOthers: keptForOthers,
 				auditLog: logKey,
 			};
 			console.log("drop-downloader finished:", summary);

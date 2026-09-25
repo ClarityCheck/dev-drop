@@ -186,14 +186,14 @@ export async function recordMatchFound(
 	const ctx = { workflow: INCIDENT_WORKFLOW, run_id: runId };
 	const phase = phaseTracer(env, ctx, "record match found");
 
-	const alerts: MatchAlert[] = hits.map((hit) => ({
+	let alerts: MatchAlert[] = hits.map((hit) => ({
 		list_type: hit.list_type,
 		work_item_id: hit.work_item_id,
 		hash: hit.hash,
 	}));
 	const matchRows: MatchRow[] = hits.map((hit) => ({
 		list_type: hit.list_type,
-		work_item_id: hit.work_item_id,
+		hash: hit.hash,
 		matched_normalized_value: entity.normalized_value,
 	}));
 
@@ -209,6 +209,9 @@ export async function recordMatchFound(
 				`could not record ${matchRows.length} DROP match(es) — ${unrecorded}`,
 			);
 		}
+
+		// Every work item the hash belongs to, not only the one KV named.
+		alerts = written.linkedWorkItems;
 
 		await phase("betterstack: match alert", () =>
 			logMatches(env, ctx, BATCH, alerts, { ok: true }),
@@ -262,14 +265,14 @@ export async function recordEraseIncident(
 	const ctx = { workflow: INCIDENT_WORKFLOW, run_id: runId };
 	const phase = phaseTracer(env, ctx, "record erase incident");
 
-	const alerts: MatchAlert[] = hits.map((hit) => ({
+	let alerts: MatchAlert[] = hits.map((hit) => ({
 		list_type: hit.list_type,
 		work_item_id: hit.work_item_id,
 		hash: hit.hash,
 	}));
 	const matchRows: MatchRow[] = hits.map((hit) => ({
 		list_type: hit.list_type,
-		work_item_id: hit.work_item_id,
+		hash: hit.hash,
 		matched_normalized_value: entity.normalized_value,
 	}));
 
@@ -324,6 +327,9 @@ export async function recordEraseIncident(
 			);
 		}
 
+		// Every work item the hash belongs to, not only the one KV named.
+		alerts = written.linkedWorkItems;
+
 		stage = "alert";
 		await phase("betterstack: match alert", () =>
 			logMatches(env, ctx, BATCH, alerts, { ok: true }),
@@ -346,10 +352,9 @@ export async function recordEraseIncident(
 		// row, which is true and is the thing that must not be lost, and leaves
 		// the status to the sweep.
 		//
-		// The cost is that Cron B under-reports until the next Cron C run —
-		// code 5 Not found for a consumer whose data is partly gone. That is
-		// wrong in the recoverable direction, and the match row is what makes it
-		// recoverable.
+		// Until that sweep, Cron B holds the work item back rather than
+		// reporting it: it has a match row and no status, so neither 5 Not found
+		// nor 3 Deleted is true yet. The match row is what makes that possible.
 		stage = "audit";
 		const auditKey = await phase("r2: evidence file", () =>
 			writeMatchLog(env, {

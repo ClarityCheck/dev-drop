@@ -3,7 +3,7 @@ import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { chInsert, chQuery, deleteEntityRows, erasePeopleElements } from "./ch";
 import type { ElementKey, EntityKey } from "./ch";
-import { countWorkItems, incompleteReason, markMatchesDeleted, recordMatches } from "./db";
+import { countLiveHashes, incompleteReason, markMatchesDeleted, recordMatches } from "./db";
 import type { MatchRow } from "./db";
 import {
 	describeError,
@@ -191,6 +191,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let totalMatches = 0;
 		let chunk = 0;
 		let matchesLinked = 0;
+		let matchesUnlinked = 0;
 		let matchRowsInserted = 0;
 		let workItemsMarked = 0;
 		let entityRowsExpired = 0;
@@ -395,6 +396,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					);
 
 					matchesLinked += result.linked;
+					matchesUnlinked += result.unlinked;
 					matchRowsInserted += result.inserted;
 					workItemsMarked += result.statusSet;
 					entityRowsExpired += result.rowsExpired;
@@ -441,7 +443,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			let workItemsInSupabase = -1;
 			if (!skipKvSync) {
 				workItemsInSupabase = await tracedStep("check DROP set is complete", async () => {
-					const expected = await countWorkItems(this.env);
+					const expected = await countLiveHashes(this.env);
 					const shortfall = expected - dropSetRows;
 
 					if (shortfall > 0) {
@@ -459,7 +461,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 							expected,
 							inKv: dropSetRows,
 							message:
-								`KV holds ${-shortfall} more hashes than Supabase has work items — stale ` +
+								`KV holds ${-shortfall} more hashes than Supabase has live hashes — stale ` +
 								`entries over-suppress. Harmless, but they should not be there.`,
 						});
 					}
@@ -478,7 +480,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				kvKeysWithoutMeta,
 				matchesFound: totalMatches,
 				matchesLinked,
-				matchesUnlinked: totalMatches - matchesLinked,
+				matchesUnlinked,
 				matchRowsInserted,
 				workItemsMarkedDeleted: workItemsMarked,
 				// Rows deleted whole, for phone and e-mail identifiers, and
@@ -564,6 +566,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		if (matches.length === 0) {
 			return {
 				linked: 0,
+				unlinked: 0,
 				inserted: 0,
 				statusSet: 0,
 				rowsExpired: 0,
@@ -572,14 +575,16 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			};
 		}
 
-		const alerts: MatchAlert[] = matches.map((m) => ({
+		let alerts: MatchAlert[] = matches.map((m) => ({
 			list_type: m.list_type,
 			work_item_id: m.work_item_id,
 			hash: m.hash,
 		}));
+		// Linked by hash: the work_item_id above is the one KV kept, and a
+		// shared phone or e-mail can belong to several work items.
 		const matchRows: MatchRow[] = matches.map((m) => ({
 			list_type: m.list_type,
-			work_item_id: m.work_item_id,
+			hash: m.hash,
 			matched_normalized_value: m.normalized_value,
 		}));
 
@@ -593,6 +598,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			);
 			return {
 				linked: 0,
+				unlinked: 0,
 				inserted: 0,
 				statusSet: 0,
 				rowsExpired: 0,
@@ -612,6 +618,9 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				`chunk ${chunk}: found ${matchRows.length} DROP match(es) but could not record them — ${reason}`,
 			);
 		}
+
+		// From here on, name every work item the hashes belong to.
+		alerts = written.linkedWorkItems;
 
 		// announce it, before the data goes
 		const matchLog = await phase("betterstack: match alert", () =>
@@ -663,6 +672,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 
 		return {
 			linked: written.linked,
+			unlinked: written.unlinked,
 			inserted: written.inserted,
 			statusSet,
 			rowsExpired: expired.before - expired.after,

@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 import { incompleteReason } from "../worker/db";
 import { planErasures } from "../worker/workflow-reports-cleanup";
 import type { MatchResult } from "../worker/workflow-reports-cleanup";
+import { planKvRemovals } from "../worker/workflow-downloader";
 
 /**
  * Cron C's control flow, tested without ClickHouse, KV or Supabase.
@@ -17,6 +18,7 @@ import type { MatchResult } from "../worker/workflow-reports-cleanup";
 function chunkResult(over: Record<string, unknown> = {}) {
 	return {
 		linked: 0,
+		unlinked: 0,
 		inserted: 0,
 		statusSet: 0,
 		rowsExpired: 0,
@@ -225,10 +227,12 @@ describe("incompleteReason", () => {
 	const ok = {
 		submitted: 3,
 		skippedEmpty: 0,
+		unlinked: 0,
 		linked: 3,
 		workItems: 2,
 		inserted: 3,
 		workItemIds: ["1", "2"],
+		linkedWorkItems: [],
 	};
 
 	it("passes when every match linked to a work item", () => {
@@ -243,10 +247,41 @@ describe("incompleteReason", () => {
 	});
 
 	it("fails when a match has no work item to link to", () => {
-		expect(incompleteReason({ ...ok, linked: 1 })).toContain("no row in ca_drop_work_item");
+		expect(incompleteReason({ ...ok, unlinked: 1 })).toContain("no live row in ca_drop_work_item");
+	});
+
+	it("passes when one match links more work items than were submitted", () => {
+		// Two consumers sharing a phone: one hash, one match, two work items.
+		expect(incompleteReason({ ...ok, submitted: 1, linked: 2, workItems: 2 })).toBeNull();
 	});
 
 	it("fails when a match was dropped for an empty identifier", () => {
 		expect(incompleteReason({ ...ok, skippedEmpty: 2 })).toContain("empty normalized value");
+	});
+});
+
+describe("planKvRemovals", () => {
+	const holder = (hash: string, work_item_id: string) => ({
+		list_type: "phone",
+		hash,
+		work_item_id,
+		request_date: null,
+	});
+
+	it("deletes a hash nobody else holds", () => {
+		expect(planKvRemovals([{ hash: "h1" }], [])).toEqual([{ hash: "h1", action: "delete" }]);
+	});
+
+	it("keeps a shared hash and points it at the consumer who did not withdraw", () => {
+		// Ben withdrew; Anna shares the phone and did not. Deleting the key
+		// would stop suppressing Anna.
+		expect(planKvRemovals([{ hash: "shared" }], [holder("shared", "anna")])).toEqual([
+			{ hash: "shared", action: "reassign", holder: holder("shared", "anna") },
+		]);
+	});
+
+	it("decides each hash once when a removals file names it twice", () => {
+		const plan = planKvRemovals([{ hash: "h1" }, { hash: "h1" }, { hash: "h2" }], []);
+		expect(plan.map((p) => p.hash)).toEqual(["h1", "h2"]);
 	});
 });
