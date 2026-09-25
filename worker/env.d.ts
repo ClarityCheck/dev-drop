@@ -8,7 +8,6 @@
  *   npx wrangler secret put LOGS_TOKEN
  *   npx wrangler secret put DROP_API_KEY
  *   npx wrangler secret put DROP_OPERATOR_TOKEN
- *   npx wrangler secret put WEBSITE_DB_URL      (only until the WEBSITE_DB Hyperdrive exists)
  *
  * SUPABASE_DB_URL is the fallback used until the DROP_DB Hyperdrive binding
  * exists; db.ts prefers the binding when it is there.
@@ -22,11 +21,4 @@ interface Env {
 	DROP_API_KEY?: string;
 	/** Bearer token for starting Cron A, B and C by hand. Absent = nobody can start them. */
 	DROP_OPERATOR_TOKEN?: string;
-	/**
-	 * The website's Supabase project, until the WEBSITE_DB Hyperdrive binding
-	 * exists. Session-mode pooler string, as for SUPABASE_DB_URL. Cron C fails a
-	 * chunk without one of the two, rather than mark work items deleted while
-	 * search_history still holds the value.
-	 */
-	WEBSITE_DB_URL?: string;
 }

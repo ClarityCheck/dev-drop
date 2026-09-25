@@ -303,7 +303,8 @@ Nothing from it is served, and nothing from it is stored.
   same `(type, normalized_value)`:
   - every `ai_enrichment_info` row (ClickHouse) — the AI text generated from
     the report, for every user and purpose;
-  - every `search_history` row in the **website's** Supabase project whose
+  - every `search_history` row in **each website's** Supabase project —
+    ClarityCheck and ReverseLookup — whose
     searched value normalizes to it, and that row's deep-search children —
     the searched value is the listed consumer's own identifier.
 
@@ -620,10 +621,11 @@ ordered by consequence rather than by effort.
 
 ### It stops suppressing, or never starts
 
-- **Cron C cannot sweep until it can reach the website's Supabase.** It fails
-  every chunk without the `WEBSITE_DB` Hyperdrive binding or the
-  `WEBSITE_DB_URL` secret. Setup: `sql/website-supabase.sql` in the website
-  project, then the Hyperdrive config it describes. The ClickHouse role also
+- **Cron C cannot sweep until it can reach every website's Supabase.** It fails
+  every chunk while `WEBSITE_CC_DB` (ClarityCheck) or `WEBSITE_RL_DB`
+  (ReverseLookup) is missing. On DEV both now exist; the rest of setup is
+  `sql/website-supabase.sql` in each project and the Hyperdrive config it
+  describes. The ClickHouse role also
   needs the new `ai_enrichment_info` grant in `sql/clickhouse.sql` section 3.
 - **The request path does not clean the website's copies.** When the lookup API
   erases a cached phone or e-mail report itself (`match-found` →

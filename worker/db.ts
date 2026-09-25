@@ -215,23 +215,36 @@ function connect(env: Env) {
 }
 
 /**
- * The website's Supabase project — a different database from the one above,
- * reached the same way: the WEBSITE_DB Hyperdrive binding, or the
- * WEBSITE_DB_URL secret until that exists. Its role is granted SELECT and
- * DELETE on public.search_history and nothing else (sql/website-supabase.sql).
+ * The websites' Supabase projects — each a different database from the one
+ * above, reached through its own Hyperdrive binding, as a drop_workflow role
+ * granted SELECT and DELETE on public.search_history and nothing else
+ * (sql/website-supabase.sql). Cron C cleans every one of them.
  */
-function connectWebsite(env: Env) {
-	const hyperdrive = (env as unknown as { WEBSITE_DB?: { connectionString?: string } }).WEBSITE_DB;
-	return connectVia(
-		hyperdrive?.connectionString,
-		env.WEBSITE_DB_URL,
-		"no website database: add the WEBSITE_DB Hyperdrive binding or set WEBSITE_DB_URL",
-	);
+export const WEBSITE_DBS = [
+	{ name: "claritycheck", binding: "WEBSITE_CC_DB" },
+	{ name: "reverselookup", binding: "WEBSITE_RL_DB" },
+] as const;
+
+export type WebsiteDb = (typeof WEBSITE_DBS)[number];
+
+function websiteConnectionString(env: Env, site: WebsiteDb): string | undefined {
+	const hyperdrive = (env as unknown as Record<string, { connectionString?: string } | undefined>)[
+		site.binding
+	];
+	return hyperdrive?.connectionString;
 }
 
-export function hasWebsiteDb(env: Env): boolean {
-	const hyperdrive = (env as unknown as { WEBSITE_DB?: { connectionString?: string } }).WEBSITE_DB;
-	return Boolean(hyperdrive?.connectionString ?? env.WEBSITE_DB_URL);
+/** The websites whose database this Worker cannot reach. Empty means all. */
+export function missingWebsiteDbs(env: Env): WebsiteDb[] {
+	return WEBSITE_DBS.filter((site) => !websiteConnectionString(env, site));
+}
+
+function connectWebsite(env: Env, site: WebsiteDb) {
+	return connectVia(
+		websiteConnectionString(env, site),
+		undefined,
+		`no ${site.name} website database: add the ${site.binding} Hyperdrive binding`,
+	);
 }
 
 function connectVia(hyperdriveConnectionString: string | undefined, url: string | undefined, missing: string) {
@@ -1140,12 +1153,13 @@ export type SearchHistoryErase = { matched: number; deleted: number; remaining: 
  */
 export async function deleteSearchHistory(
 	env: Env,
+	site: WebsiteDb,
 	keys: { type: string; normalized_value: string }[],
 ): Promise<SearchHistoryErase> {
 	const pairs = keys.filter((k) => k.type === "phone" || k.type === "email");
 	if (pairs.length === 0) return { matched: 0, deleted: 0, remaining: 0 };
 
-	const sql = connectWebsite(env);
+	const sql = connectWebsite(env, site);
 	try {
 		const [r] = await withTimeout(
 			sql<{ matched: string; deleted: string }[]>`
@@ -1172,7 +1186,7 @@ export async function deleteSearchHistory(
 				       (SELECT count(*) FROM del)::text AS deleted
 			`,
 			30000,
-			"delete website search_history",
+			`delete ${site.name} search_history`,
 		);
 
 		const [left] = await withTimeout(
@@ -1191,7 +1205,7 @@ export async function deleteSearchHistory(
 				      END
 			`,
 			30000,
-			"count website search_history",
+			`count ${site.name} search_history`,
 		);
 
 		return {

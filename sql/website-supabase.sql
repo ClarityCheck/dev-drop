@@ -1,8 +1,10 @@
 -- =====================================================================
 -- CA DROP — the Worker's access to the WEBSITE's Supabase project
 --
--- A different project from sql/supabase.sql: the one the website stores
--- its users' search history in ([ClarityCheck] Product *DEV on DEV).
+-- A different project from sql/supabase.sql: one the website stores its
+-- users' search history in. Run it in EACH website project — on DEV,
+-- [ClarityCheck] Product *DEV and [ReverseLookup] Product *DEV — with a
+-- different password for each.
 -- Cron C deletes the search_history rows of a phone or e-mail whose
 -- report it erases, so a DROP-listed consumer's identifier does not stay
 -- in anyone's report history.
@@ -40,16 +42,15 @@ WHERE table_schema = 'public' AND grantee = 'drop_workflow'
 GROUP BY grantee, table_name;
 
 
--- 4. Then, outside SQL — the Hyperdrive config the Worker binds as
---    WEBSITE_DB (same CA and flags as the existing drop-db config):
+-- 4. Then, outside SQL — one Hyperdrive config per project, with the
+--    supabase-ca certificate (npx wrangler cert list):
 --
---    npx wrangler hyperdrive create drop-website-db \
+--    npx wrangler hyperdrive create drop-website-cc-db \
 --      --connection-string="postgresql://drop_workflow:<PASSWORD>@db.<ref>.supabase.co:5432/postgres" \
---      --sslmode verify-full --ca-certificate-id <UUID>
+--      --sslmode verify-full --ca-certificate-id <supabase-ca id>
 --
---    and add to wrangler.jsonc under "hyperdrive":
---      { "binding": "WEBSITE_DB", "id": "<returned id>", "localConnectionString": "…" }
---
---    Until then the WEBSITE_DB_URL secret works instead (session-mode
---    pooler string, user drop_workflow.<ref>). Without either, Cron C fails
---    every chunk rather than mark work items deleted.
+--    Answer No when Wrangler offers to add the binding, and add it by hand
+--    under "hyperdrive" in wrangler.jsonc:
+--      { "binding": "WEBSITE_CC_DB", "id": "<returned id>", "localConnectionString": "…" }
+--    (WEBSITE_RL_DB for ReverseLookup). Cron C fails every chunk while any
+--    website listed in WEBSITE_DBS (worker/db.ts) has no binding.

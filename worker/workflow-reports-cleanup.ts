@@ -6,7 +6,8 @@ import type { ElementKey, EntityKey } from "./ch";
 import {
 	countLiveHashes,
 	deleteSearchHistory,
-	hasWebsiteDb,
+	missingWebsiteDbs,
+	WEBSITE_DBS,
 	incompleteReason,
 	markMatchesDeleted,
 	recordMatches,
@@ -35,8 +36,9 @@ import { writeMatchLog } from "./audit";
  *   ⑤ per chunk of matches:
  *        the rows in public.ca_drop_work_item_match
  *        the Better Stack alert
- *        delete the website's search_history rows for a phone or e-mail
- *          (the website's Supabase, WEBSITE_DB), and the AI enrichments in
+ *        delete the websites' search_history rows for a phone or e-mail
+ *          (ClarityCheck and ReverseLookup Supabase, WEBSITE_CC_DB and
+ *          WEBSITE_RL_DB), and the AI enrichments in
  *          default.ai_enrichment_info — before the report, because once the
  *          report is gone the next refresh cannot find them again
  *        erase the matched records from default.entity_search_results —
@@ -632,9 +634,10 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		// reach: the chunk has to clean search_history too, and doing the rest
 		// without it would leave 'deleted' unreachable — once the reports are
 		// erased, the next refresh has nothing left to match.
-		if (!hasWebsiteDb(this.env)) {
+		const missing = missingWebsiteDbs(this.env);
+		if (missing.length > 0) {
 			const why =
-				"no website database — add the WEBSITE_DB Hyperdrive binding or set WEBSITE_DB_URL; " +
+				`no website database for ${missing.map((m) => `${m.name} (${m.binding})`).join(", ")}; ` +
 				"nothing was recorded or erased";
 			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
 			throw new NonRetryableError(`chunk ${chunk}: ${why}`);
@@ -663,13 +666,17 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		// The website's copies go before the report does. If they come after
 		// and fail, the next run cannot find them again: the refresh no longer
 		// matches an identifier whose report is already gone.
-		const history = await phase("website supabase: delete search history", () =>
-			deleteSearchHistory(this.env, plan.rows),
-		);
-		if (history.remaining > 0) {
-			const why = `${history.remaining} website search_history row(s) survived the delete`;
-			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
-			throw new Error(`chunk ${chunk}: ${why}`);
+		let historyDeleted = 0;
+		for (const site of WEBSITE_DBS) {
+			const history = await phase(`${site.name} supabase: delete search history`, () =>
+				deleteSearchHistory(this.env, site, plan.rows),
+			);
+			if (history.remaining > 0) {
+				const why = `${history.remaining} ${site.name} search_history row(s) survived the delete`;
+				await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+				throw new Error(`chunk ${chunk}: ${why}`);
+			}
+			historyDeleted += history.deleted;
 		}
 
 		const enrichment = await phase("clickhouse: erase ai enrichment", () =>
@@ -732,7 +739,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			rowsExpired: expired.before - expired.after,
 			recordsErased: erased.before - erased.after,
 			enrichmentErased: enrichment.before - enrichment.after,
-			searchHistoryDeleted: history.deleted,
+			searchHistoryDeleted: historyDeleted,
 			matchLog,
 		};
 	}

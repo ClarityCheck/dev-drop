@@ -1,6 +1,6 @@
 import { env, introspectWorkflowInstance } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { incompleteReason } from "../worker/db";
+import { incompleteReason, missingWebsiteDbs } from "../worker/db";
 import { planErasures } from "../worker/workflow-reports-cleanup";
 import type { MatchResult } from "../worker/workflow-reports-cleanup";
 import { planKvRemovals } from "../worker/workflow-downloader";
@@ -292,5 +292,17 @@ describe("planKvRemovals", () => {
 	it("decides each hash once when a removals file names it twice", () => {
 		const plan = planKvRemovals([{ hash: "h1" }, { hash: "h1" }, { hash: "h2" }], []);
 		expect(plan.map((p) => p.hash)).toEqual(["h1", "h2"]);
+	});
+});
+
+describe("missingWebsiteDbs", () => {
+	it("names every website whose database the Worker cannot reach", () => {
+		expect(missingWebsiteDbs({} as Env).map((s) => s.binding)).toEqual(["WEBSITE_CC_DB", "WEBSITE_RL_DB"]);
+		const oneBound = { WEBSITE_CC_DB: { connectionString: "postgres://x" } } as unknown as Env;
+		expect(missingWebsiteDbs(oneBound).map((s) => s.binding)).toEqual(["WEBSITE_RL_DB"]);
+	});
+
+	it("is satisfied in the test Worker, which has both bindings", () => {
+		expect(missingWebsiteDbs(env as unknown as Env)).toEqual([]);
 	});
 });

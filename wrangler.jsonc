@@ -144,6 +144,21 @@
 			// that do not reach Postgres; point it at a real local database if
 			// you want `wrangler dev` to actually query one.
 			"localConnectionString": "postgresql://postgres:postgres@localhost:5432/postgres"
+		},
+		{
+			// The website's Supabase — ClarityCheck DEV. Cron C deletes
+			// search_history rows here, as drop_workflow (sql/website-supabase.sql).
+			//   config: drop-website-cc-db · origin db.ijpyeyygqouclbsfyyga.supabase.co:5432
+			"binding": "WEBSITE_CC_DB",
+			"id": "89bd45855fc74b70b923ce48c521a11a",
+			"localConnectionString": "postgresql://postgres:postgres@localhost:5432/postgres"
+		},
+		{
+			// The website's Supabase — ReverseLookup DEV. Same role and grants.
+			//   config: drop-website-rl-db · origin db.wtucrjkwfhdjpuiooddz.supabase.co:5432
+			"binding": "WEBSITE_RL_DB",
+			"id": "9424403860344a69a47cf772aa392593",
+			"localConnectionString": "postgresql://postgres:postgres@localhost:5432/postgres"
 		}
 	]
 }
