@@ -246,10 +246,11 @@ digest is meaningful against every stored copy of that element.
 DEV still carries v3, which had no element identity at all. §7 has what that
 costs until the view is rebuilt.
 
-The view caps the factors exactly as `FIELD_CAPS` does — 10 first names, 10 last
-names, 5 dates of birth, 24 ZIPs, 12 VINs — **sorted and sliced on the
-normalized values, before hashing**, because the Worker sorts values and sorting
-hashes instead would select a different subset. Without the caps, merging
+The view caps the factors — 10 first names, 10 last names, 5 dates of birth,
+24 ZIPs, 12 VINs — **sorted and sliced on the normalized values, before
+hashing**, so the subset it keeps does not depend on array order. This is the
+one place keys are capped: every Worker path derives every combination (§3), so
+the view can only check fewer composites than the Worker, never more. Without the caps, merging
 providers multiplies the factors far enough that most email values would pass
 the 20,000 cut and derive no composites at all.
 
@@ -371,8 +372,12 @@ All three reach the lookup API as a failed check: it logs the worker's reason,
 raises, and the lookup is marked **failed**. A pathological report — the
 measured worst case is an aggregated email row at 33M candidate keys — now
 fails that subject's lookup instead of being capped down to something runnable.
-`FIELD_CAPS` and `exactFieldsOnly()` still bound the **incident** paths, where a
-subset of the hits is worth having because the erasure already happened.
+The **incident** paths (`match-found`, `erase-incident`) and the erase check in
+`listedRecordsIn` derive keys with the same `reportKeyGroups()` and the same
+limit. They must: a match `report-check` found that `match-found` could not
+re-derive would be refused with 422 after the API had already erased the data.
+A report reaching them has already passed `report-check`, so their own 503 over
+the limit is a backstop, not a path.
 
 ## 4. The endpoints, and who calls them
 

@@ -351,54 +351,19 @@ export function reportGroups(
 	return [subject, mergeReportFields([subject, ...perRecord])];
 }
 
-/**
- * Per-field caps on the composite cross product.
- *
- * Measured against DEV: a phone row reaches 704 candidate keys at worst, and an
- * email row reaches 33,202,400. The difference is that an aggregated email
- * payload is provider noise as much as it is a person — 82 first names, 71 last
- * names, 230 birthDates, 140 ZIPs — and the cross product multiplies all four.
- *
- * Refusing those reports was the first answer and it was wrong: the check is on
- * the path of every lookup, so a report over the limit meant that subject's
- * lookup failed with a 503 every time, permanently, with no way past it.
- *
- * So the factors are bounded instead. Sorted then sliced, so the same report
- * always yields the same keys — an unstable reduction would make the answer
- * depend on provider ordering.
- *
- * E-MAIL AND PHONE KEYS ARE NEVER CAPPED. They are exact, single-value and
- * cost one key each, so the high-confidence half of the check stays complete
- * however noisy the payload is. Only the combinatorial inference is bounded,
- * and a report that hit a cap says so.
- */
-export const FIELD_CAPS = {
-	firstNames: 10,
-	lastNames: 10,
-	dobs: 5,
-	zips: 24,
-	vins: 12,
-} as const;
-
-export type BoundedFields = { fields: ReportFields; capped: (keyof typeof FIELD_CAPS)[] };
-
-export function boundReportFields(report: ReportFields): BoundedFields {
-	const capped: (keyof typeof FIELD_CAPS)[] = [];
-	const bounded = { ...report };
-
-	for (const field of Object.keys(FIELD_CAPS) as (keyof typeof FIELD_CAPS)[]) {
-		const values = report[field];
-		if (values.length <= FIELD_CAPS[field]) continue;
-		bounded[field] = [...values].sort().slice(0, FIELD_CAPS[field]);
-		capped.push(field);
-	}
-
-	return { fields: bounded, capped };
-}
-
-/** The single-value keys only — what remains checkable when the product is too big. */
-export function exactFieldsOnly(report: ReportFields): ReportFields {
-	return { ...NO_FIELDS, emails: report.emails, phones: report.phones };
+export function reportKeyGroups(
+	type: ReportType,
+	value: string | undefined,
+	report: unknown,
+): { records: ReportRecord[]; groups: ReportFields[]; candidates: number } {
+	const records = extractReportRecords(report);
+	const groups = reportGroups(
+		type,
+		subjectFields(type, value),
+		records.map((record) => record.fields),
+	);
+	const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
+	return { records, groups, candidates };
 }
 
 export function countReportKeys(report: ReportFields): number {

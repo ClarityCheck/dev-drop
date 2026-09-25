@@ -13,15 +13,10 @@ import type { IncidentStage } from "./drop-incident";
 import { lookupGate, recordSuppression } from "./drop-suppression";
 import {
 	MAX_REPORT_KEYS,
-	boundReportFields,
 	buildReportKeys,
-	countReportKeys,
-	exactFieldsOnly,
-	extractReportRecords,
 	isReportType,
 	lookupDropKeys,
-	reportGroups,
-	subjectFields,
+	reportKeyGroups,
 } from "./drop-report";
 import type { ReportType } from "./drop-report";
 
@@ -73,20 +68,20 @@ async function confirmIncidentMatch(
 		return bad({ error: "report is required" }, 400);
 	}
 
-	const subject = subjectFields(type, typeof value === "string" ? value : undefined);
-	const bounded = reportGroups(
+	const { groups, candidates } = reportKeyGroups(
 		type,
-		subject,
-		extractReportRecords(report).map((record) => record.fields),
-	).map(boundReportFields);
-
-	// Bounded the same way report-check bounds it, and for a sharper reason
-	// here: refusing a pathological report would mean an erasure that ALREADY
-	// HAPPENED could never be recorded. A subset of the hits is worth having;
-	// nothing is not. The exact e-mail and phone keys are never capped.
-	let groups = bounded.map((b) => b.fields);
-	if (groups.reduce((total, g) => total + countReportKeys(g), 0) > MAX_REPORT_KEYS) {
-		groups = groups.map(exactFieldsOnly);
+		typeof value === "string" ? value : undefined,
+		report,
+	);
+	if (candidates > MAX_REPORT_KEYS) {
+		return bad(
+			{
+				error: "match could not be confirmed",
+				detail: `report yields ${candidates} candidate keys, over the ${MAX_REPORT_KEYS} limit`,
+				hint: "nothing was recorded",
+			},
+			503,
+		);
 	}
 
 	let hits: Awaited<ReturnType<typeof lookupDropKeys>>["hits"];
@@ -413,20 +408,17 @@ export default {
 				return Response.json({ error: "report is required" }, { status: 400 });
 			}
 
-			const subject = subjectFields(type, typeof value === "string" ? value : undefined);
-			const reportRecords = extractReportRecords(report);
-			const groups = reportGroups(
-				type,
-				subject,
-				reportRecords.map((record) => record.fields),
-			);
+			const {
+				records: reportRecords,
+				groups,
+				candidates,
+			} = reportKeyGroups(type, typeof value === "string" ? value : undefined, report);
 
 			// The answer is `listed` and nothing else, so anything less than the
 			// whole check is not an answer. A report whose cross product does not
 			// fit, and one that yields no key at all, both fail here rather than
 			// coming back as a reduced or empty "not listed" the caller cannot tell
 			// apart from a clean one.
-			const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
 			if (candidates === 0) {
 				return Response.json(
 					{

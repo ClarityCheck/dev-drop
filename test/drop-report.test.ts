@@ -3,13 +3,10 @@ import { describe, it, expect } from "vitest";
 import { listedRecordsIn } from "../worker/drop-incident";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
 import {
-	FIELD_CAPS,
 	MAX_REPORT_KEYS,
 	NO_FIELDS,
-	boundReportFields,
 	buildReportKeys,
 	countReportKeys,
-	exactFieldsOnly,
 	extractReportRecords,
 	lookupDropKeys,
 	normalizeDob,
@@ -878,6 +875,47 @@ describe("POST /api/drop/erase-incident", () => {
 			expect(json.hint).toContain("DO NOT ERASE");
 		});
 
+		it("confirms a match report-check found beyond the field caps", async () => {
+			// Eleven first names across two providers, and the listed person's is
+			// "zoe" — eleventh in sort order, so a path that caps first names at
+			// ten never builds this NDZ key. report-check builds every
+			// combination and says listed; match-found has to confirm the same
+			// match, or the API withholds a report it can never erase.
+			const ndz = await sha256Base64(
+				(await sha256Base64("zoe")) +
+					(await sha256Base64("smith")) +
+					(await sha256Base64("19851103")) +
+					(await sha256Base64("94107")),
+			);
+			await env.kv.put(ndz, "work-item-beyond-cap", {
+				metadata: { work_item_id: "work-item-beyond-cap", list_type: "ndz" },
+			});
+
+			const report = [
+				{
+					personalInfo: {
+						firstNames: ["Anna", "Bella", "Carla", "Dora", "Emma", "Fiona", "Gina", "Hana", "Iris", "Jana"],
+						lastName: "Smith",
+					},
+				},
+				{
+					personalInfo: { firstName: "Zoe", lastName: "Smith", birthDate: "1985-11-03" },
+					contactInfo: { zip: "94107" },
+				},
+			];
+			const body = { type: "phone", value: "+1 415 555 0101", normalizedValue: "14155550101", report };
+
+			const check = await SELF.fetch("https://example.com/api/drop/report-check", {
+				method: "POST",
+				body: JSON.stringify(body),
+			});
+			expect(((await check.json()) as { listed: boolean }).listed).toBe(true);
+
+			const { status, json } = await matchFound(body);
+			expect(status).not.toBe(422);
+			expect(json.stage).toBe("record");
+		});
+
 		it("refuses a match it cannot confirm, before writing anything", async () => {
 			const { status, json } = await matchFound({
 				type: "email",
@@ -1062,70 +1100,6 @@ describe("the real-time gate", () => {
 	it("answers not listed for a value that normalizes to nothing", async () => {
 		const { json } = await gate({ type: "phone", value: "+()- " });
 		expect(json).toEqual({ type: "phone", listed: false });
-	});
-});
-
-describe("boundReportFields", () => {
-	const fields = (over: Partial<Record<string, string[]>>) => ({
-		emails: [],
-		phones: [],
-		firstNames: [],
-		lastNames: [],
-		dobs: [],
-		zips: [],
-		vins: [],
-		...over,
-	});
-
-	const many = (n: number, prefix: string) =>
-		Array.from({ length: n }, (_, i) => `${prefix}${String(i).padStart(4, "0")}`);
-
-	it("leaves a normal report untouched", () => {
-		const input = fields({ firstNames: ["anna"], lastNames: ["smith"], zips: ["90210"] });
-		const { fields: out, capped } = boundReportFields(input);
-		expect(capped).toEqual([]);
-		expect(out).toEqual(input);
-	});
-
-	it("reduces deterministically, so the same report yields the same keys", () => {
-		const input = fields({ firstNames: many(50, "n") });
-		const first = boundReportFields(input).fields.firstNames;
-		const shuffled = fields({ firstNames: [...many(50, "n")].reverse() });
-		expect(boundReportFields(shuffled).fields.firstNames).toEqual(first);
-		expect(first).toHaveLength(FIELD_CAPS.firstNames);
-	});
-
-	it("never caps the exact keys, however many there are", () => {
-		const input = fields({ emails: many(500, "e"), phones: many(500, "p") });
-		const { fields: out, capped } = boundReportFields(input);
-		expect(out.emails).toHaveLength(500);
-		expect(out.phones).toHaveLength(500);
-		expect(capped).toEqual([]);
-	});
-
-	it("bounds the cross product to something a Worker can run", () => {
-		const { fields: out } = boundReportFields(
-			fields({
-				firstNames: many(82, "f"),
-				lastNames: many(71, "l"),
-				dobs: many(230, "19800101").map((_, i) => `1980${String(i % 900).padStart(4, "0")}`),
-				zips: many(140, "z"),
-				vins: many(40, "v"),
-			}),
-		);
-		expect(countReportKeys(out)).toBeLessThanOrEqual(
-			FIELD_CAPS.firstNames * FIELD_CAPS.lastNames * FIELD_CAPS.dobs * FIELD_CAPS.zips +
-				FIELD_CAPS.firstNames * FIELD_CAPS.lastNames * FIELD_CAPS.vins,
-		);
-	});
-
-	it("keeps only the exact keys when asked", () => {
-		const out = exactFieldsOnly(
-			fields({ emails: ["a@b.com"], phones: ["4155559317"], firstNames: ["anna"], zips: ["90210"] }),
-		);
-		expect(out).toMatchObject({ emails: ["a@b.com"], phones: ["4155559317"] });
-		expect(out.firstNames).toEqual([]);
-		expect(out.zips).toEqual([]);
 	});
 });
 

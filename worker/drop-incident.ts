@@ -8,9 +8,8 @@ import type { MatchAlert } from "./logs";
 import {
 	MAX_REPORT_KEYS,
 	buildReportKeys,
-	countReportKeys,
-	extractReportRecords,
 	lookupDropKeys,
+	reportKeyGroups,
 } from "./drop-report";
 import type { DropHit } from "./drop-report";
 
@@ -113,8 +112,7 @@ export async function listedRecordsIn(
 			throw new Error(`payload_json for ${row.label} is not valid JSON`);
 		}
 
-		const groups = extractReportRecords(payload).map((record) => record.fields);
-		const candidates = groups.reduce((total, group) => total + countReportKeys(group), 0);
+		const { groups, candidates } = reportKeyGroups("people", undefined, payload);
 		if (candidates === 0) continue;
 		if (candidates > MAX_REPORT_KEYS) {
 			throw new Error(

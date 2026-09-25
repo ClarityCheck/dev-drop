@@ -222,9 +222,8 @@ FROM
     FROM
     (
         -- ── L3 ── cap the GROUP's values, then hash them. Sorted and sliced
-        --          on the normalized values and before hashing, matching
-        --          FIELD_CAPS: the Worker sorts values, and sorting hashes
-        --          instead would select a different subset.
+        --          on the normalized values and before hashing, so the
+        --          subset kept does not depend on array order.
         SELECT
             type,
             normalized_value,
