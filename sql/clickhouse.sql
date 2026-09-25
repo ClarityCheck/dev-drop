@@ -111,10 +111,14 @@ ORDER BY (list_type, hash);
 -- an element that moved is still the same element, and every stored copy
 -- of it goes in one mutation.
 --
--- ─── ON A SERVICE THAT ALREADY CARRIES v3 ────────────────────────────
+-- v5 reads dates of birth in more formats (epoch ms, M/D/YYYY, "Month D,
+-- YYYY") and splits personalInfo.fullName into first and last candidates.
+-- Same columns and grain as v4.
 --
--- DEV does. v4 changes the grain, so ALTER TABLE ... MODIFY QUERY cannot
--- get there. Run, as admin:
+-- ─── ON A SERVICE THAT ALREADY CARRIES v3 OR v4 ──────────────────────
+--
+-- DEV carries v3. v4 changed the grain, so ALTER TABLE ... MODIFY QUERY
+-- cannot get there. Run, as admin:
 --
 --     DROP VIEW default.ca_drop_combined_search_result;
 --
@@ -130,7 +134,7 @@ ORDER BY (list_type, hash);
 -- DO IT BEFORE DEPLOYING THE WORKER. Cron C selects element_digest, which
 -- v3 has no column for, so the match fails outright against the old view
 -- rather than matching less. That is the direction Rule 3 asks for, but it
--- does mean the sweep does not run until the view is v4.
+-- does mean the sweep does not run until the view is v4 or later.
 -- =====================================================================
 
 CREATE MATERIALIZED VIEW default.ca_drop_combined_search_result
@@ -171,7 +175,7 @@ SELECT
     record_count,
     toUInt64(report_width > 20000)             AS oversized_records,
     last_seen_at,
-    'v4'                                       AS spec_version,
+    'v5'                                       AS spec_version,
     email_keys,
     phone_keys,
     if(report_width > 20000, [], ndz_keys)     AS ndz_keys,
@@ -309,7 +313,9 @@ FROM
                 WITH
                     ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'ς', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω', 'ά', 'έ', 'ί', 'ή', 'ύ', 'ό', 'ώ', 'ϊ', 'ΐ', 'ϋ', 'ΰ', 'а', 'б', 'в', 'г', 'д', 'е', 'ё', 'ж', 'з', 'и', 'й', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я', 'є', 'і', 'ї', 'ґ', 'ў', 'ß', 'æ', 'œ', 'ø', 'ð', 'þ', 'ł', 'đ', 'ħ', 'ŋ', 'ı', 'ĳ', 'ŀ'] AS tr_src,
                     ['a', 'v', 'g', 'd', 'e', 'z', 'i', 'th', 'i', 'k', 'l', 'm', 'n', 'x', 'o', 'p', 'r', 's', 's', 't', 'y', 'f', 'ch', 'ps', 'o', 'a', 'e', 'i', 'i', 'y', 'o', 'o', 'i', 'i', 'y', 'y', 'a', 'b', 'v', 'g', 'd', 'e', 'yo', 'zh', 'z', 'i', 'y', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't', 'u', 'f', 'kh', 'ts', 'ch', 'sh', 'shch', '', 'y', '', 'e', 'yu', 'ya', 'e', 'i', 'i', 'g', 'u', 'ss', 'ae', 'oe', 'o', 'd', 'th', 'l', 'd', 'h', 'n', 'i', 'ij', 'l'] AS tr_dst,
-                    '[^a-z0-9\\p{Han}\\p{Hiragana}\\p{Katakana}\\p{Hangul}\\p{Arabic}\\p{Hebrew}]' AS strip_re
+                    '[^a-z0-9\\p{Han}\\p{Hiragana}\\p{Katakana}\\p{Hangul}\\p{Arabic}\\p{Hebrew}]' AS strip_re,
+                    ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'] AS month_full,
+                    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'] AS month_abbr
                 SELECT
                     type,
                     normalized_value,
@@ -335,12 +341,31 @@ FROM
                                 arrayMap(o -> JSONExtractRaw(o, 'number'), JSONExtractArrayRaw(r, 'phones'))
                             )))))) AS phones,
 
+                    -- fullName split into first and last candidates, before
+                    -- normalization: fullNameParts in worker/drop-report.ts.
+                    -- (given names, last name) per value; empty given names
+                    -- mean nothing could be split off.
+                    arrayMap(x ->
+                        if(position(x, ',') > 0,
+                           tuple(arrayFilter(t -> t != '', splitByChar(' ', substring(x, position(x, ',') + 1))),
+                                 substring(x, 1, position(x, ',') - 1)),
+                           arrayMap(toks -> tuple(arraySlice(toks, 1, length(toks) - 1), toks[-1]),
+                             [arrayMap(raw -> if(length(raw) > 2
+                                                 AND has(['jr', 'sr', 'ii', 'iii', 'iv'], replaceRegexpAll(lowerUTF8(raw[-1]), '[^a-z]', '')),
+                                                 arrayPopBack(raw), raw),
+                                [arrayFilter(t -> t != '', splitByChar(' ', x))])[1]])[1]),
+                        arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                            if(JSONType(r, 'personalInfo', 'fullName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'fullName'), [JSONExtractRaw(r, 'personalInfo', 'fullName')]),
+                            if(JSONType(r, 'personalInfo', 'fullNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'fullNames'), [JSONExtractRaw(r, 'personalInfo', 'fullNames')])
+                        )))) AS full_name_parts,
+
                     arrayDistinct(arrayFilter(x -> x != '',
                         arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
                             arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
                                 if(JSONType(r, 'personalInfo', 'firstName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstName'), [JSONExtractRaw(r, 'personalInfo', 'firstName')]),
                                 if(JSONType(r, 'personalInfo', 'firstNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstNames'), [JSONExtractRaw(r, 'personalInfo', 'firstNames')]),
-                                arrayMap(o -> JSONExtractRaw(o, 'first'), JSONExtractArrayRaw(r, 'names'))
+                                arrayMap(o -> JSONExtractRaw(o, 'first'), JSONExtractArrayRaw(r, 'names')),
+                                arrayFlatten(arrayMap(p -> if(length(p.1) > 0, [p.1[1], arrayStringConcat(p.1, ' ')], []), full_name_parts))
                             )))))) AS firsts,
 
                     arrayDistinct(arrayFilter(x -> x != '',
@@ -348,16 +373,46 @@ FROM
                             arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
                                 if(JSONType(r, 'personalInfo', 'lastName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastName'), [JSONExtractRaw(r, 'personalInfo', 'lastName')]),
                                 if(JSONType(r, 'personalInfo', 'lastNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastNames'), [JSONExtractRaw(r, 'personalInfo', 'lastNames')]),
-                                arrayMap(o -> JSONExtractRaw(o, 'last'), JSONExtractArrayRaw(r, 'names'))
+                                arrayMap(o -> JSONExtractRaw(o, 'last'), JSONExtractArrayRaw(r, 'names')),
+                                arrayFlatten(arrayMap(p -> if(length(p.1) > 0, [p.2], []), full_name_parts))
                             )))))) AS lasts,
 
-                    arrayDistinct(arrayFilter(x -> length(x) = 8,
-                        arrayMap(x -> if(match(x, '^(19|20)\\d{2}'), substring(replaceRegexpAll(x, '[^0-9]', ''), 1, 8), ''),
+                    -- normalizeDob in worker/drop-report.ts: epoch ms, year
+                    -- first, M/D/YYYY (month first unless the first number is
+                    -- over 12), or "Month D, YYYY"; then one range check.
+                    arrayDistinct(arrayFilter(d -> length(d) = 8
+                            AND toUInt16OrZero(substring(d, 1, 4)) BETWEEN 1700 AND 2099
+                            AND toUInt8OrZero(substring(d, 5, 2)) BETWEEN 1 AND 12
+                            AND toUInt8OrZero(substring(d, 7, 2)) BETWEEN 1 AND 31,
+                        arrayMap(x -> multiIf(
+                            match(x, '^-?[0-9]{11,13}$'),
+                              if(toInt64(x) BETWEEN -2208988800000 AND 4102444799999,
+                                 formatDateTime(fromUnixTimestamp64Milli(toInt64(x), 'UTC'), '%Y%m%d'), ''),
+                            match(x, '^(1[7-9]|20)[0-9]{2}'),
+                              substring(replaceRegexpAll(x, '[^0-9]', ''), 1, 8),
+                            match(x, '^[0-9]{1,2}[/.-][0-9]{1,2}[/.-][0-9]{4}$') OR match(x, '^[0-9]{8}$'),
+                              arrayMap(g -> concat(g[3],
+                                  leftPad(if(toUInt8(g[1]) > 12, g[2], g[1]), 2, '0'),
+                                  leftPad(if(toUInt8(g[1]) > 12, g[1], g[2]), 2, '0')),
+                                [if(match(x, '^[0-9]{8}$'),
+                                    extractGroups(x, '^([0-9]{2})([0-9]{2})([0-9]{4})$'),
+                                    extractGroups(x, '^([0-9]{1,2})[/.-]([0-9]{1,2})[/.-]([0-9]{4})$'))])[1],
+                            match(x, '^[A-Za-z]+\\.? +[0-9]{1,2},? +[0-9]{4}$'),
+                              arrayMap(g -> arrayMap(m -> if(m = 0, '', concat(g[3], leftPad(toString(m), 2, '0'), leftPad(g[2], 2, '0'))),
+                                  [multiIf(indexOf(month_full, lowerUTF8(g[1])) > 0, indexOf(month_full, lowerUTF8(g[1])),
+                                           indexOf(month_abbr, lowerUTF8(g[1])) > 0, indexOf(month_abbr, lowerUTF8(g[1])),
+                                           lowerUTF8(g[1]) = 'sept', 9, 0)])[1],
+                                [extractGroups(x, '^([A-Za-z]+)\\.? +([0-9]{1,2}),? +([0-9]{4})$')])[1],
+                            ''),
+                            -- take off a trailing "(MM/DD/YYYY)" note and a Ruby
+                            -- "#<Date: YYYY-MM-DD …>" printout first
+                            arrayMap(x -> if(match(x, '^#<Date: [0-9]{4}-[0-9]{2}-[0-9]{2}'), substring(x, 9, 10), x),
+                            arrayMap(x -> replaceRegexpOne(x, ' \\([A-Za-z/]+\\)$', ''),
                             arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
                                 if(JSONType(r, 'personalInfo', 'birthDate') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'birthDate'), [JSONExtractRaw(r, 'personalInfo', 'birthDate')]),
                                 if(JSONType(r, 'personalInfo', 'birthDates') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'birthDates'), [JSONExtractRaw(r, 'personalInfo', 'birthDates')]),
                                 [JSONExtractRaw(r, 'dateOfBirth', 'start')]
-                            )))))) AS dobs,
+                            )))))))) AS dobs,
 
                     arrayDistinct(arrayFilter(x -> x != '',
                         arrayMap(x -> substring(replaceRegexpOne(replaceRegexpAll(lowerUTF8(splitByChar('-', x)[1]), '[^a-z0-9]', ''), '^0+', ''), 1, 5),
@@ -558,7 +613,7 @@ SELECT access_type, database, table
 FROM system.grants
 WHERE user_name = 'drop_workflow';
 
--- Expect spec_version v4 on every row once the view has been refreshed.
+-- Expect spec_version v5 on every row once the view has been refreshed.
 -- It is empty until then; REFRESH is the next step.
 SELECT spec_version, count() AS rows
 FROM default.ca_drop_combined_search_result

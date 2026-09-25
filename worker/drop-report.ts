@@ -65,10 +65,117 @@ export function normalizeName(raw: string): string {
 	return transliterated.normalize("NFD").replace(NON_NAME_CHARACTERS, "");
 }
 
-export function normalizeDob(raw: string): string {
-	if (!/^(19|20)\d{2}/.test(raw)) return "";
-	const digits = raw.replace(/[^0-9]/g, "").slice(0, 8);
-	return digits.length === 8 ? digits : "";
+const MONTH_NAMES = [
+	"january", "february", "march", "april", "may", "june",
+	"july", "august", "september", "october", "november", "december",
+];
+
+function monthNumber(word: string): number {
+	const w = word.toLowerCase();
+	const full = MONTH_NAMES.indexOf(w);
+	if (full >= 0) return full + 1;
+	const short = MONTH_NAMES.findIndex((m) => m.slice(0, 3) === w);
+	if (short >= 0) return short + 1;
+	return w === "sept" ? 9 : 0;
+}
+
+function yyyymmdd(year: number, month: number, day: number): string {
+	if (year < 1700 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31) return "";
+	return `${year}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}`;
+}
+
+/** Epoch milliseconds, in the range ClickHouse's DateTime64 can also read. */
+const EPOCH_MS_MIN = -2208988800000;
+const EPOCH_MS_MAX = 4102444799999;
+
+/**
+ * DROP wants YYYYMMDD with a four-digit year. Providers send, in order of how
+ * this tries them:
+ *
+ *   -315619200000       epoch milliseconds, 11-13 digits, read in UTC
+ *   1985-11-03[T…]      year first — the digits, in order
+ *   11/03/1985, 3/7/1985
+ *                       month first, as US data is, unless the first number
+ *                       is over 12 and so can only be the day
+ *   09141990            eight digits that are not year first: MMDDYYYY, by the
+ *                       same month-first rule
+ *   July 4, 1776        a month name, full or three letters — the spec's own
+ *                       example
+ *
+ * Before that, two wrappers seen in provider data are taken off: a trailing
+ * format note ("08/18/1987 (MM/DD/YYYY)") and a Ruby Date printout
+ * ("#<Date: 1978-03-19 ((2443587j,0s,0n),+0s,2299161j)>").
+ *
+ * Anything else yields no date. The same rules are in the ClickHouse view.
+ */
+export function normalizeDob(value: string): string {
+	let raw = value.replace(/ \([A-Za-z/]+\)$/, "");
+	const ruby = /^#<Date: (\d{4}-\d{2}-\d{2})/.exec(raw);
+	if (ruby) raw = ruby[1];
+
+	if (/^-?\d{11,13}$/.test(raw)) {
+		const ms = Number(raw);
+		if (ms < EPOCH_MS_MIN || ms > EPOCH_MS_MAX) return "";
+		const t = new Date(ms);
+		return yyyymmdd(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+	}
+
+	if (/^(1[7-9]|20)\d{2}/.test(raw)) {
+		const digits = raw.replace(/[^0-9]/g, "").slice(0, 8);
+		if (digits.length !== 8) return "";
+		return yyyymmdd(Number(digits.slice(0, 4)), Number(digits.slice(4, 6)), Number(digits.slice(6, 8)));
+	}
+
+	const numeric =
+		/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(raw) ?? /^(\d{2})(\d{2})(\d{4})$/.exec(raw);
+	if (numeric) {
+		const [a, b, year] = [Number(numeric[1]), Number(numeric[2]), Number(numeric[3])];
+		return a > 12 ? yyyymmdd(year, b, a) : yyyymmdd(year, a, b);
+	}
+
+	const named = /^([A-Za-z]+)\.? +(\d{1,2}),? +(\d{4})$/.exec(raw);
+	if (named) {
+		const month = monthNumber(named[1]);
+		return month ? yyyymmdd(Number(named[3]), month, Number(named[2])) : "";
+	}
+
+	return "";
+}
+
+const NAME_SUFFIXES = new Set(["jr", "sr", "ii", "iii", "iv"]);
+
+/**
+ * First and last name candidates from a full name, before normalization.
+ *
+ *   "Anna Maria Smith"   first: "Anna", "Anna Maria"   last: "Smith"
+ *   "Smith, Anna Maria"  the same, from the comma form
+ *   "John Smith Jr"      a trailing Jr / Sr / II / III / IV is dropped first
+ *
+ * Splitting a full name is a guess, so both first-name readings are offered —
+ * the first word alone, and every given name run together the way DROP's
+ * compound-name rule would write "Juan Pablo". A wrong guess produces a key
+ * nobody holds, so extra candidates can only add matches, never cause one.
+ * A single word yields nothing: there is no last name to pair it with.
+ */
+export function fullNameParts(raw: string): { firsts: string[]; lasts: string[] } {
+	const comma = raw.indexOf(",");
+	let given: string[];
+	let last: string;
+
+	if (comma >= 0) {
+		last = raw.slice(0, comma);
+		given = raw.slice(comma + 1).split(" ").filter((t) => t !== "");
+	} else {
+		const tokens = raw.split(" ").filter((t) => t !== "");
+		const tail = (tokens[tokens.length - 1] ?? "").toLowerCase().replace(/[^a-z]/g, "");
+		if (tokens.length > 2 && NAME_SUFFIXES.has(tail)) tokens.pop();
+		if (tokens.length < 2) return { firsts: [], lasts: [] };
+		last = tokens[tokens.length - 1];
+		given = tokens.slice(0, -1);
+	}
+
+	if (given.length === 0) return { firsts: [], lasts: [] };
+	return { firsts: [given[0], given.join(" ")], lasts: [last] };
 }
 
 export function normalizeZip(raw: string): string {
@@ -149,6 +256,7 @@ function personFields(person: JsonRecord): ReportFields {
 	const contactInfo = records(person.contactInfo);
 	const names = records(person.names);
 	const addresses = [...nested(contactInfo, "fullAddresses"), ...records(person.addresses)];
+	const fromFullNames = fields(personalInfo, "fullName", "fullNames").map(fullNameParts);
 
 	return {
 		emails: distinct(
@@ -160,11 +268,19 @@ function personFields(person: JsonRecord): ReportFields {
 			normalizePhone,
 		),
 		firstNames: distinct(
-			[...fields(personalInfo, "firstName", "firstNames"), ...fields(names, "first")],
+			[
+				...fields(personalInfo, "firstName", "firstNames"),
+				...fields(names, "first"),
+				...fromFullNames.flatMap((p) => p.firsts),
+			],
 			normalizeName,
 		),
 		lastNames: distinct(
-			[...fields(personalInfo, "lastName", "lastNames"), ...fields(names, "last")],
+			[
+				...fields(personalInfo, "lastName", "lastNames"),
+				...fields(names, "last"),
+				...fromFullNames.flatMap((p) => p.lasts),
+			],
 			normalizeName,
 		),
 		dobs: distinct(

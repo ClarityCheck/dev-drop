@@ -130,6 +130,35 @@ Four lists. Each entry is a work item ID and a Base64 SHA-256 hash.
 and ZIP held for a person is hashed in every combination, so one consumer can
 produce thousands of candidate keys.
 
+### Reading the inputs providers actually send
+
+The specification says what the normalized value must be; providers send it in
+many shapes. What we read, in `normalizeDob` / `fullNameParts` and identically
+in the view:
+
+**Date of birth → `YYYYMMDD`**, years 1700–2099, month and day range-checked:
+
+| Provider sends                                  | Read as                          |
+| ----------------------------------------------- | -------------------------------- |
+| `1985-11-03`, `19851103`, `1985-11-03T00:00:00Z` | year first                       |
+| `11/03/1985`, `3/7/1985`, `09141990`            | month first — US data            |
+| `25/03/1985`                                    | day first, since 25 is no month  |
+| `July 4, 1776`, `Sept. 9, 1990`                 | month name — the spec's example  |
+| `499132800000`, `-315619200000`                 | epoch milliseconds, UTC          |
+| `08/18/1987 (MM/DD/YYYY)`, `#<Date: 1978-03-19 …>` | the wrapper is taken off first |
+
+A year alone, a year and month, two-digit years, `0000-00-00` and masked values
+(`*0suDIs…==`) yield no date. On DEV this reads 6,229 of 7,965 values, up from
+5,818; 1,597 of the rest are masked by the provider.
+
+**`personalInfo.fullName`** adds first and last candidates to whatever
+`firstName` / `lastName` already give: the last word is the last name, and the
+first name is offered both as the first word and as every given name run
+together (`Juan Pablo Martinez` → `juan`, `juanpablo`; `martinez`). `Smith,
+Anna` is read last-name first, and a trailing `Jr` / `Sr` / `II` / `III` / `IV`
+is dropped. A single word yields nothing. Splitting is a guess, so both readings
+are offered: a wrong one is a key nobody holds and can only add matches.
+
 Normalization and key derivation exist twice — in `worker/drop-normalize.ts` and
 `worker/drop-report.ts`, and again in the ClickHouse view Cron C matches
 against. **If the two ever disagree, no error is raised anywhere**: the gate
@@ -190,7 +219,7 @@ called it listed, and serving the element that matched is not an option.
 ### Cron C groups the same way
 
 `sql/clickhouse.sql` builds view `ca_drop_combined_search_result`, `spec_version`
-v4, whose **grain is the grouping rule**:
+v5, whose **grain is the grouping rule**:
 
 | Report shape  | One view row is                                                  |
 | ------------- | ---------------------------------------------------------------- |
@@ -575,8 +604,9 @@ ordered by consequence rather than by effort.
 
 ### It stops suppressing, or never starts
 
-- **The live DEV view is v3, and the sweep does not run until it is v4.** v4
-  changes the view's grain, so it cannot be altered into place: `DROP VIEW`,
+- **The live DEV view is v3, and the sweep does not run until it is v5.** v4
+  changed the view's grain (v5 adds the date and full-name reading on top), so
+  it cannot be altered into place: `DROP VIEW`,
   re-run `sql/clickhouse.sql`'s section 2, `SYSTEM REFRESH VIEW` — in that
   order, and **before** the Worker is deployed. The grants survive, because
   ClickHouse records a privilege against the name. Cron C selects
@@ -594,6 +624,15 @@ ordered by consequence rather than by effort.
 - **VIN, username and entity lookups are not screened at all** (§2a).
 
 ### It fails quietly
+
+- **Japanese, Korean, Arabic and Hebrew names are not left unchanged.** Both
+  sides decompose a name (NFD) to strip Latin accents, then keep only an
+  allow-list of scripts, so a Korean syllable is hashed as its separate jamo
+  (`김민준` → 9 code points), and a Japanese voicing mark or an Arabic/Hebrew
+  vowel mark is removed (`やまだ` → `やまた`). The specification says to leave
+  these scripts unchanged but names no Unicode form, and has no non-Latin
+  example to test against. A consumer registered under such a name is not
+  matched. Deliberately deferred.
 
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.

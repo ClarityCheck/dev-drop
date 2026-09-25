@@ -87,9 +87,41 @@ const CLICKHOUSE_DOB_VECTORS: [string, string][] = [
 	["2020-02-29", "20200229"],
 	["1980/1/1", ""],
 	["1980-01", ""],
-	["1899-01-01", ""],
-	["01/01/1980", ""],
+	["1899-01-01", "18990101"],
+	["01/01/1980", "19800101"],
 	["", ""],
+	// v5: formats found in DEV provider data, outputs taken from the view
+	["11/03/1985", "19851103"],
+	["3/7/1985", "19850307"],
+	["25/03/1985", "19850325"],
+	["08/18/1987 (MM/DD/YYYY)", "19870818"],
+	["#<Date: 1978-03-19 ((2443587j,0s,0n),+0s,2299161j)>", "19780319"],
+	["09141990", "19900914"],
+	["13131990", ""],
+	["July 4, 1776", "17760704"],
+	["Jul 4 1776", "17760704"],
+	["Sept. 9, 1990", "19900909"],
+	["junk 4, 1990", ""],
+	["499132800000", "19851026"],
+	["-315619200000", "19600101"],
+	["99999999999999", ""],
+	["1985-13-01", ""],
+	["2100-01-01", ""],
+	["1000-01-01", ""],
+	["0000-00-00 00:00:00", ""],
+	["1977", ""],
+	["11/21/78", ""],
+];
+
+// fullName -> first and last candidates, normalized; outputs taken from the view
+const CLICKHOUSE_FULL_NAME_VECTORS: { fullName: string; firsts: string[]; lasts: string[] }[] = [
+	{ fullName: "Anna Maria Smith", firsts: ["anna", "annamaria"], lasts: ["smith"] },
+	{ fullName: "Smith, José Luis", firsts: ["jose", "joseluis"], lasts: ["smith"] },
+	{ fullName: "John O'Neil Jr.", firsts: ["john"], lasts: ["oneil"] },
+	{ fullName: "Mary-Jane Watson", firsts: ["maryjane"], lasts: ["watson"] },
+	{ fullName: "Ωmega Test", firsts: ["omega"], lasts: ["test"] },
+	{ fullName: " Björn Ålund ", firsts: ["bjorn"], lasts: ["alund"] },
+	{ fullName: "Cher", firsts: [], lasts: [] },
 ];
 
 const CLICKHOUSE_ZIP_VECTORS: [string, string][] = [
@@ -150,6 +182,12 @@ const PUBLISHED_SPEC_VECTORS: {
 	normalized: string;
 	hash: string;
 }[] = [
+	{
+		normalize: normalizeDob,
+		raw: "July 4, 1776",
+		normalized: "17760704",
+		hash: "skXYXxBER6HQTZ3rXSZH1wVGLQ054mS5rbR/bwvzy4I=",
+	},
 	{
 		normalize: normalizeName,
 		raw: "Juan Pablo",
@@ -270,10 +308,11 @@ describe("published DROP specification examples", () => {
 		expect(keys.namevin).toEqual(["rtnDuXIe63jXYQQXW5r07GJ7lSsrib8+46QuKFwkOmk="]);
 	});
 
-	it("drops a date of birth that is not year-first, rather than mis-keying it", () => {
-		expect(normalizeDob("07/04/1985")).toBe("");
+	it("reads a US date month first, and drops what it cannot read", () => {
+		expect(normalizeDob("07/04/1985")).toBe("19850704");
+		expect(normalizeDob("1776-07-04")).toBe("17760704");
 		expect(normalizeDob("45")).toBe("");
-		expect(normalizeDob("1776-07-04")).toBe("");
+		expect(normalizeDob("*0suDIs1yoF8kUCG4nOkq29w==")).toBe("");
 	});
 });
 
@@ -287,6 +326,32 @@ describe("name normalization matches ca_drop_combined_search_result", () => {
 
 	it("keeps the last character of a name whose lowercasing grows it", () => {
 		expect(normalizeName("İzmir")).toBe("izmir");
+	});
+});
+
+describe("fullName splitting matches ca_drop_combined_search_result", () => {
+	for (const vector of CLICKHOUSE_FULL_NAME_VECTORS) {
+		it(`${JSON.stringify(vector.fullName)}`, () => {
+			const [record] = extractReportRecords([{ personalInfo: { fullName: vector.fullName } }]);
+			expect([...record.fields.firstNames].sort()).toEqual(vector.firsts);
+			expect([...record.fields.lastNames].sort()).toEqual(vector.lasts);
+		});
+	}
+
+	it("adds to firstName and lastName rather than replacing them", () => {
+		const [record] = extractReportRecords([
+			{ personalInfo: { firstName: "Ann", lastName: "Smyth", fullName: "Anna Smith" } },
+		]);
+		expect([...record.fields.firstNames].sort()).toEqual(["ann", "anna"]);
+		expect([...record.fields.lastNames].sort()).toEqual(["smith", "smyth"]);
+	});
+
+	it("gives a provider that sends only fullName an NDZ key", async () => {
+		const [record] = extractReportRecords([
+			{ personalInfo: { fullName: "Anna Smith", birthDate: "11/03/1985" }, contactInfo: { zip: "94107" } },
+		]);
+		const keys = await buildReportKeys(record.fields);
+		expect(keys.ndz).toHaveLength(1);
 	});
 });
 
