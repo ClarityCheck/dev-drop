@@ -309,6 +309,21 @@ subset of the hits is worth having because the erasure already happened.
 
 ## 4. The endpoints, and who calls them
 
+### Starting the crons
+
+Cron A, Cron B and Cron C are **started by hand, never on a schedule**, and
+only by an operator. `POST /api/downloader/start`, `/api/workflow/start` and
+`/api/status-report/start` require `Authorization: Bearer <DROP_OPERATOR_TOKEN>`
+and answer `401` without it. With the secret unset they answer `503`: nobody
+can start a run, rather than everybody. It is a separate secret from the one
+the Lookup API sends, because the API has no reason to start a workflow.
+
+Manual on purpose: each run is a step in a cycle someone is accountable for —
+download, then sweep, then report — and Cron B refuses a sweep it cannot
+trust, so an operator deciding when each happens is the control, not a gap.
+
+### Who calls what
+
 | Endpoint                        | Caller     | Question it answers                        |
 | ------------------------------- | ---------- | ------------------------------------------ |
 | `POST /api/drop/check`          | website    | is this one identifier suppressed?         |
@@ -439,8 +454,9 @@ Once written it stays. There is no expiry and no clearing path.
 
 ## 5a. Reporting to DROP (Cron B)
 
-`POST /api/status-report/start` with `{ cleanupInstanceId, upload? }`. Workflow
-`drop-status-report`, in `worker/workflow-status-report.ts`.
+`POST /api/status-report/start` with `{ cleanupInstanceId, upload? }` and the
+operator token (§4). Workflow `drop-status-report`, in
+`worker/workflow-status-report.ts`.
 
 ### It only runs on a real sweep
 
@@ -548,10 +564,12 @@ ordered by consequence rather than by effort.
   than widened into a whole-row delete. That is the right direction — a failed
   run alerts, and the records are still there for the next one — but for as long
   as the two disagree there is no sweep.
-- **The Worker has no authentication.** `report-check` is an oracle for testing
-  whether a value is on the DROP list, and `erase-incident` writes a compliance
-  record and is trusted to have been called honestly. The API sends
-  `DROP_WORKER_TOKEN`; the Worker ignores it.
+- **The request-path endpoints have no authentication.** Starting the crons
+  needs the operator token (§4), but `report-check` is still an open oracle for
+  testing whether a value is on the DROP list, and `erase-incident` writes a
+  compliance record and is trusted to have been called honestly. The API sends
+  `DROP_WORKER_TOKEN`; the Worker ignores it. The same is true of
+  `/api/kv-repair/start`, which rewrites both KV namespaces.
 - **VIN, username and entity lookups are not screened at all** (§2a).
 
 ### It fails quietly
@@ -590,9 +608,9 @@ ordered by consequence rather than by effort.
   runs build and archive only. The upload and amend calls follow the published
   API (`multipart/form-data`, field `files`, header `X-API-KEY`) and have only
   been exercised against a mocked response.
-- **Nothing schedules it.** Like Cron A and Cron C it is started by hand, and
-  the 45-day deadline is visible only as `oldestUnreportedDays` in the run
-  summary — no alert fires as it approaches.
+- **No alert as the deadline approaches.** It is started by hand, like Cron A
+  and Cron C (§4), and the 45-day deadline is visible only as
+  `oldestUnreportedDays` in the run summary.
 - **Row-level rejections are invisible.** DROP validates after the `202` and
   answers by e-mail; nothing reads that mailbox or feeds it back.
 

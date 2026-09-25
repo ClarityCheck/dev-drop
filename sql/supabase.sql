@@ -304,6 +304,8 @@ WHERE table_schema = 'public' AND table_name = 'ca_drop_work_item'
 --
 --   1. Put the password from section 4 into the Hyperdrive config.
 --   2. Run sql/clickhouse.sql against the ClickHouse service.
+--   Each start needs Authorization: Bearer <DROP_OPERATOR_TOKEN>.
+--
 --   3. POST /api/downloader/start     Cron A — fills the work items
 --   4. POST /api/workflow/start       Cron C — matches and erases
 --   5. POST /api/status-report/start  Cron B — { "cleanupInstanceId":

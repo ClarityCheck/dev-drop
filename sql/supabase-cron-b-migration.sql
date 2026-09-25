@@ -22,6 +22,7 @@ CREATE INDEX ca_drop_work_item_report_idx
 -- Backfill by re-running Cron A on each archived ZIP:
 --
 --   POST /api/downloader/start   { "r2Key": "ca-drop/raw/<file>.zip" }
+--   Authorization: Bearer <DROP_OPERATOR_TOKEN>
 --
 -- The upsert only fills source_file where it is NULL, so this changes
 -- nothing else. Then check:

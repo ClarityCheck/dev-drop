@@ -5,9 +5,10 @@ export default defineConfig({
 	plugins: [
 		cloudflareTest({
 			wrangler: { configPath: "./wrangler.jsonc" },
-			// Cron B refuses to upload without a key. The upload step itself is
-			// mocked in the tests; this only gets the run past that check.
-			miniflare: { bindings: { DROP_API_KEY: "test-key" } },
+			// Test-only secrets. Cron B refuses to upload without an API key (the
+			// upload step itself is mocked), and the start routes refuse without
+			// the operator token.
+			miniflare: { bindings: { DROP_API_KEY: "test-key", DROP_OPERATOR_TOKEN: "test-operator" } },
 		}),
 	],
 });

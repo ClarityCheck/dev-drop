@@ -5,6 +5,7 @@ export { WorkflowStatusDO } from "./durable-object";
 export { DropKvRepairWorkflow } from "./workflow-kv-repair";
 export { DropStatusReportWorkflow } from "./workflow-status-report";
 
+import { requireOperator } from "./auth";
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
 import { IncidentFailed, recordEraseIncident, recordMatchFound } from "./drop-incident";
@@ -160,6 +161,9 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  *     row for an e-mail or phone, the matched array elements for a people
  *     report. Verifies the match AND the erasure, then sets the work item
  *     status and writes the R2 evidence.
+ * Starting Cron A, B or C needs Authorization: Bearer <DROP_OPERATOR_TOKEN>
+ * (worker/auth.ts). They are started by hand only; there are no cron triggers.
+ *
  * - POST /api/status-report/start - Cron B: report a status per work item.
  *     Body: { cleanupInstanceId, upload?, skipCleanupGate?, pageSize? }
  * - GET /api/status-report/status/:id - its status
@@ -172,6 +176,8 @@ export default {
 
 		// API: Start a new workflow instance
 		if (url.pathname === "/api/workflow/start" && request.method === "POST") {
+			const denied = await requireOperator(request, env);
+			if (denied) return denied;
 			try {
 				// Optional body: { refreshView?: boolean, batchSize?: number, maxPages?: number }
 				let params: Record<string, unknown> = {};
@@ -283,6 +289,8 @@ export default {
 		// POST /api/downloader/start   body (all optional):
 		//   { r2Key?, clearKv?, pageSize?, supabase?, keepParsedPages? }
 		if (url.pathname === "/api/downloader/start" && request.method === "POST") {
+			const denied = await requireOperator(request, env);
+			if (denied) return denied;
 			let params: Record<string, unknown> = {};
 			try {
 				params = (await request.json()) as Record<string, unknown>;
@@ -302,6 +310,8 @@ export default {
 
 		// Cron B: the status report.
 		if (url.pathname === "/api/status-report/start" && request.method === "POST") {
+			const denied = await requireOperator(request, env);
+			if (denied) return denied;
 			let params: Record<string, unknown> = {};
 			try {
 				params = (await request.json()) as Record<string, unknown>;
