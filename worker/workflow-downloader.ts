@@ -4,28 +4,26 @@ import { writeAuditLog } from "./audit";
 import { liveHoldersOf, markWorkItemsRevoked, upsertWorkItems } from "./db";
 import type { HashHolder } from "./db";
 import { logRun, tracer } from "./logs";
+import { DROP_API_URL } from "./drop-status";
 import { LISTS, listTypeOf, parseCsv, unzip } from "./zip";
 import type { ListType } from "./zip";
 
 /**
  * Cron A — drop-downloader
  *
- *   ① download the ZIP from the DROP API   — NOT ENABLED: no account yet.
- *      The code is below, commented, along with the audit log it writes.
- *      Until then the ZIP is placed in R2 by hand under ca-drop/raw/ and
- *      step ② takes the newest one.
+ *   ① download the ZIP from the DROP API, with { download: true }. Without
+ *      it the ZIP is placed in R2 by hand under ca-drop/raw/ and step ②
+ *      takes the newest one. "200 no data" ends the run before R2 is touched.
  *   ② locate the archive in R2
- *   ③ count the rows per list (the ZIP is the only copy of the data)
+ *   ③ stage it: unzip and parse ONCE, one JSON page per pageSize rows under
+ *      ca-drop/staging/<run>/
  *   ④ clear KV, then load the hashes into KV
  *   ⑤ upsert the rows into public.ca_drop_work_item
  *   ⑥ apply the Removed identifiers file
- *   ⑦ write the audit log to ca-drop/logs/
+ *   ⑦ write the audit log to ca-drop/logs/, and delete the staging pages
  *
- * Nothing intermediate is stored. Every step that needs rows reads the
- * archive from R2 and parses the slice it needs: the archive has to be kept
- * anyway (it is the only source the identifier set could be rebuilt from),
- * so a second parsed copy would be the same data twice. The cost is
- * re-inflating the ZIP per step, which is cheap next to the R2 round trip.
+ * Every later step reads one staged page, so the archive is inflated once
+ * per run rather than once per page.
  *
  * KV shape: the key is the hash exactly as DROP publishes it (Base64), with
  * no prefix, so the real-time gate is a single kv.get(hash). What the hash
@@ -36,6 +34,8 @@ import type { ListType } from "./zip";
  */
 
 type Params = {
+	/** fetch the ZIP from the DROP API first */
+	download?: boolean;
 	/** the ZIP to ingest; defaults to the newest object under ca-drop/raw/ */
 	r2Key?: string;
 	/** wipe KV before loading. Default false — see the note where it is read. */
@@ -84,6 +84,58 @@ export function planKvRemovals(
 }
 
 const RAW_PREFIX = "ca-drop/raw/";
+const STAGING_PREFIX = "ca-drop/staging/";
+const R2_CONCURRENCY = 20;
+
+export type DownloadOutcome =
+	| { kind: "zip"; bytes: ArrayBuffer }
+	| { kind: "no-data"; message: string }
+	| { kind: "refused"; message: string };
+
+function isZip(bytes: ArrayBuffer): boolean {
+	if (bytes.byteLength < 4) return false;
+	const sig = new DataView(bytes).getUint32(0, true);
+	return sig === 0x04034b50 || sig === 0x06054b50;
+}
+
+export async function readDownload(res: Response): Promise<DownloadOutcome> {
+	if (res.status === 202) throw new Error("DROP download 202 — the ZIP is being prepared, retrying");
+	if (res.status === 429 || res.status >= 500) throw new Error(`DROP download ${res.status} — retrying`);
+	if (res.status !== 200) {
+		const text = await res.text();
+		return { kind: "refused", message: `DROP download ${res.status}: ${text.slice(0, 300)}` };
+	}
+
+	const bytes = await res.arrayBuffer();
+	if (isZip(bytes)) return { kind: "zip", bytes };
+
+	const text = new TextDecoder().decode(bytes);
+	let body: unknown;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		return { kind: "refused", message: `DROP download 200 is neither a ZIP nor JSON: ${text.slice(0, 100)}` };
+	}
+	const message =
+		typeof body === "object" && body !== null && typeof (body as { message?: unknown }).message === "string"
+			? (body as { message: string }).message
+			: text.slice(0, 300);
+	return { kind: "no-data", message };
+}
+
+function stagedPage(runId: string, listType: ListType, page: number): string {
+	return `${STAGING_PREFIX}${runId}/${listType}/${page}.json`;
+}
+
+function stagedRemovals(runId: string): string {
+	return `${STAGING_PREFIX}${runId}/removed.json`;
+}
+
+async function inBatches<T>(items: T[], size: number, f: (item: T) => Promise<unknown>): Promise<void> {
+	for (let i = 0; i < items.length; i += size) {
+		await Promise.all(items.slice(i, i + size).map(f));
+	}
+}
 
 export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
@@ -104,41 +156,64 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 
 		try {
 			// -----------------------------------------------------------
-			// ① download from the DROP API — enable once the account exists.
-			//
-			// const zipKey = await tracedStep("download list", async () => {
-			//   const res = await fetch("https://api.drop.privacy.ca.gov/data/download", {
-			//     headers: { "X-API-KEY": this.env.DROP_API_KEY },
-			//   });
-			//   if (res.status === 202) throw new Error("202 — not ready yet, retry");
-			//   if (res.status === 429) throw new Error("429 — rate limited, retry");
-			//   if (!res.ok) {
-			//     await writeAuditLog(this.env, {
-			//       event: "download", run_id: runId, outcome: "failed",
-			//       fields: { source: "drop-api", http_status: res.status },
-			//       error: `DROP download ${res.status}`,
-			//     });
-			//     throw new Error(`DROP download ${res.status}`);
-			//   }
-			//   // Archive the bytes unopened, before anything parses them: this
-			//   // archive is the only source the set could ever be rebuilt from.
-			//   const key = `${RAW_PREFIX}${new Date().toISOString().slice(0, 10)}_${runId}.zip`;
-			//   const put = await this.env.r2.put(key, res.body);
-			//   await writeAuditLog(this.env, {
-			//     event: "download", run_id: runId, outcome: "ok",
-			//     fields: {
-			//       source: "drop-api", http_status: res.status,
-			//       zip: key, bytes: put?.size ?? "",
-			//     },
-			//   });
-			//   return key;
-			// });
+			// ① download from the DROP API
 			// -----------------------------------------------------------
+			let downloadedKey: string | null = null;
+			if (event.payload?.download) {
+				const downloaded = await tracedStep(
+					"download list",
+					{ timeout: "10 minutes", retries: { limit: 10, delay: "30 seconds", backoff: "constant" } },
+					async () => {
+						if (!this.env.DROP_API_KEY) {
+							return { key: null, message: "", refused: "download requested but DROP_API_KEY is not set" };
+						}
+						const res = await fetch(`${DROP_API_URL}/data/download`, {
+							headers: {
+								"X-API-KEY": this.env.DROP_API_KEY,
+								Accept: "application/zip, application/json",
+							},
+						});
+						const outcome = await readDownload(res);
+						if (outcome.kind === "refused") return { key: null, message: "", refused: outcome.message };
+						if (outcome.kind === "no-data") {
+							await writeAuditLog(this.env, {
+								event: "download",
+								run_id: runId,
+								outcome: "ok",
+								fields: { source: "drop-api", http_status: res.status, result: "no data", message: outcome.message },
+							});
+							return { key: null, message: outcome.message, refused: "" };
+						}
+						// Archive the bytes unopened, before anything parses them: this
+						// archive is the only source the set could ever be rebuilt from.
+						const key = `${RAW_PREFIX}${new Date().toISOString().slice(0, 10)}_${runId}.zip`;
+						const put = await this.env.r2.put(key, outcome.bytes);
+						await writeAuditLog(this.env, {
+							event: "download",
+							run_id: runId,
+							outcome: "ok",
+							fields: { source: "drop-api", http_status: res.status, zip: key, bytes: put?.size ?? "" },
+						});
+						return { key, message: "", refused: "" };
+					},
+				);
+				if (downloaded.refused) throw new Error(downloaded.refused);
+				if (downloaded.key === null) {
+					const summary = { runId, noData: 1, message: downloaded.message };
+					await logRun(this.env, ctx, "completed", {
+						result: summary,
+						duration_ms: Date.now() - startedAt,
+					});
+					return summary;
+				}
+				downloadedKey = downloaded.key;
+			}
 
 			// -----------------------------------------------------------
-			// ② the archive — for now, whatever was put there by hand
+			// ② the archive
 			// -----------------------------------------------------------
 			const zipKey = await tracedStep("locate ZIP in R2", async () => {
+				if (downloadedKey) return downloadedKey;
 				if (event.payload?.r2Key) return event.payload.r2Key;
 				const listed = await this.env.r2.list({ prefix: RAW_PREFIX });
 				const zips = listed.objects.filter((o) => o.key.toLowerCase().endsWith(".zip"));
@@ -150,17 +225,29 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			});
 
 			// -----------------------------------------------------------
-			// ③ how much there is. Counts only — a step's return value is
-			//    persisted and size-capped, so rows never travel between steps.
+			// ③ stage: the only step that inflates the archive. Counts come
+			//    back; rows go to R2, because a step's return value is
+			//    persisted and size-capped.
 			// -----------------------------------------------------------
 			const counts = await tracedStep(
-				"count rows per list",
-				{ timeout: "5 minutes" },
+				"stage archive",
+				{ timeout: "15 minutes" },
 				async () => {
 					const { lists, removed, files } = await this.readArchive(zipKey);
-					const out: Record<string, number> = { removed: removed.length };
-					for (const l of LISTS) out[l] = lists[l]?.length ?? 0;
-					out.files = files.length;
+					const out: Record<string, number> = { removed: removed.length, files: files.length };
+					const puts: { key: string; body: string }[] = [];
+					for (const l of LISTS) {
+						const rows = lists[l] ?? [];
+						out[l] = rows.length;
+						for (let page = 1; (page - 1) * pageSize < rows.length; page++) {
+							puts.push({
+								key: stagedPage(runId, l, page),
+								body: JSON.stringify(rows.slice((page - 1) * pageSize, page * pageSize)),
+							});
+						}
+					}
+					puts.push({ key: stagedRemovals(runId), body: JSON.stringify(removed) });
+					await inBatches(puts, R2_CONCURRENCY, (p) => this.env.r2.put(p.key, p.body));
 					return out;
 				},
 			);
@@ -214,7 +301,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 						`load KV · ${listType} · page ${page}`,
 						{ timeout: "5 minutes" },
 						async () => {
-							const rows = await this.page(zipKey, listType, page, pageSize);
+							const rows = await this.staged<Row>(stagedPage(runId, listType, page));
 							for (const r of rows) {
 								await this.env.kv.put(r.hash, r.id, {
 									metadata: {
@@ -244,7 +331,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 						`save Supabase · ${listType} · page ${page}`,
 						{ timeout: "5 minutes", retries: { limit: 3, delay: "10 seconds", backoff: "linear" } },
 						async () => {
-							const rows = await this.page(zipKey, listType, page, pageSize);
+							const rows = await this.staged<Row>(stagedPage(runId, listType, page));
 							return upsertWorkItems(
 								this.env,
 								rows.map((r) => ({
@@ -282,8 +369,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 			let keptForOthers = 0;
 			if ((counts.removed ?? 0) > 0) {
 				const applied = await tracedStep("apply removals", async () => {
-					const { removed: rows } = await this.readArchive(zipKey);
-					const removals = rows as RemovedRow[];
+					const removals = await this.staged<RemovedRow>(stagedRemovals(runId));
 
 					const marked = await markWorkItemsRevoked(
 						this.env,
@@ -344,6 +430,8 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 				}),
 			);
 
+			await tracedStep("delete staging", async () => this.deleteStaging(runId));
+
 			const summary = {
 				runId,
 				zipKey,
@@ -375,6 +463,11 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 				});
 			} catch {
 				// the audit log must not replace the original failure
+			}
+			try {
+				await this.deleteStaging(runId);
+			} catch {
+				// nor must cleaning up
 			}
 			await logRun(this.env, ctx, "failed", { error, duration_ms: Date.now() - startedAt });
 			throw e;
@@ -425,14 +518,23 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 		return { lists, removed, files };
 	}
 
-	private async page(
-		zipKey: string,
-		listType: ListType,
-		page: number,
-		pageSize: number,
-	): Promise<Row[]> {
-		const { lists } = await this.readArchive(zipKey);
-		const rows = lists[listType] ?? [];
-		return rows.slice((page - 1) * pageSize, page * pageSize);
+	private async staged<T>(key: string): Promise<T[]> {
+		const obj = await this.env.r2.get(key);
+		if (!obj) throw new Error(`${key} is missing — the archive was not staged by this run`);
+		return (await obj.json()) as T[];
+	}
+
+	private async deleteStaging(runId: string): Promise<number> {
+		const prefix = `${STAGING_PREFIX}${runId}/`;
+		let deleted = 0;
+		let cursor: string | undefined;
+		for (;;) {
+			const listed = await this.env.r2.list({ prefix, cursor, limit: 1000 });
+			const keys = listed.objects.map((o) => o.key);
+			if (keys.length > 0) await this.env.r2.delete(keys);
+			deleted += keys.length;
+			if (!listed.truncated) return deleted;
+			cursor = listed.cursor;
+		}
 	}
 }

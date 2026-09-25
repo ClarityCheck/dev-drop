@@ -113,9 +113,13 @@ ORDER BY (list_type, hash);
 --
 -- v5 reads dates of birth in more formats (epoch ms, M/D/YYYY, "Month D,
 -- YYYY") and splits personalInfo.fullName into first and last candidates.
--- Same columns and grain as v4.
 --
--- ─── ON A SERVICE THAT ALREADY CARRIES v3 OR v4 ──────────────────────
+-- v6 derives composites from name PAIRS, first and last from one record,
+-- instead of every first name times every last name, and caps nothing. It
+-- decomposes only Latin letters, so Hangul, kana, Arabic and Hebrew stay
+-- as they are. Same columns and grain as v4.
+--
+-- ─── ON A SERVICE THAT ALREADY CARRIES v3, v4 OR v5 ──────────────────────
 --
 -- DEV carries v3. v4 changed the grain, so ALTER TABLE ... MODIFY QUERY
 -- cannot get there. Run, as admin:
@@ -161,9 +165,10 @@ ORDER BY (type, normalized_value, provider, service, created_at, element_digest)
 DEFINER = `sql-console:access@claritycheck.com`
 SQL SECURITY DEFINER
 AS
--- ── L5 ── drop the composites if the REPORT is past the cut.
---          `oversized_records` means "composites dropped", which with the
---          caps in place is the only way they can be missing.
+-- ── L5 ── the cross product, over the name PAIRS. A report past the cut
+--          maps over an empty array, so its composites are never computed
+--          rather than computed and thrown away; `oversized_records` marks
+--          it, and Cron C reports it instead of treating it as clean.
 SELECT
     type,
     normalized_value,
@@ -175,55 +180,31 @@ SELECT
     record_count,
     toUInt64(report_width > 20000)             AS oversized_records,
     last_seen_at,
-    'v5'                                       AS spec_version,
+    'v6'                                       AS spec_version,
     email_keys,
     phone_keys,
-    if(report_width > 20000, [], ndz_keys)     AS ndz_keys,
-    if(report_width > 20000, [], namevin_keys) AS namevin_keys
+    arrayDistinct(arrayFlatten(arrayMap(n ->
+        arrayFlatten(arrayMap(d ->
+            arrayMap(z -> base64Encode(SHA256(concat(n, d, z))), zh),
+        dh)),
+    if(report_width > 20000, [], nh))))        AS ndz_keys,
+    arrayDistinct(arrayFlatten(arrayMap(n ->
+        arrayMap(v -> base64Encode(SHA256(concat(n, v))), vh),
+    if(report_width > 20000, [], nh))))        AS namevin_keys
 FROM
 (
-    -- ── L4 ── the cross product, and the total the cut applies to.
-    --
-    --          The window is what keeps the cut a REPORT-level decision now
-    --          that a people report is many rows. For phone and e-mail the
+    -- ── L4 ── the total the cut applies to. For phone and e-mail the
     --          partition is this one row; for people it sums every element,
-    --          which is the same arithmetic as the Worker's
-    --          groups.reduce(countReportKeys). Composites are then dropped
-    --          for the whole report or for none of it, never per element.
+    --          the same arithmetic as the Worker's groups.reduce(countReportKeys).
     SELECT
-        type,
-        normalized_value,
-        provider,
-        service,
-        created_at,
-        element_digest,
-        source_rows,
-        record_count,
-        last_seen_at,
-        email_keys,
-        phone_keys,
-
+        *,
         sum(width + length(email_keys) + length(phone_keys))
-            OVER (PARTITION BY type, normalized_value) AS report_width,
-
-        arrayDistinct(arrayFlatten(arrayMap(f ->
-            arrayFlatten(arrayMap(l ->
-                arrayFlatten(arrayMap(d ->
-                    arrayMap(z -> base64Encode(SHA256(concat(f, l, d, z))), zh),
-                dh)),
-            lh)),
-        fh))) AS ndz_keys,
-
-        arrayDistinct(arrayFlatten(arrayMap(f ->
-            arrayFlatten(arrayMap(l ->
-                arrayMap(v -> base64Encode(SHA256(concat(f, l, v))), vh),
-            lh)),
-        fh))) AS namevin_keys
+            OVER (PARTITION BY type, normalized_value) AS report_width
     FROM
     (
-        -- ── L3 ── cap the GROUP's values, then hash them. Sorted and sliced
-        --          on the normalized values and before hashing, so the
-        --          subset kept does not depend on array order.
+        -- ── L3 ── hash the group's values. Nothing is capped: a name pair is
+        --          first and last from ONE record, which is what keeps the
+        --          product small enough to derive whole.
         SELECT
             type,
             normalized_value,
@@ -237,19 +218,12 @@ FROM
             email_keys,
             phone_keys,
 
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_firsts), 1, 10)) AS fh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_lasts),  1, 10)) AS lh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_dobs),   1, 5))  AS dh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_zips),   1, 24)) AS zh,
-            arrayMap(x -> base64Encode(SHA256(x)), arraySlice(arraySort(all_vins),   1, 12)) AS vh,
+            arrayMap(p -> concat(base64Encode(SHA256(p.1)), base64Encode(SHA256(p.2))), all_pairs) AS nh,
+            arrayMap(x -> base64Encode(SHA256(x)), all_dobs) AS dh,
+            arrayMap(x -> base64Encode(SHA256(x)), all_zips) AS zh,
+            arrayMap(x -> base64Encode(SHA256(x)), all_vins) AS vh,
 
-            (toFloat64(length(arraySlice(all_firsts, 1, 10)))
-                * length(arraySlice(all_lasts, 1, 10))
-                * length(arraySlice(all_dobs,  1, 5))
-                * length(arraySlice(all_zips,  1, 24)))
-            + (toFloat64(length(arraySlice(all_firsts, 1, 10)))
-                * length(arraySlice(all_lasts, 1, 10))
-                * length(arraySlice(all_vins,  1, 12)))                                      AS width
+            toFloat64(length(all_pairs)) * (length(all_dobs) * length(all_zips) + length(all_vins)) AS width
         FROM
         (
             -- ── L2 ── THE GROUP BY IS THE RULE.
@@ -261,9 +235,6 @@ FROM
             --          from Pipl and forms the ndz key that a per-provider
             --          grouping would never derive.
             --
-            --          Capping happens after this, never before: taking each
-            --          provider's own first ten names and merging those is
-            --          not the ten the Worker picks.
             SELECT
                 type,
                 normalized_value,
@@ -295,8 +266,7 @@ FROM
                              arrayDistinct(arrayFlatten(groupArray(phones))))
                 )) AS phone_keys,
 
-                arrayDistinct(arrayFlatten(groupArray(firsts))) AS all_firsts,
-                arrayDistinct(arrayFlatten(groupArray(lasts)))  AS all_lasts,
+                arrayDistinct(arrayFlatten(groupArray(name_pairs))) AS all_pairs,
                 arrayDistinct(arrayFlatten(groupArray(dobs)))   AS all_dobs,
                 arrayDistinct(arrayFlatten(groupArray(zips)))   AS all_zips,
                 arrayDistinct(arrayFlatten(groupArray(vins)))   AS all_vins
@@ -358,23 +328,28 @@ FROM
                             if(JSONType(r, 'personalInfo', 'fullNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'fullNames'), [JSONExtractRaw(r, 'personalInfo', 'fullNames')])
                         )))) AS full_name_parts,
 
-                    arrayDistinct(arrayFilter(x -> x != '',
-                        arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
-                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                if(JSONType(r, 'personalInfo', 'firstName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstName'), [JSONExtractRaw(r, 'personalInfo', 'firstName')]),
-                                if(JSONType(r, 'personalInfo', 'firstNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstNames'), [JSONExtractRaw(r, 'personalInfo', 'firstNames')]),
-                                arrayMap(o -> JSONExtractRaw(o, 'first'), JSONExtractArrayRaw(r, 'names')),
-                                arrayFlatten(arrayMap(p -> if(length(p.1) > 0, [p.1[1], arrayStringConcat(p.1, ' ')], []), full_name_parts))
-                            )))))) AS firsts,
+                    -- namePairs in worker/drop-report.ts: first and last
+                    -- from the same record. personalInfo's lists pair by
+                    -- index when their lengths agree and cross otherwise;
+                    -- each fullName and each names[] entry is its own pair.
+                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                        if(JSONType(r, 'personalInfo', 'firstName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstName'), [JSONExtractRaw(r, 'personalInfo', 'firstName')]),
+                        if(JSONType(r, 'personalInfo', 'firstNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'firstNames'), [JSONExtractRaw(r, 'personalInfo', 'firstNames')])
+                    ))) AS info_firsts,
+                    arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
+                        if(JSONType(r, 'personalInfo', 'lastName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastName'), [JSONExtractRaw(r, 'personalInfo', 'lastName')]),
+                        if(JSONType(r, 'personalInfo', 'lastNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastNames'), [JSONExtractRaw(r, 'personalInfo', 'lastNames')])
+                    ))) AS info_lasts,
 
-                    arrayDistinct(arrayFilter(x -> x != '',
-                        arrayMap(x -> replaceRegexpAll(normalizeUTF8NFD(arrayStringConcat(arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(x), '.')), '')), strip_re, ''),
-                            arrayFilter(x -> (x != '') AND (x != 'null'), arrayMap(x -> trim(BOTH '"' FROM x), arrayConcat(
-                                if(JSONType(r, 'personalInfo', 'lastName') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastName'), [JSONExtractRaw(r, 'personalInfo', 'lastName')]),
-                                if(JSONType(r, 'personalInfo', 'lastNames') = 'Array', JSONExtractArrayRaw(r, 'personalInfo', 'lastNames'), [JSONExtractRaw(r, 'personalInfo', 'lastNames')]),
-                                arrayMap(o -> JSONExtractRaw(o, 'last'), JSONExtractArrayRaw(r, 'names')),
-                                arrayFlatten(arrayMap(p -> if(length(p.1) > 0, [p.2], []), full_name_parts))
-                            )))))) AS lasts,
+                    arrayDistinct(arrayFilter(p -> (p.1 != '') AND (p.2 != ''),
+                        arrayMap(p -> (replaceRegexpAll(arrayStringConcat(arrayMap(c -> if(match(c, '\\p{Latin}'), normalizeUTF8NFD(c), c), arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(normalizeUTF8NFC(p.1)), '.'))), ''), strip_re, ''), replaceRegexpAll(arrayStringConcat(arrayMap(c -> if(match(c, '\\p{Latin}'), normalizeUTF8NFD(c), c), arrayMap(c -> transform(c, tr_src, tr_dst, c), extractAll(lowerUTF8(normalizeUTF8NFC(p.2)), '.'))), ''), strip_re, '')),
+                            arrayFilter(p -> (p.1 NOT IN ('', 'null')) AND (p.2 NOT IN ('', 'null')), arrayConcat(
+                                if(length(info_firsts) = length(info_lasts),
+                                   arrayZip(info_firsts, info_lasts),
+                                   arrayFlatten(arrayMap(f -> arrayMap(l -> (f, l), info_lasts), info_firsts))),
+                                arrayFlatten(arrayMap(p -> if(length(p.1) > 0, [(p.1[1], p.2), (arrayStringConcat(p.1, ' '), p.2)], []), full_name_parts)),
+                                arrayMap(o -> (trim(BOTH '"' FROM JSONExtractRaw(o, 'first')), trim(BOTH '"' FROM JSONExtractRaw(o, 'last'))), JSONExtractArrayRaw(r, 'names'))
+                            ))))) AS name_pairs,
 
                     -- normalizeDob in worker/drop-report.ts: epoch ms, year
                     -- first, M/D/YYYY (month first unless the first number is
@@ -618,7 +593,7 @@ SELECT access_type, database, table
 FROM system.grants
 WHERE user_name = 'drop_workflow';
 
--- Expect spec_version v5 on every row once the view has been refreshed.
+-- Expect spec_version v6 on every row once the view has been refreshed.
 -- It is empty until then; REFRESH is the next step.
 SELECT spec_version, count() AS rows
 FROM default.ca_drop_combined_search_result

@@ -57,12 +57,15 @@ const TRANSLITERATION: Record<string, string> = { ...GREEK, ...CYRILLIC, ...SPEC
 const NON_NAME_CHARACTERS =
 	/[^a-z0-9\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Arabic}\p{Script=Hebrew}]/gu;
 
+const LATIN = /\p{Script=Latin}/u;
+
 export function normalizeName(raw: string): string {
-	let transliterated = "";
-	for (const character of raw.toLowerCase()) {
-		transliterated += TRANSLITERATION[character] ?? character;
+	let out = "";
+	for (const character of raw.normalize("NFC").toLowerCase()) {
+		const mapped = TRANSLITERATION[character] ?? character;
+		out += LATIN.test(mapped) ? mapped.normalize("NFD") : mapped;
 	}
-	return transliterated.normalize("NFD").replace(NON_NAME_CHARACTERS, "");
+	return out.replace(NON_NAME_CHARACTERS, "");
 }
 
 const MONTH_NAMES = [
@@ -187,11 +190,12 @@ export function normalizeVin(raw: string): string {
 	return raw.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+export type NamePair = readonly [first: string, last: string];
+
 export type ReportFields = {
 	emails: string[];
 	phones: string[];
-	firstNames: string[];
-	lastNames: string[];
+	names: NamePair[];
 	dobs: string[];
 	zips: string[];
 	vins: string[];
@@ -242,12 +246,48 @@ function distinct(values: string[], normalize: (value: string) => string): strin
 export const NO_FIELDS: ReportFields = {
 	emails: [],
 	phones: [],
-	firstNames: [],
-	lastNames: [],
+	names: [],
 	dobs: [],
 	zips: [],
 	vins: [],
 };
+
+function distinctPairs(pairs: NamePair[]): NamePair[] {
+	const out = new Map<string, NamePair>();
+	for (const [first, last] of pairs) {
+		if (first !== "" && last !== "") out.set(`${first}\u0000${last}`, [first, last]);
+	}
+	return [...out.values()];
+}
+
+function crossPairs(firsts: string[], lasts: string[]): NamePair[] {
+	return firsts.flatMap((first) => lasts.map((last): NamePair => [first, last]));
+}
+
+function nonEmpty(values: string[]): string[] {
+	return values.filter((value) => value !== "" && value !== "null");
+}
+
+function namePairs(personalInfo: JsonRecord[], names: JsonRecord[]): NamePair[] {
+	const raw: NamePair[] = [];
+	for (const info of personalInfo) {
+		const firsts = nonEmpty(fields([info], "firstName", "firstNames"));
+		const lasts = nonEmpty(fields([info], "lastName", "lastNames"));
+		if (firsts.length === lasts.length) {
+			firsts.forEach((first, i) => raw.push([first, lasts[i]]));
+		} else {
+			raw.push(...crossPairs(firsts, lasts));
+		}
+		for (const full of nonEmpty(fields([info], "fullName", "fullNames"))) {
+			const parts = fullNameParts(full);
+			raw.push(...crossPairs(parts.firsts, parts.lasts));
+		}
+	}
+	for (const entry of names) {
+		raw.push(...crossPairs(nonEmpty(fields([entry], "first")), nonEmpty(fields([entry], "last"))));
+	}
+	return distinctPairs(raw.map(([first, last]) => [normalizeName(first), normalizeName(last)]));
+}
 
 export type ReportRecord = { index: number; id?: string; fields: ReportFields };
 
@@ -256,7 +296,6 @@ function personFields(person: JsonRecord): ReportFields {
 	const contactInfo = records(person.contactInfo);
 	const names = records(person.names);
 	const addresses = [...nested(contactInfo, "fullAddresses"), ...records(person.addresses)];
-	const fromFullNames = fields(personalInfo, "fullName", "fullNames").map(fullNameParts);
 
 	return {
 		emails: distinct(
@@ -267,22 +306,7 @@ function personFields(person: JsonRecord): ReportFields {
 			[...fields(contactInfo, "phone", "phones"), ...fields(records(person.phones), "number")],
 			normalizePhone,
 		),
-		firstNames: distinct(
-			[
-				...fields(personalInfo, "firstName", "firstNames"),
-				...fields(names, "first"),
-				...fromFullNames.flatMap((p) => p.firsts),
-			],
-			normalizeName,
-		),
-		lastNames: distinct(
-			[
-				...fields(personalInfo, "lastName", "lastNames"),
-				...fields(names, "last"),
-				...fromFullNames.flatMap((p) => p.lasts),
-			],
-			normalizeName,
-		),
+		names: namePairs(personalInfo, names),
 		dobs: distinct(
 			[
 				...fields(personalInfo, "birthDate", "birthDates"),
@@ -313,13 +337,16 @@ export function subjectFields(type: ReportType, value: string | undefined): Repo
 	return NO_FIELDS;
 }
 
-const FIELD_NAMES = Object.keys(NO_FIELDS) as (keyof ReportFields)[];
+const FIELD_NAMES = (Object.keys(NO_FIELDS) as (keyof ReportFields)[]).filter(
+	(field): field is Exclude<keyof ReportFields, "names"> => field !== "names",
+);
 
 export function mergeReportFields(groups: ReportFields[]): ReportFields {
 	const merged = { ...NO_FIELDS };
 	for (const field of FIELD_NAMES) {
 		merged[field] = [...new Set(groups.flatMap((group) => group[field]))];
 	}
+	merged.names = distinctPairs(groups.flatMap((group) => group.names));
 	return merged;
 }
 
@@ -367,12 +394,11 @@ export function reportKeyGroups(
 }
 
 export function countReportKeys(report: ReportFields): number {
-	const nameCombinations = report.firstNames.length * report.lastNames.length;
 	return (
 		report.emails.length +
 		report.phones.length +
-		nameCombinations * report.dobs.length * report.zips.length +
-		nameCombinations * report.vins.length
+		report.names.length * report.dobs.length * report.zips.length +
+		report.names.length * report.vins.length
 	);
 }
 
@@ -388,11 +414,12 @@ export async function buildReportKeys(
 		return computed;
 	};
 
-	const [email, phone, firsts, lasts, births, zips, vins] = await Promise.all([
+	const [email, phone, names, births, zips, vins] = await Promise.all([
 		Promise.all(report.emails.map(digest)),
 		Promise.all(report.phones.map(digest)),
-		Promise.all(report.firstNames.map(digest)),
-		Promise.all(report.lastNames.map(digest)),
+		Promise.all(
+			report.names.map(async ([first, last]) => (await digest(first)) + (await digest(last))),
+		),
 		Promise.all(report.dobs.map(digest)),
 		Promise.all(report.zips.map(digest)),
 		Promise.all(report.vins.map(digest)),
@@ -400,13 +427,11 @@ export async function buildReportKeys(
 
 	const ndzInputs = new Set<string>();
 	const namevinInputs = new Set<string>();
-	for (const first of firsts) {
-		for (const last of lasts) {
-			for (const birth of births) {
-				for (const zip of zips) ndzInputs.add(first + last + birth + zip);
-			}
-			for (const vin of vins) namevinInputs.add(first + last + vin);
+	for (const name of names) {
+		for (const birth of births) {
+			for (const zip of zips) ndzInputs.add(name + birth + zip);
 		}
+		for (const vin of vins) namevinInputs.add(name + vin);
 	}
 
 	const [ndz, namevin] = await Promise.all([

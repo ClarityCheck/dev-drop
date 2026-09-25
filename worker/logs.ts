@@ -426,6 +426,21 @@ export async function logRun(
  * who asked to be deleted — and warn when it is long, which only means stale
  * entries suppressing someone who should have got a result.
  */
+export async function logUncheckedReports(env: Env, ctx: Context, reports: number): Promise<void> {
+	await ship(env, {
+		...ctx,
+		dt: new Date().toISOString(),
+		level: "error",
+		message:
+			`${reports} stored report(s) yield more than 20,000 DROP keys, so their NDZ and NameVIN ` +
+			"keys were not derived and a listed consumer in them cannot be found. Cron B will not " +
+			"report Not found while this is non-zero.",
+		step: "count unchecked reports",
+		phase: "match",
+		result: { unchecked_reports: reports },
+	});
+}
+
 export async function logKvDrift(
 	env: Env,
 	ctx: Context,

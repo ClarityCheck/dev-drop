@@ -9,6 +9,7 @@ import {
 	countReportKeys,
 	extractReportRecords,
 	lookupDropKeys,
+	mergeReportFields,
 	normalizeDob,
 	normalizeName,
 	normalizeVin,
@@ -43,9 +44,9 @@ const CLICKHOUSE_NAME_VECTORS: { raw: string; normalized: string; hash: string }
 	{ raw: "田中", normalized: "田中", hash: "GAZJa8t1PCgPk0u94hpBrVeTAYcmaBwDjanPyKjIKiA=" },
 	{ raw: "キムラ", normalized: "キムラ", hash: "8Qqz5cJl/Y2fQSPJcnsaFOYdS92Q456G5TFQ2h0Sh40=" },
 	{
-		raw: "김",
-		normalized: "김",
-		hash: "LiYobxObm0pDeis43MPt2cPTgEshVWpyJuVFVveod8A=",
+		raw: "\uAE40",
+		normalized: "\uAE40",
+		hash: "oNXyQapvtUTl0mQx4vQKMQ8PwmCAMFMDjlxgEt2qbOY=",
 	},
 	{ raw: "محمد", normalized: "محمد", hash: "DLTJshBi3k0sDt1I78n6hrl/3IpqTn+nCSVE+E4SH2E=" },
 	{ raw: "שלום", normalized: "שלום", hash: "t6wDmO90GTq3OLId8JEjKTA98Q2GjCusN6hKWdEsDi8=" },
@@ -111,14 +112,14 @@ const CLICKHOUSE_DOB_VECTORS: [string, string][] = [
 ];
 
 // fullName -> first and last candidates, normalized; outputs taken from the view
-const CLICKHOUSE_FULL_NAME_VECTORS: { fullName: string; firsts: string[]; lasts: string[] }[] = [
-	{ fullName: "Anna Maria Smith", firsts: ["anna", "annamaria"], lasts: ["smith"] },
-	{ fullName: "Smith, José Luis", firsts: ["jose", "joseluis"], lasts: ["smith"] },
-	{ fullName: "John O'Neil Jr.", firsts: ["john"], lasts: ["oneil"] },
-	{ fullName: "Mary-Jane Watson", firsts: ["maryjane"], lasts: ["watson"] },
-	{ fullName: "Ωmega Test", firsts: ["omega"], lasts: ["test"] },
-	{ fullName: " Björn Ålund ", firsts: ["bjorn"], lasts: ["alund"] },
-	{ fullName: "Cher", firsts: [], lasts: [] },
+const CLICKHOUSE_FULL_NAME_VECTORS: { fullName: string; names: [string, string][] }[] = [
+	{ fullName: "Anna Maria Smith", names: [["anna", "smith"], ["annamaria", "smith"]] },
+	{ fullName: "Smith, José Luis", names: [["jose", "smith"], ["joseluis", "smith"]] },
+	{ fullName: "John O'Neil Jr.", names: [["john", "oneil"]] },
+	{ fullName: "Mary-Jane Watson", names: [["maryjane", "watson"]] },
+	{ fullName: "Ωmega Test", names: [["omega", "test"]] },
+	{ fullName: " Björn Ålund ", names: [["bjorn", "alund"]] },
+	{ fullName: "Cher", names: [] },
 ];
 
 const CLICKHOUSE_ZIP_VECTORS: [string, string][] = [
@@ -283,8 +284,7 @@ describe("published DROP specification examples", () => {
 		const keys = await buildReportKeys({
 			emails: [],
 			phones: [],
-			firstNames: [normalizeName("Danielle")],
-			lastNames: [normalizeName("Johnson")],
+			names: [[normalizeName("Danielle"), normalizeName("Johnson")]],
 			dobs: [normalizeDob("1985-07-04")],
 			zips: [normalizeZip("91790")],
 			vins: [],
@@ -296,8 +296,7 @@ describe("published DROP specification examples", () => {
 		const keys = await buildReportKeys({
 			emails: [],
 			phones: [],
-			firstNames: [normalizeName("Eve")],
-			lastNames: [normalizeName("Genesis")],
+			names: [[normalizeName("Eve"), normalizeName("Genesis")]],
 			dobs: [],
 			zips: [],
 			vins: [normalizeVin("1HGCM82633A004352")],
@@ -313,6 +312,68 @@ describe("published DROP specification examples", () => {
 	});
 });
 
+function sortedPairs(pairs: readonly (readonly [string, string])[]): [string, string][] {
+	return pairs.map(([f, l]): [string, string] => [f, l]).sort((a, b) =>
+		`${a[0]} ${a[1]}`.localeCompare(`${b[0]} ${b[1]}`),
+	);
+}
+
+describe("name pairs", () => {
+	it("pairs every first name in the list with the last name at its index", () => {
+		const [record] = extractReportRecords([
+			{
+				personalInfo: {
+					firstNames: ["Anna", "Bella", "Carla", "Dora", "Emma", "Fiona", "Gina", "Hana", "Iris", "Jana", "Zoe"],
+					lastNames: ["Smith", "Jones", "Brown", "Lee", "King", "Hill", "Ward", "Cole", "Reed", "Hart", "Quinn"],
+				},
+			},
+		]);
+		expect(record.fields.names).toHaveLength(11);
+		expect(record.fields.names).toContainEqual(["zoe", "quinn"]);
+		expect(record.fields.names).not.toContainEqual(["zoe", "smith"]);
+	});
+
+	it("crosses lists that cannot be aligned, so no real pairing is lost", () => {
+		const [record] = extractReportRecords([
+			{ personalInfo: { firstNames: ["Anna", "Ann", "Annie"], lastNames: ["Smith", "Smyth"] } },
+		]);
+		expect(record.fields.names).toHaveLength(6);
+	});
+
+	it("keeps each names[] entry and each fullName as its own pair", () => {
+		const [record] = extractReportRecords([
+			{
+				names: [
+					{ first: "Anna", last: "Smith" },
+					{ first: "Zoe", last: "Quinn" },
+				],
+				personalInfo: { fullNames: ["Mia Lopez"] },
+			},
+		]);
+		expect(sortedPairs(record.fields.names)).toEqual([
+			["anna", "smith"],
+			["mia", "lopez"],
+			["zoe", "quinn"],
+		]);
+	});
+
+	it("drops a pair with a missing half", () => {
+		const [record] = extractReportRecords([{ names: [{ first: "Anna" }, { first: "Zoe", last: "null" }] }]);
+		expect(record.fields.names).toEqual([]);
+	});
+
+	it("merges providers' pairs without inventing new ones", () => {
+		const merged = mergeReportFields([
+			{ ...NO_FIELDS, names: [["anna", "smith"]] },
+			{ ...NO_FIELDS, names: [["zoe", "quinn"], ["anna", "smith"]] },
+		]);
+		expect(sortedPairs(merged.names)).toEqual([
+			["anna", "smith"],
+			["zoe", "quinn"],
+		]);
+	});
+});
+
 describe("name normalization matches ca_drop_combined_search_result", () => {
 	for (const vector of CLICKHOUSE_NAME_VECTORS) {
 		it(`${JSON.stringify(vector.raw)} -> ${JSON.stringify(vector.normalized)}`, async () => {
@@ -324,14 +385,21 @@ describe("name normalization matches ca_drop_combined_search_result", () => {
 	it("keeps the last character of a name whose lowercasing grows it", () => {
 		expect(normalizeName("İzmir")).toBe("izmir");
 	});
+
+	it("leaves Korean, Japanese, Arabic and Hebrew letters as they are", () => {
+		expect([...normalizeName("김민준")]).toHaveLength(3);
+		expect(normalizeName("김민준")).toBe("김민준".normalize("NFC"));
+		expect(normalizeName("やまだ")).toBe("やまだ");
+		expect(normalizeName("やまだ".normalize("NFD"))).toBe("やまだ");
+		expect(normalizeName("José".normalize("NFD"))).toBe("jose");
+	});
 });
 
 describe("fullName splitting matches ca_drop_combined_search_result", () => {
 	for (const vector of CLICKHOUSE_FULL_NAME_VECTORS) {
 		it(`${JSON.stringify(vector.fullName)}`, () => {
 			const [record] = extractReportRecords([{ personalInfo: { fullName: vector.fullName } }]);
-			expect([...record.fields.firstNames].sort()).toEqual(vector.firsts);
-			expect([...record.fields.lastNames].sort()).toEqual(vector.lasts);
+			expect(sortedPairs(record.fields.names)).toEqual(vector.names);
 		});
 	}
 
@@ -339,8 +407,10 @@ describe("fullName splitting matches ca_drop_combined_search_result", () => {
 		const [record] = extractReportRecords([
 			{ personalInfo: { firstName: "Ann", lastName: "Smyth", fullName: "Anna Smith" } },
 		]);
-		expect([...record.fields.firstNames].sort()).toEqual(["ann", "anna"]);
-		expect([...record.fields.lastNames].sort()).toEqual(["smith", "smyth"]);
+		expect(sortedPairs(record.fields.names)).toEqual([
+			["ann", "smyth"],
+			["anna", "smith"],
+		]);
 	});
 
 	it("gives a provider that sends only fullName an NDZ key", async () => {
@@ -376,8 +446,7 @@ describe("combined keys match ca_drop_combined_search_result", () => {
 			const keys = await buildReportKeys({
 				emails: [],
 				phones: [],
-				firstNames: [normalizeName(vector.first)],
-				lastNames: [normalizeName(vector.last)],
+				names: [[normalizeName(vector.first), normalizeName(vector.last)]],
 				dobs: [normalizeDob(vector.dob)],
 				zips: [normalizeZip(vector.zip)],
 				vins: [normalizeVin(vector.vin)],
@@ -409,8 +478,10 @@ describe("extractReportRecords", () => {
 		expect(extracted).toHaveLength(1);
 		expect(extracted[0].index).toBe(0);
 		expect(extracted[0].fields).toEqual({
-			firstNames: ["anna", "ann"],
-			lastNames: ["smith"],
+			names: [
+				["anna", "smith"],
+				["ann", "smith"],
+			],
 			dobs: ["19800101"],
 			zips: ["90210", "2134"],
 			vins: ["1hgcm82633a004352"],
@@ -439,11 +510,11 @@ describe("extractReportRecords", () => {
 
 		expect(extracted).toHaveLength(2);
 		expect(extracted[0]).toMatchObject({ index: 0, id: "pipl-1" });
-		expect(extracted[0].fields.firstNames).toEqual(["anna"]);
+		expect(extracted[0].fields.names).toEqual([["anna", "smith"]]);
 		expect(extracted[0].fields.zips).toEqual(["90210"]);
 		expect(extracted[1]).toMatchObject({ index: 1 });
 		expect(extracted[1].id).toBeUndefined();
-		expect(extracted[1].fields.firstNames).toEqual(["jose"]);
+		expect(extracted[1].fields.names).toEqual([["jose", "muller"]]);
 		expect(extracted[1].fields.zips).toEqual(["2134"]);
 	});
 
@@ -476,8 +547,10 @@ describe("countReportKeys", () => {
 		const fields = {
 			emails: ["a@b.com"],
 			phones: ["4155559317"],
-			firstNames: ["anna", "ann"],
-			lastNames: ["smith"],
+			names: [
+				["anna", "smith"],
+				["ann", "smith"],
+			] as [string, string][],
 			dobs: ["19800101"],
 			zips: ["90210", "2134", "10001"],
 			vins: ["1hgcm82633a004352"],
@@ -490,8 +563,7 @@ describe("countReportKeys", () => {
 			countReportKeys({
 				emails: [],
 				phones: [],
-				firstNames: ["anna"],
-				lastNames: ["smith"],
+				names: [["anna", "smith"]],
 				dobs: ["19800101"],
 				zips: [],
 				vins: [],
@@ -579,7 +651,7 @@ describe("POST /api/drop/report-check", () => {
 
 	it("fails when many records are individually fine but together over the limit", async () => {
 		const person = (i: number) => ({
-			names: Array.from({ length: 10 }, (_, n) => ({ first: `f${n}`, last: `l${n}` })),
+			names: Array.from({ length: 100 }, (_, n) => ({ first: `f${n}`, last: `l${n}` })),
 			dateOfBirth: { start: "1980-01-01" },
 			addresses: Array.from({ length: 24 }, (_, z) => ({
 				zipCode: `1${String(z).padStart(4, "0")}`,

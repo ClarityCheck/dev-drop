@@ -18,6 +18,7 @@ import {
 	logKvDrift,
 	logMatches,
 	logRun,
+	logUncheckedReports,
 	Pending,
 	phaseTracer,
 	renderMatchLog,
@@ -212,6 +213,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let enrichmentRowsErased = 0;
 		let searchHistoryRowsDeleted = 0;
 		let lastMatchLog = "";
+		let uncheckedReports = 0;
 
 		const notifyStep = async (
 			stepName: string,
@@ -380,6 +382,17 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					return Number(r?.n ?? 0);
 				},
 			);
+			uncheckedReports = await tracedStep("count unchecked reports", async () => {
+				const [r] = await chQuery<{ n: string }>(
+					this.env,
+					`SELECT uniqExact(type, normalized_value) AS n
+					 FROM default.ca_drop_combined_search_result
+					 WHERE oversized_records > 0`,
+				);
+				const n = Number(r?.n ?? 0);
+				if (n > 0) await logUncheckedReports(this.env, ctx, n);
+				return n;
+			});
 			await notifyStep("match", "completed");
 
 			// ---------------------------------------------------------------
@@ -507,6 +520,7 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				peopleRecordsErased,
 				enrichmentRowsErased,
 				searchHistoryRowsDeleted,
+				uncheckedReports,
 				chunks: chunk,
 				dryRun: dryRun ? 1 : 0,
 				// What Cron B's gate reads: a sweep counts only if it synced the

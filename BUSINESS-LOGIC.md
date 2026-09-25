@@ -43,6 +43,25 @@ suppressing everyone registered in an earlier cycle — silently, and invisibly
 from outside. `clearKv` defaults to `false`; it exists for rebuilding from the
 archive, not for normal runs.
 
+### Reading a download (Cron A)
+
+`POST /api/downloader/start` with `{ download: true }` fetches
+`GET /data/download` with `DROP_API_KEY`; without it, the newest ZIP placed by
+hand under `ca-drop/raw/` is used. DROP answers `200` for two different things,
+told apart by the body before anything is stored:
+
+| DROP answers           | Cron A                                                            |
+| ---------------------- | ----------------------------------------------------------------- |
+| 200, a ZIP             | archived verbatim under `ca-drop/raw/`, then ingested             |
+| 200, JSON "No data"    | audit log, run ends `noData: 1` — nothing written to R2 or KV     |
+| 202 preparing, 429, 5xx | retried, 30 seconds apart                                        |
+| any other status       | the run fails and says why                                        |
+
+The archive is unzipped and parsed **once**, into staging pages of `pageSize`
+rows under `ca-drop/staging/<run>/`; every KV, Supabase and removals step reads
+one page, and the staging is deleted when the run ends, succeeded or not. Zip64
+archives are read.
+
 ### Consumers can be removed
 
 DROP publishes a removals file alongside the four lists — `Id,Hash,ListType` —
@@ -126,9 +145,16 @@ Four lists. Each entry is a work item ID and a Base64 SHA-256 hash.
 | `ndz`     | `sha256(first) + sha256(last) + sha256(dob) + sha256(zip)`, hashed again |
 | `namevin` | `sha256(first) + sha256(last) + sha256(vin)`, hashed again               |
 
-`ndz` and `namevin` are composites: every first name, last name, date of birth
-and ZIP held for a person is hashed in every combination, so one consumer can
-produce thousands of candidate keys.
+`ndz` and `namevin` are composites: every name pair held for a person — a first
+and last name from the same record (§2) — is hashed with every date of birth and
+ZIP, or every VIN, so one consumer can produce thousands of candidate keys.
+
+**Names** follow the specification's rules and its transliteration tables, which
+`TRANSLITERATION` in `worker/drop-report.ts` and `tr_src`/`tr_dst` in the view
+reproduce entry for entry (Greek 36, Cyrillic 38, special Latin 13). Accents are
+stripped by decomposing **Latin letters only**; Chinese, Japanese, Korean,
+Arabic and Hebrew letters are kept as written, composed (`김민준` stays three
+syllables, `やまだ` keeps its voicing mark).
 
 ### Reading the inputs providers actually send
 
@@ -151,10 +177,9 @@ A year alone, a year and month, two-digit years, `0000-00-00` and masked values
 (`*0suDIs…==`) yield no date. On DEV this reads 6,229 of 7,965 values, up from
 5,818; 1,597 of the rest are masked by the provider.
 
-**`personalInfo.fullName`** adds first and last candidates to whatever
-`firstName` / `lastName` already give: the last word is the last name, and the
-first name is offered both as the first word and as every given name run
-together (`Juan Pablo Martinez` → `juan`, `juanpablo`; `martinez`). `Smith,
+**`personalInfo.fullName`** adds name pairs to whatever `firstName` /
+`lastName` already give: the last word is the last name, and the first name is
+offered both as the first word and as every given name run together (`Juan Pablo Martinez` → `juan`, `juanpablo`; `martinez`). `Smith,
 Anna` is read last-name first, and a trailing `Jr` / `Sr` / `II` / `III` / `IV`
 is dropped. A single word yields nothing. Splitting is a guess, so both readings
 are offered: a wrong one is a key nobody holds and can only add matches.
@@ -165,7 +190,8 @@ against. **If the two ever disagree, no error is raised anywhere**: the gate
 simply answers "not listed" for someone who is. Two sets of conformance vectors
 guard that seam. `test/drop-report.test.ts` asserts the specification's own
 published hashes, and both it and `test/drop-normalize.test.ts` carry vectors
-generated from the view's SQL.
+generated from the view's SQL. `npm run conformance:view` checks the whole
+derivation end to end (§2).
 
 ## 2. The rule that governs everything else: what an array element _is_
 
@@ -219,7 +245,7 @@ called it listed, and serving the element that matched is not an option.
 ### Cron C groups the same way
 
 `sql/clickhouse.sql` builds view `ca_drop_combined_search_result`, `spec_version`
-v5, whose **grain is the grouping rule**:
+v6, whose **grain is the grouping rule**:
 
 | Report shape  | One view row is                                                  |
 | ------------- | ---------------------------------------------------------------- |
@@ -246,32 +272,42 @@ digest is meaningful against every stored copy of that element.
 DEV still carries v3, which had no element identity at all. §7 has what that
 costs until the view is rebuilt.
 
-The view caps the factors — 10 first names, 10 last names, 5 dates of birth,
-24 ZIPs, 12 VINs — **sorted and sliced on the normalized values, before
-hashing**, so the subset it keeps does not depend on array order. This is the
-one place keys are capped: every Worker path derives every combination (§3), so
-the view can only check fewer composites than the Worker, never more. Without the caps, merging
-providers multiplies the factors far enough that most email values would pass
-the 20,000 cut and derive no composites at all.
+### One key rule, and nothing capped
 
-Order matters twice over:
+The Worker (`reportKeyGroups()` in `worker/drop-report.ts`) and the view derive
+keys by the same rule, and `npm run conformance:view` checks that they do. It
+prints one read-only SELECT that runs the view's own SQL, taken from
+`sql/clickhouse.sql`, over fixture reports, and compares every key family with
+what the Worker module derives for the same reports. Any row with a non-empty
+`differs` is a disagreement. Run it after changing either side.
 
-|               |                                                                                   |
-| ------------- | --------------------------------------------------------------------------------- |
-| people        | cap per element → keys per element, and never a union across elements             |
-| phone / email | union the raw fields across providers → **then** cap → **then** one cross product |
+**A name is a pair.** An NDZ or NameVIN key needs a first and a last name, and
+they come from the same record:
 
-Both fall out of capping _after_ the grouping and never before it. Capping first
-would take each provider's own first ten names and merge those, which is not the
-ten the Worker picks.
+| Source                                  | Pairs                                                  |
+| --------------------------------------- | ------------------------------------------------------ |
+| `names[]` entry                         | its `first` with its `last`                            |
+| `personalInfo.fullName(s)`              | each full name, split as `fullNameParts()` splits it   |
+| `personalInfo.firstName(s)`/`lastName(s)` | by index when the two lists are the same length, otherwise every first with every last — the record then says nothing about which go together, and dropping the cross would miss a real pair |
 
-One group is bounded at `10·10·5·24 + 10·10·12` = 13,200 keys, so for phone and
-email the 20,000 cut is unreachable and the two sides agree exactly. A people
-report sums its elements and can still cross it; its composites are then
-dropped, as they are in the Worker. The cut stays a decision about the whole
-report even though a people report is now many rows — the view sums the report
-with a window — because the Worker adds up its groups the same way.
-On DEV no row has crossed it — `oversized_records` is 0 across all 2,033 values.
+The pairs are then crossed with the group's dates of birth and ZIPs (NDZ) and
+VINs (NameVIN). For phone and e-mail that group is every provider merged (§2),
+so a pair from one provider meets a date of birth and ZIP from another.
+
+**Nothing is capped.** The view used to keep the first 10 first names, 10 last
+names, 5 dates of birth, 24 ZIPs and 12 VINs, alphabetically, so a listed "zoe"
+in a report with ten other first names never got a key. Pairs make the product
+small enough to derive whole: on DEV, v6 derives every composite for 1,621 of
+1,625 reports, in 1.4 seconds.
+
+**A report over 20,000 keys is not checked, and says so.** Its NDZ and NameVIN
+keys are not derived — the view maps over an empty array rather than build
+millions of hashes — and its rows carry `oversized_records = 1`. Its exact
+e-mail and phone keys are still matched. On DEV that is 4 e-mail reports, each
+merging hundreds of names, dates of birth and ZIPs from breach data; the widest
+comes to 42 million keys. Cron C counts these reports (`uncheckedReports`),
+alerts on Better Stack at `error`, and Cron B refuses to report on that run
+(§5a), because `5 Not found` would be a claim nobody checked.
 
 ## 2a. What is checked, and what is not
 
@@ -534,10 +570,16 @@ operator token (§4). Workflow `drop-status-report`, in
 
 The caller names the Cron C run the report rests on. Cron B refuses unless that
 run is **complete**, was **not a dry run**, **synced the DROP set from KV**,
-**refreshed the view**, and **started after the newest live work item
-arrived**. The last one is the point: absence of a status reads as `5`, so a
-report over work items Cron C never looked at is a clean sheet nobody earned.
-The refusal names which condition failed.
+**refreshed the view**, **checked every stored report**, and **started after
+the newest live work item arrived**. The last one is the point: absence of a
+status reads as `5`, so a report over work items Cron C never looked at is a
+clean sheet nobody earned. The refusal names which condition failed.
+
+"Checked every stored report" is Cron C's `uncheckedReports` being 0 (§2). A run
+that found reports too wide to derive composites for is refused, because a
+listed consumer in one of them would be reported as `5` unseen. Erase or narrow
+those reports and run Cron C again, or start Cron B with
+`acceptUncheckedReports: true` to report anyway, knowingly.
 
 ### What each work item gets
 
@@ -641,8 +683,8 @@ ordered by consequence rather than by effort.
   project's anon key can read and change them. Outside this pipeline, but it is
   where DROP-listed identifiers sit in search history.
 
-- **The live DEV view is v4, and the sweep does not match the new date and
-  full-name rules until it is v5.** Recreate it: `DROP VIEW`,
+- **The live DEV view is v4, and the sweep does not match the name pairs, the
+  new date and full-name rules, or uncapped keys until it is v6.** Recreate it: `DROP VIEW`,
   re-run `sql/clickhouse.sql`'s section 2, `SYSTEM REFRESH VIEW` — in that
   order, and **before** the Worker is deployed. The grants survive, because
   ClickHouse records a privilege against the name. Cron C selects
@@ -661,28 +703,14 @@ ordered by consequence rather than by effort.
 
 ### It fails quietly
 
-- **Japanese, Korean, Arabic and Hebrew names are not left unchanged.** Both
-  sides decompose a name (NFD) to strip Latin accents, then keep only an
-  allow-list of scripts, so a Korean syllable is hashed as its separate jamo
-  (`김민준` → 9 code points), and a Japanese voicing mark or an Arabic/Hebrew
-  vowel mark is removed (`やまだ` → `やまた`). The specification says to leave
-  these scripts unchanged but names no Unicode form, and has no non-Latin
-  example to test against. A consumer registered under such a name is not
-  matched. Deliberately deferred.
-
 - **No paging incident when the fallback fires** (§4). A broken Cron C is
   invisible for as long as nobody reads the log.
 - **An oversized report now fails the lookup.** `report-check` caps nothing: a
   report over the 20,000 key total is a 503, so that subject's lookup fails
-  every time until the payload gets narrower. Cron C's view still checks it, by
-  dropping the composites, so the consumer is not missed — but the live search
-  stays broken, and nothing measures how often this fires.
-- **`arraySort` orders by UTF-8 bytes; JavaScript `sort()` by UTF-16 code
-  units.** They agree for everything in the Basic Multilingual Plane, which is
-  all of `[a-z0-9]` and almost all CJK. A name containing a character above
-  U+FFFF could be capped to a different subset on the two sides. Rare, and it
-  only matters for a report already over a cap.
-
+  every time until the payload gets narrower, and nothing measures how often
+  this fires on the live path. Cron C does not check such a report's NDZ and
+  NameVIN keys either (§2): it counts them and blocks Cron B, but a listed
+  consumer inside one stays in the data until someone erases or narrows it.
 ### Rule 3 is implemented except for its alerting half
 
 - **No dedicated Better Stack alert on a fail-closed.** The lookup API logs at

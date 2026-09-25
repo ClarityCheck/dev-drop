@@ -43,6 +43,7 @@ describe("DropReportsCleanupWorkflow", () => {
 			await m.disableSleeps();
 			// 25 matches at 10 per chunk is three chunks, the last one short.
 			await m.mockStepResult({ name: "match" }, 25);
+			await m.mockStepResult({ name: "count unchecked reports" }, 2);
 			await m.mockStepResult(
 				{ name: "record and erase · chunk 1" },
 				chunkResult({
@@ -85,6 +86,7 @@ describe("DropReportsCleanupWorkflow", () => {
 
 		expect(output.chunks).toBe(3);
 		expect(output.matchesFound).toBe(25);
+		expect(output.uncheckedReports).toBe(2);
 		expect(output.matchesLinked).toBe(25);
 		expect(output.matchRowsInserted).toBe(20);
 		expect(output.workItemsMarkedDeleted).toBe(9);
@@ -115,6 +117,7 @@ describe("DropReportsCleanupWorkflow", () => {
 		await instance.modify(async (m) => {
 			await m.disableSleeps();
 			await m.mockStepResult({ name: "match" }, 1_000_000);
+			await m.mockStepResult({ name: "count unchecked reports" }, 1);
 			await m.mockStepResult({ name: "record and erase · chunk 1" }, chunkResult());
 			await m.mockStepResult({ name: "record and erase · chunk 2" }, chunkResult());
 		});

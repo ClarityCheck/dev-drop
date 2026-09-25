@@ -52,6 +52,8 @@ type Params = {
 	cleanupInstanceId?: string;
 	/** report without checking Cron C — for testing against a fixture only */
 	skipCleanupGate?: boolean;
+	/** report although Cron C found reports too wide to check */
+	acceptUncheckedReports?: boolean;
 	/** send the files to DROP. Off by default. */
 	upload?: boolean;
 	/** work items read per query while building a file */
@@ -83,6 +85,7 @@ type BuiltFile = {
 export function cleanupGateFailure(
 	status: { status: string; output?: unknown },
 	latestIngestMs: number | null,
+	acceptUncheckedReports = false,
 ): string | null {
 	if (status.status !== "complete") {
 		return `Cron C run is "${status.status}", not complete`;
@@ -92,12 +95,23 @@ export function cleanupGateFailure(
 		kvSynced?: number;
 		viewRefreshed?: number;
 		startedAt?: string;
+		uncheckedReports?: number;
 	};
 	if (out.dryRun === 1) return "Cron C run was a dry run — it erased nothing";
 	if (out.kvSynced !== 1) return "Cron C run skipped the KV sync — it matched a stale DROP set";
 	if (out.viewRefreshed !== 1) return "Cron C run did not refresh the view — it matched stale data";
 	const started = out.startedAt ? Date.parse(out.startedAt) : NaN;
 	if (Number.isNaN(started)) return "Cron C run carries no startedAt — run Cron C again";
+	if (out.uncheckedReports === undefined) {
+		return "Cron C run does not say how many reports it could not check — run Cron C again";
+	}
+	if (out.uncheckedReports > 0 && !acceptUncheckedReports) {
+		return (
+			`Cron C could not derive NDZ and NameVIN keys for ${out.uncheckedReports} report(s) over the ` +
+			"key limit, so Not found is unverified for them. Erase or narrow them and run Cron C again, " +
+			"or start with acceptUncheckedReports: true"
+		);
+	}
 	if (latestIngestMs !== null && started < latestIngestMs) {
 		return (
 			`Cron C started ${new Date(started).toISOString()}, before the newest work item arrived ` +
@@ -193,7 +207,11 @@ export class DropStatusReportWorkflow extends WorkflowEntrypoint<Env, Params> {
 						};
 					}
 
-					const reason = cleanupGateFailure(status, await latestIngestAt(this.env));
+					const reason = cleanupGateFailure(
+						status,
+						await latestIngestAt(this.env),
+						event.payload?.acceptUncheckedReports ?? false,
+					);
 					return reason ? { gated: 0, refused: reason } : { gated: 1 };
 				},
 			);

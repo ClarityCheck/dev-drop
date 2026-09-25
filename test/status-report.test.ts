@@ -91,7 +91,7 @@ describe("DROP's upload answer", () => {
 
 describe("the gate on Cron C", () => {
 	const at = "2026-09-20T10:00:00.000Z";
-	const good = { dryRun: 0, kvSynced: 1, viewRefreshed: 1, startedAt: at };
+	const good = { dryRun: 0, kvSynced: 1, viewRefreshed: 1, startedAt: at, uncheckedReports: 0 };
 	const before = Date.parse(at) - 60_000;
 	const after = Date.parse(at) + 60_000;
 
@@ -115,6 +115,18 @@ describe("the gate on Cron C", () => {
 		expect(
 			cleanupGateFailure({ status: "complete", output: { ...good, viewRefreshed: 0 } }, before),
 		).toMatch(/refresh/);
+	});
+
+	it("refuses a sweep that could not check every report, unless told to accept it", () => {
+		const partial = { status: "complete", output: { ...good, uncheckedReports: 4 } };
+		expect(cleanupGateFailure(partial, before)).toMatch(/4 report\(s\) over the key limit/);
+		expect(cleanupGateFailure(partial, before, true)).toBeNull();
+	});
+
+	it("refuses a run from before Cron C counted what it could not check", () => {
+		const old: Record<string, unknown> = { ...good };
+		delete old.uncheckedReports;
+		expect(cleanupGateFailure({ status: "complete", output: old }, before)).toMatch(/could not check/);
 	});
 
 	it("refuses a run from before Cron C recorded when it started", () => {
