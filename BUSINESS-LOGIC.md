@@ -25,7 +25,7 @@ as `5 Not found` — so silence is an answer, and one we may be wrong about.
 
 The list must be downloaded **at least every 45 days**. The cycle is the unit of
 work: download, match, erase, report. Cron B has to run _after_ Cron C for its
-answers to be true, and nothing enforces that ordering.
+answers to be true, and it refuses to run otherwise (§5a).
 
 ### The download is a delta
 
@@ -324,12 +324,17 @@ decides.
 `/api/drop/check` is asked about one identifier and returns `{ type, listed }`.
 `listed` means: do not search this, do not serve it.
 
-It reads two KV keys — the DROP hash itself and a `suppressed:` key from a
-report we had to suppress earlier — and both produce the same `true`. Which one
-answered stays inside the Worker. The statutory fact, _this identifier belongs
-to a consumer who asked to be deleted_, is not something a caller should infer
-from a gate read at all: it lives in `ca_drop_work_item`, and Cron B reports
-from there.
+It reads the hash in **two KV namespaces** and a hit in either is `listed`:
+
+| Namespace       | Holds                                          | Also read by        |
+| --------------- | ---------------------------------------------- | ------------------- |
+| `kv`            | California's DROP hash set                     | Cron C, report-check |
+| `suppressed_kv` | hashes of values in `ca_drop_suppressed_value` | nothing else        |
+
+Which namespace answered stays inside the Worker. The statutory fact — _this
+identifier belongs to a consumer who asked to be deleted_ — is not something a
+caller should take from a gate read: it lives in `ca_drop_work_item`, and Cron B
+reports from there.
 
 The intended caller is the **website, before the lookup funnel starts**: one
 question, and a listed subject costs no provider call at all. Nothing calls it
@@ -393,38 +398,111 @@ of other cached emails and phone numbers it never touched. Cron C can make that
 claim because it sweeps everything in one run. This path cannot, so it writes the
 match row and leaves the status to the sweep.
 
-The cost is that Cron B under-reports — code 5 Not found — until the next Cron C
-run. That is wrong in the recoverable direction, and the match row is what makes
-it recoverable.
+Cron B does not report such an item as `5 Not found` in the meantime: a work
+item with a match row and no status is **held back** until the next Cron C run
+sets `deleted`, and is then reported as `3` (§5a). The match row is what makes
+that possible.
 
-## 5. The suppression cache
+## 5. Suppressed values
 
 A phone number or email can be absent from every DROP list and still produce a
 report that cannot be served, because the aggregated data carries a listed
-person. The subject is not suppressed; the report is. Without a record of that,
-every later search for the value calls the providers, spends the credit, builds
-the report and has it suppressed again.
+person. The subject is not suppressed; the report is.
 
-So the value is remembered — hash in KV under a `suppressed:` prefix, normalized
-value in Supabase — and `/api/drop/check` answers from it.
+That value is recorded twice, by `report-check`, when a phone or email report
+matches and its subject does not:
+
+1. **`ca_drop_suppressed_value`** in Supabase — one row per
+   `(search_type, value)`, DROP-normalized. The source of truth.
+2. **`suppressed_kv`** — the value's DROP hash as the key. This is what the
+   website's gate reads, so a later search for the value is answered `listed`
+   without calling a provider.
+
+Supabase is written first; `kv-repair` rebuilds `suppressed_kv` from it.
+
+`suppressed_kv` is a **separate namespace** from the DROP `kv`, on purpose. Cron
+C lists `kv` and copies it into ClickHouse as the set it matches and erases
+against. A suppressed value is our own finding, not California's hash, and
+keeping it in its own namespace means it can never join that set.
 
 Two things this is **not**:
 
 - **Not a compliance record.** "Searching this yields data we must suppress" is
   ours and derived. "This identifier belongs to a consumer who asked to be
   deleted" is California's, and lives in `ca_drop_work_item`. Cron B reports from
-  the second and must never report from the first, which is why the gate answers
-  `listed` alone and names neither source: there is nothing in its answer a
-  caller could mistake for DROP membership.
-- **Not on the answer's path.** It is a cost optimisation. Losing it costs one
-  provider fan-out. It runs in `waitUntil`, after the response, and can never
-  delay a request or change an answer.
-
-The prefix matters: Cron C lists the KV namespace and copies what it finds into
-ClickHouse to match against. A suppression key is not a DROP hash and must never
-be mistaken for one.
+  the second and must never report from the first.
+- **Not on the answer's path.** It runs in `waitUntil`, after the response, and
+  can never delay a request or change an answer. A failed write is logged and
+  dropped.
 
 Once written it stays. There is no expiry and no clearing path.
+
+## 5a. Reporting to DROP (Cron B)
+
+`POST /api/status-report/start` with `{ cleanupInstanceId, upload? }`. Workflow
+`drop-status-report`, in `worker/workflow-status-report.ts`.
+
+### It only runs on a real sweep
+
+The caller names the Cron C run the report rests on. Cron B refuses unless that
+run is **complete**, was **not a dry run**, **synced the DROP set from KV**,
+**refreshed the view**, and **started after the newest live work item
+arrived**. The last one is the point: absence of a status reads as `5`, so a
+report over work items Cron C never looked at is a clean sheet nobody earned.
+The refusal names which condition failed.
+
+### What each work item gets
+
+| Work item                       | Reported as                                   |
+| ------------------------------- | --------------------------------------------- |
+| `status = 'deleted'`            | `3` Deleted                                   |
+| `status = 'exempted'`           | `2` Exempted                                  |
+| `status = 'opted_out'`          | `4` Opted out                                 |
+| no status, no match row         | `5` Not found                                 |
+| no status, **has** a match row  | held back — found, not yet erased             |
+| revoked                         | not reported; DROP asks for no response       |
+
+Nothing sets `exempted` or `opted_out` today. They are policy decisions, not
+something the pipeline infers.
+
+### Upload, then amend
+
+Each work item remembers what was last reported (`reported_status`,
+`reported_at`). A run sends:
+
+- **`POST /data/upload`** — every live item never reported.
+- **`POST /data/amend`** — every item reported before whose code has changed,
+  typically `5` → `3` after a later sweep erased a match. The specification
+  requires an update within 45 days of the change.
+
+`reported_status` is written only for files DROP answers as accepted, and with
+the code that was in the file, so a status that changes between building and
+accepting is amended on the next run rather than lost.
+
+### The files
+
+One `Id,Status` CSV per downloaded file and kind, named after the file it
+answers: `20260910_0000_NDZ.csv` is answered by `20260910_0000_NDZ_U<run>.csv`
+(upload) or `…_A<run>.csv` (amend). The suffix keeps names unique within the
+cycle, as the specification requires. Every file is written to
+`ca-drop/reports/<run>/` in R2 **before** anything is sent, so R2 holds exactly
+what was reported; each upload also writes an audit file under `ca-drop/logs/`.
+
+This is why `ca_drop_work_item.source_file` exists: Cron A records which
+downloaded file each item came from. An item without one cannot be named, is
+not reported, and fails the run.
+
+### When a run fails
+
+- DROP rejects a file — the others are still recorded; the run fails naming the
+  rejected file and DROP's reason, and the next run sends it again.
+- Items without `source_file` — the same.
+- Without `upload: true`, or without the `DROP_API_KEY` secret, nothing is sent:
+  the run builds and archives only. `upload: true` without the key fails.
+
+A `202` means **queued, not accepted** — DROP validates rows afterwards and
+answers by e-mail. A file DROP later refuses at row level is not visible to
+Cron B.
 
 ## 6. Where a mistake shows up as silence
 
@@ -505,6 +583,18 @@ ordered by consequence rather than by effort.
   `logRun`, so the side that actually knows the check could not run reports
   nothing. The cron paths already use `logRun`/`logMatches` against Better Stack;
   the gate routes should use the same.
+
+### Cron B is built but not yet in service
+
+- **It cannot upload yet.** There is no DROP account, so no `DROP_API_KEY`;
+  runs build and archive only. The upload and amend calls follow the published
+  API (`multipart/form-data`, field `files`, header `X-API-KEY`) and have only
+  been exercised against a mocked response.
+- **Nothing schedules it.** Like Cron A and Cron C it is started by hand, and
+  the 45-day deadline is visible only as `oldestUnreportedDays` in the run
+  summary — no alert fires as it approaches.
+- **Row-level rejections are invisible.** DROP validates after the `202` and
+  answers by e-mail; nothing reads that mailbox or feeds it back.
 
 ### It costs more than it needs to
 

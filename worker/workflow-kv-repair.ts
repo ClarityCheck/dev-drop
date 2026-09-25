@@ -3,13 +3,14 @@ import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { countWorkItems, pageSuppressedValues, pageWorkItems } from "./db";
 import { dropKey } from "./drop-normalize";
 import type { DropListType } from "./drop-normalize";
-import { logRun, tracer } from "./logs";
 import { putSuppressedKey } from "./drop-suppression";
+import { logRun, tracer } from "./logs";
 
 /**
  * KV repair  (workflow: drop-kv-repair)
  *
- * Rewrites the DROP hash set in KV from public.ca_drop_work_item.
+ * Rewrites the DROP hash set in kv from public.ca_drop_work_item, then
+ * suppressed_kv from public.ca_drop_suppressed_value.
  *
  * It exists because KV is the one store in this pipeline that can be wrong
  * without anything noticing. Supabase is queryable and R2 is immutable, but
@@ -137,11 +138,7 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 				);
 			}
 
-			// The suppressed-search keys live in the same namespace and are wiped
-			// by the same clearKv, so the repair has to put them back too. Their
-			// absence is not dangerous — the gate falls back to the DROP list
-			// alone, which is what it did before they existed — but every
-			// short-circuited search starts costing a credit again.
+			// suppressed_kv, rebuilt from ca_drop_suppressed_value the same way.
 			let suppressionsRestored = 0;
 			let suppressionCursor = "0";
 			let suppressionPage = 0;
@@ -168,9 +165,6 @@ export class DropKvRepairWorkflow extends WorkflowEntrypoint<Env, Params> {
 						let put = 0;
 						if (!dryRun) {
 							for (const r of rows) {
-								// The hash is derived from the stored value, by the same
-								// dropKey the gate uses -- so a restored key is the key the
-								// gate will look for, and the table needs no hash column.
 								const { hash } = await dropKey(
 									r.search_type as DropListType,
 									r.value,

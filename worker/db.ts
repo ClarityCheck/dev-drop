@@ -38,6 +38,8 @@ export type WorkItemRow = {
 	work_item_id: string;
 	hash: string;
 	request_date: string | null;
+	/** the downloaded CSV this item arrived in; Cron B names its response after it */
+	source_file: string;
 };
 
 /** One DROP work item found in ClickHouse, as Cron C reports it. */
@@ -256,10 +258,12 @@ export async function upsertWorkItems(env: Env, rows: WorkItemRow[]): Promise<nu
 		await withTimeout(
 			sql`
 				INSERT INTO public.ca_drop_work_item
-					${sql(rows, "list_type", "work_item_id", "hash", "request_date")}
+					${sql(rows, "list_type", "work_item_id", "hash", "request_date", "source_file")}
 				ON CONFLICT (list_type, work_item_id) DO UPDATE
 					SET hash         = EXCLUDED.hash,
-					    request_date = EXCLUDED.request_date
+					    request_date = EXCLUDED.request_date,
+					    source_file  = COALESCE(public.ca_drop_work_item.source_file,
+					                            EXCLUDED.source_file)
 			`,
 			20000,
 			"upsert ca_drop_work_item",
@@ -659,7 +663,7 @@ export async function sampleWorkItems(
  * was cost without a reader.
  *
  * `value` is DROP-normalized, so one consumer is one row however the search was
- * typed, and so the KV key can be derived from it during a repair.
+ * typed, and so its suppressed_kv key can be re-derived during a repair.
  */
 export async function recordSuppressedValue(
 	env: Env,
@@ -682,34 +686,6 @@ export async function recordSuppressedValue(
 	}
 }
 
-/**
- * Recent suppressed values, oldest first, for rebuilding the KV fast path.
- *
- * Paged by id rather than OFFSET so a repair running while rows are added
- * cannot skip one: the cursor is a row that exists.
- */
-export async function pageSuppressedValues(
-	env: Env,
-	afterId: string,
-	limit: number,
-): Promise<{ id: string; search_type: string; value: string }[]> {
-	const sql = connect(env);
-	try {
-		return await withTimeout(
-			sql<{ id: string; search_type: string; value: string }[]>`
-				SELECT id::text AS id, search_type, value
-				FROM public.ca_drop_suppressed_value
-				WHERE id > ${afterId}::bigint
-				ORDER BY id
-				LIMIT ${limit}
-			`,
-			30000,
-			"page ca_drop_suppressed_value",
-		);
-	} finally {
-		await closeQuietly(sql);
-	}
-}
 
 /**
  * Mark work items as revoked, from a DROP removals file.
@@ -756,6 +732,245 @@ export async function markWorkItemsRevoked(
 			"revoke ca_drop_work_item",
 		);
 		return Number(r?.revoked ?? 0);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * Suppressed values, oldest first, for rebuilding suppressed_kv.
+ *
+ * Paged by id rather than OFFSET so a repair running while rows are added
+ * cannot skip one: the cursor is a row that exists.
+ */
+export async function pageSuppressedValues(
+	env: Env,
+	afterId: string,
+	limit: number,
+): Promise<{ id: string; search_type: string; value: string }[]> {
+	const sql = connect(env);
+	try {
+		return await withTimeout(
+			sql<{ id: string; search_type: string; value: string }[]>`
+				SELECT id::text AS id, search_type, value
+				FROM public.ca_drop_suppressed_value
+				WHERE id > ${afterId}::bigint
+				ORDER BY id
+				LIMIT ${limit}
+			`,
+			30000,
+			"page ca_drop_suppressed_value",
+		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/** The newest live work item's arrival, epoch ms. Cron C must have started after it. */
+export async function latestIngestAt(env: Env): Promise<number | null> {
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ at: string | null }[]>`
+				SELECT (extract(epoch FROM max(added_at)) * 1000)::bigint::text AS at
+				FROM public.ca_drop_work_item
+				WHERE revoked_at IS NULL
+			`,
+			15000,
+			"latest ca_drop_work_item",
+		);
+		return r?.at == null ? null : Number(r.at);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+export type ReportKind = "upload" | "amend";
+
+export type ReportGroup = {
+	source_file: string;
+	list_type: string;
+	kind: ReportKind;
+	rows: number;
+};
+
+export type ReportPlan = {
+	groups: ReportGroup[];
+	/** live items Cron B cannot name a response file for */
+	missingSourceFile: number;
+	/** matched but not yet erased — neither 5 nor 3 would be true today */
+	held: number;
+	/** days since the oldest never-reported live item arrived; 0 if none */
+	oldestUnreportedDays: number;
+};
+
+/**
+ * What Cron B has to send, grouped by the downloaded file each item came from.
+ *
+ *   upload  never reported
+ *   amend   reported, and the code it would get today is different
+ *   held    status not set yet but a match row exists: Cron C has found the
+ *           consumer and not finished erasing, so it is skipped this run
+ *
+ * Revoked items are never reported: DROP asks for no response to removals.
+ */
+export async function planStatusReport(env: Env): Promise<ReportPlan> {
+	const sql = connect(env);
+	try {
+		const rows = await withTimeout(
+			sql<{
+				source_file: string | null;
+				list_type: string;
+				kind: string;
+				rows: string;
+				oldest_days: string | null;
+			}[]>`
+				WITH live AS (
+					SELECT w.source_file, w.list_type, w.reported_status, w.added_at,
+					       CASE w.status
+					           WHEN 'exempted'  THEN 2
+					           WHEN 'deleted'   THEN 3
+					           WHEN 'opted_out' THEN 4
+					           ELSE 5
+					       END AS code,
+					       (w.status IS NULL AND EXISTS (
+					           SELECT 1 FROM public.ca_drop_work_item_match m
+					           WHERE m.ca_drop_work_item_id = w.id
+					       )) AS held
+					FROM public.ca_drop_work_item w
+					WHERE w.revoked_at IS NULL
+				)
+				SELECT source_file, list_type,
+				       CASE
+				           WHEN held                        THEN 'held'
+				           WHEN reported_status IS NULL     THEN 'upload'
+				           WHEN reported_status <> code     THEN 'amend'
+				           ELSE 'done'
+				       END AS kind,
+				       count(*)::text AS rows,
+				       (extract(epoch FROM now() - min(added_at)) / 86400)::int::text AS oldest_days
+				FROM live
+				GROUP BY 1, 2, 3
+			`,
+			30000,
+			"plan status report",
+		);
+
+		const plan: ReportPlan = { groups: [], missingSourceFile: 0, held: 0, oldestUnreportedDays: 0 };
+		for (const r of rows) {
+			const n = Number(r.rows);
+			if (r.kind === "done") continue;
+			if (r.kind === "held") {
+				plan.held += n;
+				continue;
+			}
+			if (r.kind === "upload") {
+				plan.oldestUnreportedDays = Math.max(plan.oldestUnreportedDays, Number(r.oldest_days ?? 0));
+			}
+			if (r.source_file === null) {
+				plan.missingSourceFile += n;
+				continue;
+			}
+			plan.groups.push({
+				source_file: r.source_file,
+				list_type: r.list_type,
+				kind: r.kind as ReportKind,
+				rows: n,
+			});
+		}
+		plan.groups.sort((a, b) =>
+			`${a.kind}|${a.source_file}`.localeCompare(`${b.kind}|${b.source_file}`),
+		);
+		return plan;
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+export type ReportItem = { id: string; work_item_id: string; code: number };
+
+/** One page of a report group, by id, with the code each item gets today. */
+export async function pageReportItems(
+	env: Env,
+	group: { source_file: string; list_type: string; kind: ReportKind },
+	afterId: string,
+	limit: number,
+): Promise<ReportItem[]> {
+	const sql = connect(env);
+	try {
+		return await withTimeout(
+			sql<ReportItem[]>`
+				WITH live AS (
+					SELECT w.id, w.work_item_id, w.reported_status,
+					       CASE w.status
+					           WHEN 'exempted'  THEN 2
+					           WHEN 'deleted'   THEN 3
+					           WHEN 'opted_out' THEN 4
+					           ELSE 5
+					       END AS code,
+					       (w.status IS NULL AND EXISTS (
+					           SELECT 1 FROM public.ca_drop_work_item_match m
+					           WHERE m.ca_drop_work_item_id = w.id
+					       )) AS held
+					FROM public.ca_drop_work_item w
+					WHERE w.revoked_at IS NULL
+					  AND w.source_file = ${group.source_file}
+					  AND w.list_type = ${group.list_type}
+					  AND w.id > ${afterId}::bigint
+				)
+				SELECT id::text AS id, work_item_id, code
+				FROM live
+				WHERE NOT held
+				  AND ${
+						group.kind === "upload"
+							? sql`reported_status IS NULL`
+							: sql`reported_status IS NOT NULL AND reported_status <> code`
+					}
+				ORDER BY id
+				LIMIT ${limit}
+			`,
+			30000,
+			"page status report",
+		);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+/**
+ * Record what DROP accepted. Only for files the upload answered as accepted,
+ * and with the code that was in the file, so a status that changed since the
+ * file was built is still amended next run.
+ */
+export async function markReported(
+	env: Env,
+	listType: string,
+	items: { work_item_id: string; code: number }[],
+): Promise<number> {
+	if (items.length === 0) return 0;
+	const sql = connect(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ n: string }[]>`
+				WITH v AS (
+					SELECT *
+					FROM jsonb_to_recordset(${JSON.stringify(items)}::text::jsonb)
+						AS v(work_item_id text, code int)
+				),
+				upd AS (
+					UPDATE public.ca_drop_work_item w
+					SET reported_status = v.code, reported_at = now()
+					FROM v
+					WHERE w.list_type = ${listType}
+					  AND w.work_item_id = v.work_item_id
+					RETURNING w.id
+				)
+				SELECT count(*)::text AS n FROM upd
+			`,
+			30000,
+			"mark ca_drop_work_item reported",
+		);
+		return Number(r?.n ?? 0);
 	} finally {
 		await closeQuietly(sql);
 	}

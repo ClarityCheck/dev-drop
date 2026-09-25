@@ -65,6 +65,17 @@ CREATE TABLE public.ca_drop_work_item
     -- put the hash back and suppress a consumer who asked to be released.
     revoked_at    timestamptz,
 
+    -- The downloaded CSV this item arrived in, e.g. 20260910_0000_NDZ.csv.
+    -- DROP wants each response file named after the file it answers, so
+    -- Cron B groups by this. First download wins: Cron A never overwrites it.
+    source_file   text,
+
+    -- What Cron B last told DROP: the numeric code (2 Exempted, 3 Deleted,
+    -- 4 Opted out, 5 Not found) and when. NULL = never reported. A
+    -- reported item whose current code differs is sent again as an amend.
+    reported_status smallint  CHECK (reported_status IN (2, 3, 4, 5)),
+    reported_at     timestamptz,
+
     UNIQUE (list_type, work_item_id)             -- lets Cron A upsert
 );
 
@@ -78,6 +89,10 @@ CREATE INDEX ca_drop_work_item_hash_idx
 -- serves them.
 CREATE INDEX ca_drop_work_item_live_idx
     ON public.ca_drop_work_item (id) WHERE revoked_at IS NULL;
+
+-- Cron B walks one source file at a time, by id.
+CREATE INDEX ca_drop_work_item_report_idx
+    ON public.ca_drop_work_item (source_file, id) WHERE revoked_at IS NULL;
 
 
 -- =====================================================================
@@ -119,24 +134,24 @@ CREATE INDEX ix_cadwim_work_item
 
 
 -- =====================================================================
--- 3. ca_drop_suppressed_value — searches that must be short-circuited
+-- 3. ca_drop_suppressed_value — phone and e-mail values whose report
+--    matched the DROP list
 --
 -- A phone number or e-mail can be absent from every DROP list and still
 -- produce a report that cannot be served, because the aggregated data
 -- carries a person who IS listed. The subject is not suppressed; the
--- report is. Without a record of that, every later search for the value
--- calls the providers, spends a credit, builds the report and has it
--- suppressed again.
+-- report is. This table is the source of truth for that finding; its
+-- hashes are also written to the suppressed_kv namespace, which
+-- /api/drop/check reads alongside the DROP kv. The DROP kv itself holds
+-- California's hashes only, because Cron C matches against it.
 --
 -- One row per value, written the first time a report matches. No
--- counters, no clearing and no expiry: once a value is here it is not
--- processed again.
+-- counters, no clearing and no expiry.
 --
 -- NOT a compliance record. "Searching this yields data we must suppress"
 -- is ours and derived; "this identifier belongs to a consumer who asked
 -- to be deleted" is California's and lives in ca_drop_work_item. Cron B
--- reports from that one and must never report from this one, which is
--- why /api/drop/check returns `onDropList` separately from `listed`.
+-- reports from that one and must never report from this one.
 --
 -- `value` is the DROP-normalized identifier, in the clear — the same
 -- exposure class as matched_normalized_value above, and for the same
@@ -154,8 +169,8 @@ CREATE TABLE public.ca_drop_suppressed_value
                             CHECK (search_type IN ('email', 'phone', 'people')),
 
     -- Normalized rather than raw, so one consumer is one row however the
-    -- search was typed, and so the KV key can be derived from it during a
-    -- repair without guessing.
+    -- search was typed, and so the suppressed_kv key can be re-derived
+    -- from it during a repair.
     value       text        NOT NULL CHECK (value <> ''),
 
     added_at    timestamptz NOT NULL DEFAULT now(),
@@ -189,7 +204,7 @@ GRANT USAGE, SELECT  ON SEQUENCE public.ca_drop_work_item_id_seq          TO dro
 GRANT SELECT, INSERT ON public.ca_drop_work_item_match                   TO drop_workflow;
 GRANT USAGE, SELECT  ON SEQUENCE public.ca_drop_work_item_match_id_seq   TO drop_workflow;
 
--- The suppression hint. No UPDATE: a row is inserted once and never
+-- The suppressed values. No UPDATE: a row is inserted once and never
 -- changed, and a repeat match is ON CONFLICT DO NOTHING.
 GRANT SELECT, INSERT ON public.ca_drop_suppressed_value                  TO drop_workflow;
 GRANT USAGE, SELECT  ON SEQUENCE public.ca_drop_suppressed_value_id_seq  TO drop_workflow;
@@ -291,6 +306,8 @@ WHERE table_schema = 'public' AND table_name = 'ca_drop_work_item'
 --   2. Run sql/clickhouse.sql against the ClickHouse service.
 --   3. POST /api/downloader/start     Cron A — fills the work items
 --   4. POST /api/workflow/start       Cron C — matches and erases
+--   5. POST /api/status-report/start  Cron B — { "cleanupInstanceId":
+--                                     "<the Cron C run from step 4>" }
 --
 -- Cron C against an empty ca_drop_work_item finds matches and links none
 -- of them; watch matchesLinked and matchesUnlinked in the run summary.

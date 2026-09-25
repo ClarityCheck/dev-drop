@@ -26,7 +26,7 @@
 const LOG_PREFIX = "ca-drop/logs/";
 
 export type AuditEvent = {
-	event: "download" | "supabase-upsert" | "drop-match";
+	event: "download" | "supabase-upsert" | "drop-match" | "status-report";
 	run_id: string;
 	outcome: "ok" | "failed";
 	/** everything else, rendered as key: value lines in the order given */

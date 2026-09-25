@@ -76,6 +76,13 @@
 			"name": "drop-kv-repair",
 			"binding": "DROP_KV_REPAIR",
 			"class_name": "DropKvRepairWorkflow"
+		},
+		{
+			// Cron B: reports a status per work item to DROP. Gated on a
+			// completed Cron C run; uploads only with { upload: true }.
+			"name": "drop-status-report",
+			"binding": "DROP_STATUS_REPORT",
+			"class_name": "DropStatusReportWorkflow"
 		}
 	],
 	"durable_objects": {
@@ -99,6 +106,10 @@
 		{
 			"binding": "kv",
 			"id": "0f2019fd0c714603b5c60e6ae8c0f464"
+		},
+		{
+			"binding": "suppressed_kv",
+			"id": "18e5d4487dc04923b0659797f463ec95"
 		}
 	],
 	"r2_buckets": [

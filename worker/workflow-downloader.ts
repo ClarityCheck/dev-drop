@@ -45,7 +45,7 @@ type Params = {
 	maxClearPages?: number;
 };
 
-type Row = { id: string; hash: string; request_date?: string };
+type Row = { id: string; hash: string; request_date?: string; source_file: string };
 type RemovedRow = { id: string; hash: string; list_type: string };
 
 const RAW_PREFIX = "ca-drop/raw/";
@@ -217,6 +217,7 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 									work_item_id: r.id,
 									hash: r.hash,
 									request_date: r.request_date ?? null,
+									source_file: r.source_file,
 								})),
 							);
 						},
@@ -349,11 +350,13 @@ export class DropDownloaderWorkflow extends WorkflowEntrypoint<Env, Params> {
 					}))
 					.filter((r) => r.id && r.hash);
 			} else {
+				const sourceFile = entry.name.split("/").pop() ?? entry.name;
 				lists[kind] = csv
 					.map((r) => ({
 						id: r.id ?? "",
 						hash: r.hash ?? "",
 						request_date: r.requestdate ?? r.request_date ?? undefined,
+						source_file: sourceFile,
 					}))
 					.filter((r) => r.id && r.hash);
 			}

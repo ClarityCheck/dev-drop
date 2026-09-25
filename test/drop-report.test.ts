@@ -2,7 +2,6 @@ import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { listedRecordsIn } from "../worker/drop-incident";
 import { normalizeEmail, normalizePhone, sha256Base64 } from "../worker/drop-normalize";
-import { isSuppressedKey, suppressedKey } from "../worker/drop-suppression";
 import {
 	FIELD_CAPS,
 	MAX_REPORT_KEYS,
@@ -629,7 +628,7 @@ describe("POST /api/drop/report-check", () => {
 		await env.kv.put(CLICKHOUSE_COMBINED_VECTORS[0].ndz, "work-item-suppress");
 
 		// The subject is not on the DROP list; its report carries someone who
-		// is. That finding gets recorded so the next search short-circuits — in
+		// is. That finding is recorded in ca_drop_suppressed_value — in
 		// waitUntil, after the response, and Supabase is unreachable from the
 		// test runner, so a 200 here is the assertion that the write is off the
 		// answer's path entirely.
@@ -935,7 +934,7 @@ describe("POST /api/drop/erase-incident", () => {
 	});
 });
 
-describe("the real-time gate and suppressed searches", () => {
+describe("the real-time gate", () => {
 	async function gate(
 		body: unknown,
 	): Promise<{ status: number; json: Record<string, unknown> }> {
@@ -957,13 +956,10 @@ describe("the real-time gate and suppressed searches", () => {
 		expect(json).toEqual({ type: "email", listed: true });
 	});
 
-	it("answers from a suppressed search the same way", async () => {
-		// The value itself is NOT on the DROP list. Its report was suppressed
-		// because the aggregated data carried someone who is, so searching it
-		// again would spend a credit to rebuild a report that gets suppressed.
-		// Both sources mean "do not search this", and the answer says only that.
-		const hash = await sha256Base64("clean.subject@example.com");
-		await env.kv.put(suppressedKey(hash), "ndz");
+	it("answers from a suppressed value the same way", async () => {
+		// Not on the DROP list: its report was suppressed because the aggregated
+		// data carried someone who is. It lives in suppressed_kv, not kv.
+		await env.suppressed_kv.put(await sha256Base64("clean.subject@example.com"), "email");
 
 		const { status, json } = await gate({
 			type: "email",
@@ -973,46 +969,34 @@ describe("the real-time gate and suppressed searches", () => {
 		expect(json).toEqual({ type: "email", listed: true });
 	});
 
-	it("says nothing about which key answered", async () => {
-		const onList = await sha256Base64("statutory@example.com");
-		await env.kv.put(onList, "work-item-statutory");
-		const inferred = await sha256Base64("inferred@example.com");
-		await env.kv.put(suppressedKey(inferred), "ndz");
-
-		const drop = await gate({ type: "email", value: "statutory@example.com" });
-		const ours = await gate({ type: "email", value: "inferred@example.com" });
-		const neither = await gate({ type: "email", value: "unrelated@example.com" });
-
-		// A compliance record is written from ca_drop_work_item_match, never
-		// from a gate read, so the distinction between the DROP list and our own
-		// inference stays inside the Worker.
-		expect(drop.json).toEqual({ type: "email", listed: true });
-		expect(ours.json).toEqual({ type: "email", listed: true });
-		expect(neither.json).toEqual({ type: "email", listed: false });
-	});
-
-	it("answers listed when a value is in both", async () => {
+	it("answers listed when a value is in both namespaces", async () => {
 		const hash = await sha256Base64("4155559317");
 		await env.kv.put(hash, "work-item-both");
-		await env.kv.put(suppressedKey(hash), "ndz");
+		await env.suppressed_kv.put(hash, "phone");
 
 		const { json } = await gate({ type: "phone", value: "+1 (415) 555-9317" });
 		expect(json).toEqual({ type: "phone", listed: true });
 	});
 
-	it("answers two fields for a value that normalizes to nothing", async () => {
-		const { json } = await gate({ type: "phone", value: "+()- " });
-		expect(json).toEqual({ type: "phone", listed: false });
+	it("answers not listed when neither namespace has the value", async () => {
+		const { json } = await gate({ type: "email", value: "unrelated@example.com" });
+		expect(json).toEqual({ type: "email", listed: false });
 	});
 
-	it("keeps a suppression key out of the DROP set", () => {
-		// Cron C lists this namespace and copies what it finds into
-		// ca_drop_work_items to match against. A suppression is not a DROP hash
-		// and joining that set would make the cron match against our own
-		// inference.
-		expect(isSuppressedKey(suppressedKey("abc="))).toBe(true);
-		expect(isSuppressedKey("abc=")).toBe(false);
-		expect(suppressedKey("abc=")).toBe("suppressed:abc=");
+	it("keeps suppressed values out of the namespace Cron C matches against", async () => {
+		// Cron C lists kv and copies it into ClickHouse as the DROP set. A value
+		// in suppressed_kv must not appear there.
+		const hash = await sha256Base64("kept.apart@example.com");
+		await env.suppressed_kv.put(hash, "email");
+
+		expect(await env.kv.get(hash)).toBeNull();
+		const listed = await env.kv.list();
+		expect(listed.keys.map((k) => k.name)).not.toContain(hash);
+	});
+
+	it("answers not listed for a value that normalizes to nothing", async () => {
+		const { json } = await gate({ type: "phone", value: "+()- " });
+		expect(json).toEqual({ type: "phone", listed: false });
 	});
 });
 

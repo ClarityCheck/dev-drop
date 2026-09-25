@@ -6,6 +6,7 @@
  *   npx wrangler secret put CH_PASSWORD
  *   npx wrangler secret put SUPABASE_DB_URL
  *   npx wrangler secret put LOGS_TOKEN
+ *   npx wrangler secret put DROP_API_KEY
  *
  * SUPABASE_DB_URL is the fallback used until the DROP_DB Hyperdrive binding
  * exists; db.ts prefers the binding when it is there.
@@ -15,4 +16,6 @@ interface Env {
 	SUPABASE_DB_URL?: string;
 	/** Better Stack source token. Absent = step logging is simply off. */
 	LOGS_TOKEN?: string;
+	/** DROP API key (X-API-KEY). Absent = Cron B builds and archives, never uploads. */
+	DROP_API_KEY?: string;
 }

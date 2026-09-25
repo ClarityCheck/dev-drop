@@ -3,6 +3,7 @@ export { DropReportsCleanupWorkflow } from "./workflow-reports-cleanup";
 export { DropDownloaderWorkflow } from "./workflow-downloader";
 export { WorkflowStatusDO } from "./durable-object";
 export { DropKvRepairWorkflow } from "./workflow-kv-repair";
+export { DropStatusReportWorkflow } from "./workflow-status-report";
 
 import { countWorkItems, dbPing, sampleWorkItems } from "./db";
 import { dropKey, isDropListType } from "./drop-normalize";
@@ -142,8 +143,9 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  * - POST /api/downloader/start - Start the drop-downloader workflow
  * - GET /api/downloader/status/:id - Its status
  * - GET /api/db-test - Postgres reachability, grants and RLS, with real errors
- * - POST /api/drop/check - is this e-mail or phone on the DROP list, or has
- *     a report for it been suppressed before? Answers `{ type, listed }`.
+ * - POST /api/drop/check - is this e-mail or phone on the DROP list, or a
+ *     value whose report we suppressed? Reads kv and suppressed_kv.
+ *     Answers `{ type, listed }`.
  * - POST /api/drop/report-check - does a whole report touch any DROP key?
  *     Answers `{ type, listed }`, plus per-element `records` for a people
  *     report, whose elements are different people. It writes nothing and
@@ -158,6 +160,9 @@ const INCIDENT_HINT: Partial<Record<IncidentStage | "unknown", string>> & { defa
  *     row for an e-mail or phone, the matched array elements for a people
  *     report. Verifies the match AND the erasure, then sets the work item
  *     status and writes the R2 evidence.
+ * - POST /api/status-report/start - Cron B: report a status per work item.
+ *     Body: { cleanupInstanceId, upload?, skipCleanupGate?, pageSize? }
+ * - GET /api/status-report/status/:id - its status
  * - GET /api/kv-health - is the DROP set in KV still complete?
  * - POST /api/kv-repair/start - rebuild KV from Supabase
  */
@@ -295,6 +300,25 @@ export default {
 			return Response.json(await instance.status());
 		}
 
+		// Cron B: the status report.
+		if (url.pathname === "/api/status-report/start" && request.method === "POST") {
+			let params: Record<string, unknown> = {};
+			try {
+				params = (await request.json()) as Record<string, unknown>;
+			} catch {
+				// no body — the gate will refuse without cleanupInstanceId
+			}
+			const instance = await env.DROP_STATUS_REPORT.create({ params });
+			return Response.json({ instanceId: instance.id, workflow: "drop-status-report" });
+		}
+
+		if (url.pathname.startsWith("/api/status-report/status/")) {
+			const instanceId = url.pathname.split("/").pop();
+			if (!instanceId) return Response.json({ error: "Instance ID required" }, { status: 400 });
+			const instance = await env.DROP_STATUS_REPORT.get(instanceId);
+			return Response.json(await instance.status());
+		}
+
 		// The real-time gate.
 		//
 		//   POST /api/drop/check   { "type": "phone", "value": "+12012000776" }
@@ -341,10 +365,7 @@ export default {
 			}
 
 			try {
-				// One field to act on: do not search this, do not serve it. Which
-				// key answered — the DROP list itself, or a report we suppressed
-				// earlier — is the Worker's business and stays here.
-				return Response.json({ type, listed: await lookupGate(env.kv, hash) });
+				return Response.json({ type, listed: await lookupGate(env, hash) });
 			} catch (e) {
 				return Response.json(
 					{
@@ -437,16 +458,12 @@ export default {
 			const reportListed = matched.some((families) => families.length > 0);
 
 			// The subject is clean but its report is not: the aggregated data
-			// carries a listed person, or a listed contact detail of one. Remember
-			// the value, so /api/drop/check short-circuits the next search for it
-			// instead of paying for the whole funnel again.
-			//
-			// Nothing here un-remembers it. That cost a Hyperdrive connection and
-			// an UPDATE on every clean lookup, and every one of those had nothing
-			// to clear; the expiry on the KV key does the same job for nothing.
+			// carries a listed person, or a listed contact detail of one. Record
+			// the value in ca_drop_suppressed_value and suppressed_kv, so the
+			// website's gate answers listed for it too.
 			//
 			// waitUntil, with nothing awaited before it: the answer is what the
-			// caller is waiting for, and a cache hint must not delay it or be able
+			// caller is waiting for, and this record must not delay it or be able
 			// to fail it.
 			if (type !== "people" && !subjectMatched.length && reportListed) {
 				ctx.waitUntil(
