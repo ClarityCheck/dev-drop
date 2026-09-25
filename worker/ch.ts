@@ -162,6 +162,50 @@ export async function deleteEntityRows(
 }
 
 /**
+ * Erase the website's AI enrichments for the identifiers whose reports were
+ * erased.
+ *
+ * default.ai_enrichment_info holds generated text about a searched phone or
+ * e-mail, keyed by the same (type, normalized_value) as entity_search_results —
+ * the website normalizes it the way the lookup API does. It is derived from
+ * the report, so it goes with it: every user's row, every purpose. Counted
+ * before and after, like the report rows, so a survivor fails the chunk.
+ *
+ * Phone and e-mail only, for the same reason as the whole-row erase: there is
+ * no people enrichment, and a people report is not erased whole.
+ */
+export async function deleteEnrichmentRows(
+	env: Env,
+	keys: EntityKey[],
+): Promise<{ before: number; after: number }> {
+	const scoped = keys.filter((k) => k.type === "phone" || k.type === "email");
+	if (scoped.length === 0) return { before: 0, after: 0 };
+
+	const pairs = JSON.stringify(scoped.map((k) => [k.type, k.normalized_value]));
+	const count = async () => {
+		const [r] = await chQuery<{ n: string }>(
+			env,
+			`SELECT count() AS n FROM default.ai_enrichment_info WHERE ${ENTITY_MATCH}`,
+			{ pairs },
+		);
+		return Number(r?.n ?? 0);
+	};
+
+	const before = await count();
+	if (before === 0) return { before: 0, after: 0 };
+
+	await chQuery(
+		env,
+		`ALTER TABLE default.ai_enrichment_info
+		 DELETE WHERE ${ENTITY_MATCH}
+		 SETTINGS mutations_sync = 2`,
+		{ pairs },
+	);
+
+	return { before, after: await count() };
+}
+
+/**
  * One element of a stored people payload, as the combined view names it.
  *
  * The digest is base64(SHA256(the element's raw JSON)), taken from the same

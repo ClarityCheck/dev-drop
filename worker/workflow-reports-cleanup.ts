@@ -1,9 +1,16 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { chInsert, chQuery, deleteEntityRows, erasePeopleElements } from "./ch";
+import { chInsert, chQuery, deleteEnrichmentRows, deleteEntityRows, erasePeopleElements } from "./ch";
 import type { ElementKey, EntityKey } from "./ch";
-import { countLiveHashes, incompleteReason, markMatchesDeleted, recordMatches } from "./db";
+import {
+	countLiveHashes,
+	deleteSearchHistory,
+	hasWebsiteDb,
+	incompleteReason,
+	markMatchesDeleted,
+	recordMatches,
+} from "./db";
 import type { MatchRow } from "./db";
 import {
 	describeError,
@@ -28,6 +35,10 @@ import { writeMatchLog } from "./audit";
  *   ⑤ per chunk of matches:
  *        the rows in public.ca_drop_work_item_match
  *        the Better Stack alert
+ *        delete the website's search_history rows for a phone or e-mail
+ *          (the website's Supabase, WEBSITE_DB), and the AI enrichments in
+ *          default.ai_enrichment_info — before the report, because once the
+ *          report is gone the next refresh cannot find them again
  *        erase the matched records from default.entity_search_results —
  *          every row for a phone or e-mail identifier, only the matched
  *          array elements for a people one
@@ -196,6 +207,8 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		let workItemsMarked = 0;
 		let entityRowsExpired = 0;
 		let peopleRecordsErased = 0;
+		let enrichmentRowsErased = 0;
+		let searchHistoryRowsDeleted = 0;
 		let lastMatchLog = "";
 
 		const notifyStep = async (
@@ -401,6 +414,8 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 					workItemsMarked += result.statusSet;
 					entityRowsExpired += result.rowsExpired;
 					peopleRecordsErased += result.recordsErased;
+					enrichmentRowsErased += result.enrichmentErased;
+					searchHistoryRowsDeleted += result.searchHistoryDeleted;
 					if (result.matchLog) lastMatchLog = result.matchLog;
 				}
 
@@ -488,6 +503,8 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				// because they are two different claims about the data.
 				entityRowsExpired,
 				peopleRecordsErased,
+				enrichmentRowsErased,
+				searchHistoryRowsDeleted,
 				chunks: chunk,
 				dryRun: dryRun ? 1 : 0,
 				// What Cron B's gate reads: a sweep counts only if it synced the
@@ -571,6 +588,8 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				statusSet: 0,
 				rowsExpired: 0,
 				recordsErased: 0,
+				enrichmentErased: 0,
+				searchHistoryDeleted: 0,
 				matchLog: "",
 			};
 		}
@@ -603,8 +622,22 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 				statusSet: 0,
 				rowsExpired: 0,
 				recordsErased: 0,
+				enrichmentErased: 0,
+				searchHistoryDeleted: 0,
 				matchLog: text,
 			};
+		}
+
+		// Refuse before writing anything if the website database is out of
+		// reach: the chunk has to clean search_history too, and doing the rest
+		// without it would leave 'deleted' unreachable — once the reports are
+		// erased, the next refresh has nothing left to match.
+		if (!hasWebsiteDb(this.env)) {
+			const why =
+				"no website database — add the WEBSITE_DB Hyperdrive binding or set WEBSITE_DB_URL; " +
+				"nothing was recorded or erased";
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+			throw new NonRetryableError(`chunk ${chunk}: ${why}`);
 		}
 
 		// the match rows first — the erase destroys the only other evidence
@@ -626,6 +659,27 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 		const matchLog = await phase("betterstack: match alert", () =>
 			logMatches(this.env, ctx, chunk, alerts, { ok: true }),
 		);
+
+		// The website's copies go before the report does. If they come after
+		// and fail, the next run cannot find them again: the refresh no longer
+		// matches an identifier whose report is already gone.
+		const history = await phase("website supabase: delete search history", () =>
+			deleteSearchHistory(this.env, plan.rows),
+		);
+		if (history.remaining > 0) {
+			const why = `${history.remaining} website search_history row(s) survived the delete`;
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+			throw new Error(`chunk ${chunk}: ${why}`);
+		}
+
+		const enrichment = await phase("clickhouse: erase ai enrichment", () =>
+			deleteEnrichmentRows(this.env, plan.rows),
+		);
+		if (enrichment.after > 0) {
+			const why = `${enrichment.after} of ${enrichment.before} ai_enrichment_info row(s) survived the delete`;
+			await logMatches(this.env, ctx, chunk, alerts, { ok: false, reason: why });
+			throw new Error(`chunk ${chunk}: ${why}`);
+		}
 
 		// erase, and verify rather than assume — one call per shape, because a
 		// people row is supposed to survive its erasure and a row count would
@@ -677,6 +731,8 @@ export class DropReportsCleanupWorkflow extends WorkflowEntrypoint<Env, Params> 
 			statusSet,
 			rowsExpired: expired.before - expired.after,
 			recordsErased: erased.before - erased.after,
+			enrichmentErased: enrichment.before - enrichment.after,
+			searchHistoryDeleted: history.deleted,
 			matchLog,
 		};
 	}

@@ -207,9 +207,36 @@ function checkUrl(url: string): void {
  */
 function connect(env: Env) {
 	const hyperdrive = (env as unknown as { DROP_DB?: { connectionString?: string } }).DROP_DB;
+	return connectVia(
+		hyperdrive?.connectionString,
+		env.SUPABASE_DB_URL,
+		"no database: add the DROP_DB Hyperdrive binding or set SUPABASE_DB_URL",
+	);
+}
 
-	if (hyperdrive?.connectionString) {
-		return postgres(hyperdrive.connectionString, {
+/**
+ * The website's Supabase project — a different database from the one above,
+ * reached the same way: the WEBSITE_DB Hyperdrive binding, or the
+ * WEBSITE_DB_URL secret until that exists. Its role is granted SELECT and
+ * DELETE on public.search_history and nothing else (sql/website-supabase.sql).
+ */
+function connectWebsite(env: Env) {
+	const hyperdrive = (env as unknown as { WEBSITE_DB?: { connectionString?: string } }).WEBSITE_DB;
+	return connectVia(
+		hyperdrive?.connectionString,
+		env.WEBSITE_DB_URL,
+		"no website database: add the WEBSITE_DB Hyperdrive binding or set WEBSITE_DB_URL",
+	);
+}
+
+export function hasWebsiteDb(env: Env): boolean {
+	const hyperdrive = (env as unknown as { WEBSITE_DB?: { connectionString?: string } }).WEBSITE_DB;
+	return Boolean(hyperdrive?.connectionString ?? env.WEBSITE_DB_URL);
+}
+
+function connectVia(hyperdriveConnectionString: string | undefined, url: string | undefined, missing: string) {
+	if (hyperdriveConnectionString) {
+		return postgres(hyperdriveConnectionString, {
 			max: 5,
 			fetch_types: false,
 			// prepare: false, and this is the important one.
@@ -238,8 +265,7 @@ function connect(env: Env) {
 		});
 	}
 
-	const url = env.SUPABASE_DB_URL;
-	if (!url) throw new Error("no database: add the DROP_DB Hyperdrive binding or set SUPABASE_DB_URL");
+	if (!url) throw new Error(missing);
 	checkUrl(url);
 	return postgres(url, {
 		max: 1,
@@ -1086,6 +1112,93 @@ export async function countLiveHashes(env: Env): Promise<number> {
 			"count live ca_drop_work_item hashes",
 		);
 		return Number(r?.n ?? 0);
+	} finally {
+		await closeQuietly(sql);
+	}
+}
+
+
+export type SearchHistoryErase = { matched: number; deleted: number; remaining: number };
+
+/**
+ * Delete the website's search_history rows for identifiers Cron C erased.
+ *
+ * Phone and e-mail only: for those the searched value IS the listed
+ * consumer's identifier. A people search is a name shared by many people, and
+ * Rule 2 keeps the user's record of searching it.
+ *
+ * search_history stores the value as typed, so it is normalized here the way
+ * the website's own normalizeValue does — digits only for a phone, trimmed
+ * and lowercased otherwise — which is also how entity_search_results'
+ * normalized_value was made.
+ *
+ * A matched row's deep-search children go with it: they are the same
+ * report's follow-up searches, and the parent key is ON DELETE SET NULL, so
+ * deleting only the parent would leave them behind, unlinked. What remains
+ * is counted afterwards, so a survivor fails the chunk rather than being
+ * assumed gone.
+ */
+export async function deleteSearchHistory(
+	env: Env,
+	keys: { type: string; normalized_value: string }[],
+): Promise<SearchHistoryErase> {
+	const pairs = keys.filter((k) => k.type === "phone" || k.type === "email");
+	if (pairs.length === 0) return { matched: 0, deleted: 0, remaining: 0 };
+
+	const sql = connectWebsite(env);
+	try {
+		const [r] = await withTimeout(
+			sql<{ matched: string; deleted: string }[]>`
+				WITH v AS (
+					SELECT DISTINCT type, normalized_value
+					FROM jsonb_to_recordset(${JSON.stringify(pairs)}::text::jsonb)
+						AS v(type text, normalized_value text)
+				),
+				m AS (
+					SELECT s.id
+					FROM public.search_history s
+					JOIN v ON v.type = s.type
+					      AND v.normalized_value = CASE s.type
+					          WHEN 'phone' THEN regexp_replace(s.value, '\D', '', 'g')
+					          ELSE lower(regexp_replace(s.value, '^\s+|\s+$', '', 'g'))
+					      END
+				),
+				del AS (
+					DELETE FROM public.search_history
+					WHERE id IN (SELECT id FROM m) OR parent_id IN (SELECT id FROM m)
+					RETURNING 1
+				)
+				SELECT (SELECT count(*) FROM m)::text   AS matched,
+				       (SELECT count(*) FROM del)::text AS deleted
+			`,
+			30000,
+			"delete website search_history",
+		);
+
+		const [left] = await withTimeout(
+			sql<{ n: string }[]>`
+				WITH v AS (
+					SELECT DISTINCT type, normalized_value
+					FROM jsonb_to_recordset(${JSON.stringify(pairs)}::text::jsonb)
+						AS v(type text, normalized_value text)
+				)
+				SELECT count(*)::text AS n
+				FROM public.search_history s
+				JOIN v ON v.type = s.type
+				      AND v.normalized_value = CASE s.type
+				          WHEN 'phone' THEN regexp_replace(s.value, '\D', '', 'g')
+				          ELSE lower(regexp_replace(s.value, '^\s+|\s+$', '', 'g'))
+				      END
+			`,
+			30000,
+			"count website search_history",
+		);
+
+		return {
+			matched: Number(r?.matched ?? 0),
+			deleted: Number(r?.deleted ?? 0),
+			remaining: Number(left?.n ?? 0),
+		};
 	} finally {
 		await closeQuietly(sql);
 	}

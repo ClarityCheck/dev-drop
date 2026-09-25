@@ -23,6 +23,8 @@ function chunkResult(over: Record<string, unknown> = {}) {
 		statusSet: 0,
 		rowsExpired: 0,
 		recordsErased: 0,
+		enrichmentErased: 0,
+		searchHistoryDeleted: 0,
 		matchLog: "",
 		...over,
 	};
@@ -49,6 +51,8 @@ describe("DropReportsCleanupWorkflow", () => {
 					statusSet: 4,
 					rowsExpired: 31,
 					recordsErased: 2,
+					enrichmentErased: 6,
+					searchHistoryDeleted: 9,
 				}),
 			);
 			await m.mockStepResult(
@@ -59,6 +63,8 @@ describe("DropReportsCleanupWorkflow", () => {
 					statusSet: 3,
 					rowsExpired: 12,
 					recordsErased: 5,
+					enrichmentErased: 1,
+					searchHistoryDeleted: 4,
 				}),
 			);
 			await m.mockStepResult(
@@ -86,6 +92,9 @@ describe("DropReportsCleanupWorkflow", () => {
 		// The two erasures are summed apart: rows deleted whole for a phone or
 		// e-mail identifier, records cut out of a people payload the row keeps.
 		expect(output.peopleRecordsErased).toBe(7);
+		// The website's copies, summed alongside the reports they came from.
+		expect(output.enrichmentRowsErased).toBe(7);
+		expect(output.searchHistoryRowsDeleted).toBe(13);
 		expect(output.matchesUnlinked).toBe(0);
 	});
 

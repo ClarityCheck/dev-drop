@@ -535,6 +535,12 @@ GRANT SELECT, INSERT, TRUNCATE ON default.ca_drop_work_items TO drop_workflow_ro
 -- cannot confirm.
 GRANT SELECT, ALTER DELETE, ALTER UPDATE ON default.entity_search_results TO drop_workflow_role;
 
+-- The website's AI enrichments of a searched phone or e-mail, keyed by the
+-- same (type, normalized_value). Derived from the report, so Cron C erases
+-- them with it and counts what is left. SELECT for the count, ALTER DELETE
+-- for the erase; nothing else.
+GRANT SELECT, ALTER DELETE ON default.ai_enrichment_info TO drop_workflow_role;
+
 
 -- =====================================================================
 -- 4. The user

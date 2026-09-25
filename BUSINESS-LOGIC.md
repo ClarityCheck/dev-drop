@@ -299,6 +299,19 @@ Nothing from it is served, and nothing from it is stored.
 - **Cached report.** Every `entity_search_results` row for the subject is
   erased, by `(type, normalized_value)` — all providers, not just the one the
   match came from.
+- **The website's copies go too, in the sweep.** Cron C also deletes, for the
+  same `(type, normalized_value)`:
+  - every `ai_enrichment_info` row (ClickHouse) — the AI text generated from
+    the report, for every user and purpose;
+  - every `search_history` row in the **website's** Supabase project whose
+    searched value normalizes to it, and that row's deep-search children —
+    the searched value is the listed consumer's own identifier.
+
+  Both are counted afterwards, and both happen **before** the report is erased:
+  once the report is gone the view no longer matches the identifier, so a
+  failure after it could never be retried. If the website database cannot be
+  reached, the chunk fails before anything is recorded or erased, and no work
+  item is marked `deleted`.
 - **Response.** Empty, and it does not say why. The user sees a report with no
   results, indistinguishable from a search that found nothing. DROP is never
   named in an API response.
@@ -310,6 +323,9 @@ every path that can erase, including — especially — the sweep, which is the
 destructive one and reaches everything.
 
 - **Fresh report.** The filtered array is written.
+- **Search history stays.** A user's record of searching "John Smith" is not
+  deleted because one John Smith is listed: the searched value is a name many
+  people share, not the listed consumer's identifier.
 - **Cached report, on the request path.** The stored payload is edited in place:
   the matched array positions are removed and the row survives. The edit is
   pinned to the exact row version that was read, because positions belong to one
@@ -604,9 +620,22 @@ ordered by consequence rather than by effort.
 
 ### It stops suppressing, or never starts
 
-- **The live DEV view is v3, and the sweep does not run until it is v5.** v4
-  changed the view's grain (v5 adds the date and full-name reading on top), so
-  it cannot be altered into place: `DROP VIEW`,
+- **Cron C cannot sweep until it can reach the website's Supabase.** It fails
+  every chunk without the `WEBSITE_DB` Hyperdrive binding or the
+  `WEBSITE_DB_URL` secret. Setup: `sql/website-supabase.sql` in the website
+  project, then the Hyperdrive config it describes. The ClickHouse role also
+  needs the new `ai_enrichment_info` grant in `sql/clickhouse.sql` section 3.
+- **The request path does not clean the website's copies.** When the lookup API
+  erases a cached phone or e-mail report itself (`match-found` →
+  `erase-incident`), `ai_enrichment_info` and `search_history` are left for the
+  next Cron C run, which will not find them: the report they hung off is gone.
+- **The website's Supabase has RLS off on 14 tables**, `search_history`,
+  `user`, `session`, `account` and `credit_transactions` among them, so the
+  project's anon key can read and change them. Outside this pipeline, but it is
+  where DROP-listed identifiers sit in search history.
+
+- **The live DEV view is v4, and the sweep does not match the new date and
+  full-name rules until it is v5.** Recreate it: `DROP VIEW`,
   re-run `sql/clickhouse.sql`'s section 2, `SYSTEM REFRESH VIEW` — in that
   order, and **before** the Worker is deployed. The grants survive, because
   ClickHouse records a privilege against the name. Cron C selects
